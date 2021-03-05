@@ -248,7 +248,7 @@ function setup_folly() {
 
   if [ ! -d "$FOLLY_DIR" ] ; then
     echo -e "${COLOR_GREEN}[ INFO ] Cloning folly repo ${COLOR_OFF}"
-    git clone https://github.com/odelalleau/folly.git "$FOLLY_DIR"
+    git clone -b mvfst-rl https://github.com/odelalleau/folly.git "$FOLLY_DIR"
     if [[ -z "${MVFST_SKIP_SYSTEM_DEPENDENCIES-}" ]]; then
       echo -e "${COLOR_GREEN}[ INFO ] install dependencies ${COLOR_OFF}"
       if [ "$Platform" = "Linux" ]; then
