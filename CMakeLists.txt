@@ -44,6 +44,7 @@ find_package(folly REQUIRED)
 find_package(Fizz REQUIRED)
 find_package(Glog REQUIRED)
 find_package(Threads)
+find_package(Torch REQUIRED)
 
 if(DEFINED CCP_ENABLED)
     find_package(libccp REQUIRED)

@@ -17,6 +17,22 @@ add_library(
   QuicCCP.cpp
   ServerCongestionControllerFactory.cpp
   TokenlessPacer.cpp
+  # RL-specific.
+  CongestionControlEnv.cpp
+  CongestionControlEnvConfig.cpp
+  CongestionControlLocalEnv.cpp
+  CongestionControlFixedCwndEnv.cpp
+  NetworkState.cpp
+  RLBandwidthSampler.cpp
+  RLCongestionController.cpp
+  Utils.cpp
+)
+
+# RL-specific.
+target_compile_definitions(
+  mvfst_cc_algo PUBLIC
+  MVFSTRL_INFERENCE_ONLY
+  C10_USE_GLOG  # Fix glog compilation issues related to PyTorch
 )
 
 target_include_directories(
@@ -47,6 +63,8 @@ target_link_libraries(
   mvfst_state_machine
   mvfst_state_functions
   ${LIBCCP_LIBRARY}
+  # RL-specific.
+  ${TORCH_LIBRARIES}
 )
 
 file(

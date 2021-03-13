@@ -12,6 +12,9 @@
 # Obtain the mvfst repository root folder at the very start
 MVFST_ROOT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 
+# mvfst-rl root folder
+MVFST_RL_ROOT_DIR="$MVFST_ROOT_DIR"/../..
+
 # Useful constants
 COLOR_RED="\033[0;31m"
 COLOR_GREEN="\033[0;32m"
@@ -378,9 +381,15 @@ fi
 
 
 # build mvfst:
+
+# CMake's prefix path must include the folder with PyTorch libraries.
+LIBTORCH_DIR="$MVFST_RL_ROOT_DIR"/_build/deps/libtorch
+CMAKE_PREFIX_PATH="$FOLLY_INSTALL_DIR;$LIBTORCH_DIR"
+echo -e "CMAKE_PREFIX_PATH=$CMAKE_PREFIX_PATH"
+
 cd "$MVFST_BUILD_DIR" || exit
 mvfst_cmake_build_args=(
-  -DCMAKE_PREFIX_PATH="$FOLLY_INSTALL_DIR"        \
+  -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH"        \
   -DCMAKE_INSTALL_PREFIX="$MVFST_INSTALL_DIR"     \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo               \
   -DBUILD_TESTS=On                                \
