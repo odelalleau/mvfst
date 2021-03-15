@@ -26,7 +26,11 @@ CongestionControlLocalEnv::CongestionControlLocalEnv(
 }
 
 CongestionControlLocalEnv::~CongestionControlLocalEnv() {
-  shutdown_ = true;
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    shutdown_ = true;
+  }
+  cv_.notify_all();
   thread_->join();
 }
 
