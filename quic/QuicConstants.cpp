@@ -24,6 +24,8 @@ folly::StringPiece congestionControlTypeToString(CongestionControlType type) {
       return kCongestionControlNoneStr;
     case CongestionControlType::CCP:
       return kCongestionControlCcpStr;
+    case CongestionControlType::RL:
+      return kCongestionControlRLStr;
     default:
       return "unknown";
   }
@@ -43,6 +45,8 @@ folly::Optional<CongestionControlType> congestionControlStrToType(
     return quic::CongestionControlType::None;
   } else if (str == kCongestionControlCcpStr) {
     return quic::CongestionControlType::CCP;
+  } else if (str == kCongestionControlRLStr) {
+    return quic::CongestionControlType::RL;
   }
   return folly::none;
 }

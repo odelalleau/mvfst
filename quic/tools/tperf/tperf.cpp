@@ -17,6 +17,9 @@
 #include <quic/QuicConstants.h>
 #include <quic/client/QuicClientTransport.h>
 #include <quic/common/test/TestUtils.h>
+#include <quic/congestion_control/CongestionControlEnv.h>
+#include <quic/congestion_control/CongestionControlEnvFactory.h>
+#include <quic/congestion_control/RLCongestionControllerFactory.h>
 #include <quic/congestion_control/ServerCongestionControllerFactory.h>
 #include <quic/fizz/client/handshake/FizzClientQuicHandshakeContext.h>
 #include <quic/server/AcceptObserver.h>
@@ -36,7 +39,7 @@ DEFINE_uint64(
     "Amount of data written to stream each iteration");
 DEFINE_uint64(writes_per_loop, 5, "Amount of socket writes per event loop");
 DEFINE_uint64(window, 64 * 1024, "Flow control window size");
-DEFINE_string(congestion, "newreno", "newreno/cubic/bbr/ccp/none");
+DEFINE_string(congestion, "newreno", "newreno/cubic/bbr/ccp/none/rl");
 DEFINE_string(ccp_config, "", "Additional args to pass to ccp");
 DEFINE_bool(pacing, false, "Enable pacing");
 DEFINE_bool(gso, false, "Enable GSO writes to the socket");
@@ -114,9 +117,162 @@ DEFINE_string(
     transport_knob_params,
     "",
     "JSON-serialized dictionary of transport knob params");
+// RL-specific arguments.
+DEFINE_string(
+    cc_env_mode,
+    "local",
+    "CongestionControlEnv mode for RL cc_algo - [local|remote|random|fixed]. "
+    "Note that 'remote' is not currently supported.");
+DEFINE_string(
+    cc_env_model_file,
+    "traced_model.pt",
+    "PyTorch traced model file for local mode");
+DEFINE_int64(
+    cc_env_job_id,
+    -1,
+    "Index of the current job in the list of active jobs. -1 if undefined. "
+    "In general should be kept to -1 unless 'cheating' on purpose.");
+DEFINE_string(cc_env_agg, "time", "State aggregation type for RL cc_algo");
+DEFINE_int32(
+    cc_env_time_window_ms,
+    100,
+    "Window duration (ms) for TIME_WINDOW aggregation");
+DEFINE_int32(
+    cc_env_fixed_window_size,
+    10,
+    "Window size for FIXED_WINDOW aggregation");
+DEFINE_bool(
+    cc_env_use_state_summary,
+    true,
+    "Whether to use state summary instead of raw states in "
+    "observation (auto-enabled for TIME_WINDOW)");
+DEFINE_int32(
+    cc_env_history_size,
+    2,
+    "Length of history (such as past actions) to include in observation");
+DEFINE_double(
+    cc_env_norm_ms,
+    100.0,
+    "Normalization factor for temporal (in ms) fields in observation");
+DEFINE_double(
+    cc_env_norm_bytes,
+    1000.0,
+    "Normalization factor for byte fields in observation");
+DEFINE_string(
+    cc_env_actions,
+    "0,/2,-10,+10,*2",
+    "List of actions specifying how cwnd should be updated. The "
+    "first action is required to be 0 (no-op action).");
+DEFINE_bool(
+    cc_env_reward_log_ratio,
+    false,
+    "If true, then instead of "
+    " a * throughput - b * delay - c * loss "
+    "we use as reward "
+    " a * log(a' + throughput) - b * log(b' + delay) - c * log(c' + loss)");
+DEFINE_double(
+    cc_env_reward_throughput_factor,
+    0.1,
+    "Throughput multiplier in reward (a)");
+DEFINE_double(
+    cc_env_reward_throughput_log_offset,
+    1.0,
+    "Offset to add to throughput in log version (a')");
+DEFINE_double(
+    cc_env_reward_delay_factor,
+    0.01,
+    "Delay multiplier in reward (b)");
+DEFINE_double(
+    cc_env_reward_delay_log_offset,
+    1.0,
+    "Offset to add to delay in log version (b')");
+DEFINE_double(
+    cc_env_reward_packet_loss_factor,
+    0.0,
+    "Packet loss multiplier in reward (c)");
+DEFINE_double(
+    cc_env_reward_packet_loss_log_offset,
+    1.0,
+    "Offset to add to packet loss in log version (c')");
+DEFINE_bool(
+    cc_env_reward_max_delay,
+    true,
+    "Whether to take max delay over observations in reward."
+    "Otherwise, avg delay is used.");
+DEFINE_uint32(
+    cc_env_fixed_cwnd,
+    10,
+    "Target fixed cwnd value (only used in 'fixed' env mode)");
+DEFINE_uint64(
+    cc_env_min_rtt_window_length_us,
+    quic::kMinRTTWindowLength.count(),
+    "Window length (in us) of min RTT filter used to estimate delay");
 
 namespace quic {
 namespace tperf {
+
+using Config = quic::CongestionControlEnv::Config;
+
+std::shared_ptr<quic::CongestionControllerFactory>
+makeRLCongestionControllerFactory() {
+  Config cfg;
+
+  if (FLAGS_cc_env_mode == "local") {
+    cfg.mode = Config::Mode::LOCAL;
+  } else if (FLAGS_cc_env_mode == "remote") {
+    LOG(FATAL) << "Remote RL env is not currently supported";
+  } else if (FLAGS_cc_env_mode == "random") {
+    cfg.mode = Config::Mode::RANDOM;
+  } else if (FLAGS_cc_env_mode == "fixed") {
+    cfg.mode = Config::Mode::FIXED;
+  } else {
+    LOG(FATAL) << "Unknown cc_env_mode: " << FLAGS_cc_env_mode;
+  }
+
+  cfg.modelFile = FLAGS_cc_env_model_file;
+  cfg.jobId = FLAGS_cc_env_job_id;
+
+  // These flags are only used in "remote" mode (not supported):
+  cfg.rpcAddress = "";
+  cfg.actorId = -1;
+  /*
+  cfg.rpcAddress = FLAGS_cc_env_rpc_address;
+  cfg.actorId = FLAGS_cc_env_actor_id;
+  */
+
+  if (FLAGS_cc_env_agg == "time") {
+    cfg.aggregation = Config::Aggregation::TIME_WINDOW;
+  } else if (FLAGS_cc_env_agg == "fixed") {
+    cfg.aggregation = Config::Aggregation::FIXED_WINDOW;
+  } else {
+    LOG(FATAL) << "Unknown cc_env_agg: " << FLAGS_cc_env_agg;
+  }
+  cfg.windowDuration = std::chrono::milliseconds(FLAGS_cc_env_time_window_ms);
+  cfg.windowSize = FLAGS_cc_env_fixed_window_size;
+  cfg.useStateSummary = FLAGS_cc_env_use_state_summary;
+
+  cfg.historySize = FLAGS_cc_env_history_size;
+
+  cfg.normMs = FLAGS_cc_env_norm_ms;
+  cfg.normBytes = FLAGS_cc_env_norm_bytes;
+
+  cfg.parseActionsFromString(FLAGS_cc_env_actions);
+
+  cfg.rewardLogRatio = FLAGS_cc_env_reward_log_ratio;
+  cfg.throughputFactor = FLAGS_cc_env_reward_throughput_factor;
+  cfg.throughputLogOffset = FLAGS_cc_env_reward_throughput_log_offset;
+  cfg.delayFactor = FLAGS_cc_env_reward_delay_factor;
+  cfg.delayLogOffset = FLAGS_cc_env_reward_delay_log_offset;
+  cfg.packetLossFactor = FLAGS_cc_env_reward_packet_loss_factor;
+  cfg.packetLossLogOffset = FLAGS_cc_env_reward_packet_loss_log_offset;
+  cfg.maxDelayInReward = FLAGS_cc_env_reward_max_delay;
+  cfg.fixedCwnd = FLAGS_cc_env_fixed_cwnd;
+  cfg.minRTTWindowLength =
+      std::chrono::microseconds(FLAGS_cc_env_min_rtt_window_length_us);
+
+  auto envFactory = std::make_shared<quic::CongestionControlEnvFactory>(cfg);
+  return std::make_shared<quic::RLCongestionControllerFactory>(envFactory);
+}
 
 namespace {
 
@@ -470,8 +626,15 @@ class TPerfServer {
         std::chrono::seconds(FLAGS_d6d_blackhole_detection_window_secs);
     settings.d6dConfig.blackholeDetectionThreshold =
         FLAGS_d6d_blackhole_detection_threshold;
-    server_->setCongestionControllerFactory(
-        std::make_shared<ServerCongestionControllerFactory>());
+
+    // RL-based congestion control uses a special factory.
+    std::shared_ptr<quic::CongestionControllerFactory> ccFactory =
+        std::make_shared<ServerCongestionControllerFactory>();
+    if (congestionControlType == quic::CongestionControlType::RL) {
+      ccFactory = makeRLCongestionControllerFactory();
+    }
+    server_->setCongestionControllerFactory(ccFactory);
+
     server_->setTransportSettings(settings);
     server_->setCcpConfig(FLAGS_ccp_config);
   }
@@ -642,8 +805,15 @@ class TPerfClient : public quic::QuicSocket::ConnectionCallback,
         &eventBase_, std::move(sock), std::move(fizzClientContext));
     quicClient_->setHostname("tperf");
     quicClient_->addNewPeerAddress(addr);
-    quicClient_->setCongestionControllerFactory(
-        std::make_shared<DefaultCongestionControllerFactory>());
+
+    // RL-based congestion control uses a special factory.
+    std::shared_ptr<quic::CongestionControllerFactory> ccFactory =
+        std::make_shared<DefaultCongestionControllerFactory>();
+    if (congestionControlType_ == quic::CongestionControlType::RL) {
+      ccFactory = makeRLCongestionControllerFactory();
+    }
+    quicClient_->setCongestionControllerFactory(ccFactory);
+
     auto settings = quicClient_->getTransportSettings();
     settings.advertisedInitialUniStreamWindowSize = window_;
     // TODO figure out what actually to do with conn flow control and not sent
