@@ -45,6 +45,10 @@ DefaultCongestionControllerFactory::makeCongestionController(
       throw QuicInternalException(
           "CCP congestion control only available on server (via ServerCongestionControllerFactory)",
           LocalErrorCode::INTERNAL_ERROR);
+    case CongestionControlType::RL:
+      throw QuicInternalException(
+          "Use RLCongestionControllerFactory for RL-based congestion control",
+          LocalErrorCode::INTERNAL_ERROR);
     case CongestionControlType::None:
       break;
   }

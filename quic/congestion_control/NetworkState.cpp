@@ -36,7 +36,7 @@ void NetworkState::toTensor(const quic::utils::vector<NetworkState> &states,
     return;
   }
 
-  tensor.resize_({states.size(), states[0].size()});
+  tensor.resize_({static_cast<long>(states.size()), states[0].size()});
   auto tensor_a = tensor.accessor<float, 2>();
   for (int i = 0; i < tensor_a.size(0); ++i) {
     for (int j = 0; j < tensor_a.size(1); ++j) {

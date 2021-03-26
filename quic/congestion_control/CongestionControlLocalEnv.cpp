@@ -26,10 +26,7 @@ CongestionControlLocalEnv::CongestionControlLocalEnv(
 }
 
 CongestionControlLocalEnv::~CongestionControlLocalEnv() {
-  {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    shutdown_ = true;
-  }
+  shutdown_ = true;
   cv_.notify_all();
   thread_->join();
 }
@@ -93,7 +90,16 @@ void CongestionControlLocalEnv::loop() {
     core_state = outputs->elements()[1].toTuple();
 
     action.cwndAction = *action_tensor.data_ptr<long>();
-    onAction(action);
+
+    // If there is an ongoing shutdown, it is important not to trigger the action
+    // because `onAction()` calls `runImmediatelyOrRunInEventBaseThreadAndWait()`
+    // and this method will hang forever during shutdown, preventing the thread from
+    // exiting cleanly.
+    if (!shutdown_) {
+      onAction(action);
+    } else {
+      LOG(INFO) << "Skipping action due to shutdown in progress";
+    }
 
     episode_step++;
     observationReady_ = false; // Back to waiting

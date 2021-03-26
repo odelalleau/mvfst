@@ -51,6 +51,11 @@ ServerCongestionControllerFactory::makeCongestionController(
           LocalErrorCode::INTERNAL_ERROR);
 #endif
       break;
+    case CongestionControlType::RL:
+      throw QuicInternalException(
+          "Use RLCongestionControllerFactory for RL-based congestion control",
+          LocalErrorCode::INTERNAL_ERROR);
+      break;
     case CongestionControlType::None:
       break;
   }

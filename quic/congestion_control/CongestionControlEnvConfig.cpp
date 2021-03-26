@@ -19,20 +19,20 @@ void CongestionControlEnvConfig::parseActionsFromString(
 
   quic::utils::vector<folly::StringPiece> v;
   folly::split(",", actionsStr, v);
-  quic::utils::vector<std::pair<ActionOp, float>> actions(v.size());
+  quic::utils::vector<std::pair<ActionOp, float>> actions_(v.size());
 
   CHECK_EQ(v[0], "0") << "First action must be no-op (\"0\"), received "
                       << actionsStr;
-  actions[0] = {ActionOp::NOOP, 0};
+  actions_[0] = {ActionOp::NOOP, 0};
 
   for (size_t i = 1; i < v.size(); ++i) {
     CHECK_GT(v[i].size(), 1) << "Invalid actions specified: " << actionsStr;
     const char op = v[i][0];
     const auto &val = v[i].subpiece(1);
-    actions[i] = {charToActionOp(op), folly::to<float>(val)};
+    actions_[i] = {charToActionOp(op), folly::to<float>(val)};
   }
 
-  this->actions = actions;
+  this->actions = actions_;
 }
 
 CongestionControlEnvConfig::ActionOp
