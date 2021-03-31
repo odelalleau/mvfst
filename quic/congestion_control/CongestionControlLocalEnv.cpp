@@ -60,9 +60,7 @@ void CongestionControlLocalEnv::loop() {
   while (!shutdown_) {
     cv_.wait(lock, [&]() -> bool { return (observationReady_ || shutdown_); });
     if (shutdown_) {
-      LOG(INFO) << "Inference loop terminating after " << episode_step
-                << " steps, total return = " << episode_return;
-      return;
+      break;
     }
 
     done = (episode_step == 0);
@@ -104,6 +102,9 @@ void CongestionControlLocalEnv::loop() {
     episode_step++;
     observationReady_ = false; // Back to waiting
   }
+
+  LOG(INFO) << "Inference loop terminating after " << episode_step
+            << " steps, total return = " << episode_return;
 }
 
 } // namespace quic
