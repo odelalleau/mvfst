@@ -31,7 +31,7 @@ add_library(
 # RL-specific.
 target_compile_definitions(
   mvfst_cc_algo PUBLIC
-  MVFSTRL_INFERENCE_ONLY
+  MVFSTRL_INFERENCE_ONLY_MVFST
   C10_USE_GLOG  # Fix glog compilation issues related to PyTorch
 )
 
