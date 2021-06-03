@@ -128,10 +128,10 @@ DEFINE_string(
     "traced_model.pt",
     "PyTorch traced model file for local mode");
 DEFINE_int64(
-    cc_env_job_id,
+    cc_env_job_count,
     -1,
-    "Index of the current job in the list of active jobs. -1 if undefined. "
-    "In general should be kept to -1 unless 'cheating' on purpose.");
+    "Job counter during training. -1 if undefined. "
+    "In general should be kept to -1, unless 'cheating' on purpose.");
 DEFINE_string(cc_env_agg, "time", "State aggregation type for RL cc_algo");
 DEFINE_int32(
     cc_env_time_window_ms,
@@ -230,7 +230,7 @@ makeRLCongestionControllerFactory() {
   }
 
   cfg.modelFile = FLAGS_cc_env_model_file;
-  cfg.jobId = FLAGS_cc_env_job_id;
+  cfg.jobCount = FLAGS_cc_env_job_count;
 
   // These flags are only used in "remote" mode (not supported):
   cfg.rpcAddress = "";
