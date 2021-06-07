@@ -163,13 +163,14 @@ DEFINE_string(
     "0,/2,-10,+10,*2",
     "List of actions specifying how cwnd should be updated. The "
     "first action is required to be 0 (no-op action).");
-DEFINE_bool(
-    cc_env_reward_log_ratio,
-    false,
-    "If true, then instead of "
-    " a * throughput - b * delay - c * loss "
-    "we use as reward "
-    " a * log(a' + throughput) - b * log(b' + delay) - c * log(c' + loss)");
+DEFINE_double(cc_env_uplink_bandwidth, 0.0,
+              "Maximum bandwidth (in MBytes/s) achievable by the uplink");
+DEFINE_string(cc_env_reward_formula, "log_ratio",
+              "Which formula to use for the reward, among: "
+              "linear, log_ratio, min_throughput "
+              "(see pantheon_env.py for details)");
+DEFINE_double(cc_env_reward_delay_offset, 0.1,
+              "Offset to remove from the delay when computing the reward (o)");
 DEFINE_double(
     cc_env_reward_throughput_factor,
     0.1,
@@ -194,11 +195,19 @@ DEFINE_double(
     cc_env_reward_packet_loss_log_offset,
     1.0,
     "Offset to add to packet loss in log version (c')");
+DEFINE_double(
+    cc_env_reward_min_throughput_ratio, 0.9,
+    "Ratio of the maximum achievable bandwidth that we want to reach (r)");
+DEFINE_double(
+    cc_env_reward_n_packets_offset, 1.0,
+    "Offset to add to the estimated number of packets in the queue (k).");
 DEFINE_bool(
     cc_env_reward_max_delay,
     true,
     "Whether to take max delay over observations in reward."
     "Otherwise, avg delay is used.");
+DEFINE_uint32(cc_env_reward_target_cwnd, 0,
+              "Target CWND that we want the agent to reach.");
 DEFINE_uint32(
     cc_env_fixed_cwnd,
     10,
@@ -258,14 +267,35 @@ makeRLCongestionControllerFactory() {
 
   cfg.parseActionsFromString(FLAGS_cc_env_actions);
 
-  cfg.rewardLogRatio = FLAGS_cc_env_reward_log_ratio;
+  if (FLAGS_cc_env_reward_formula == "linear") {
+    cfg.rewardFormula = Config::RewardFormula::LINEAR;
+  } else if (FLAGS_cc_env_reward_formula == "log_ratio") {
+    cfg.rewardFormula = Config::RewardFormula::LOG_RATIO;
+  } else if (FLAGS_cc_env_reward_formula == "min_throughput") {
+    cfg.rewardFormula = Config::RewardFormula::MIN_THROUGHPUT;
+  } else if (FLAGS_cc_env_reward_formula == "target_cwnd") {
+    cfg.rewardFormula = Config::RewardFormula::TARGET_CWND;
+  } else if (FLAGS_cc_env_reward_formula == "target_cwnd_shaped") {
+    cfg.rewardFormula = Config::RewardFormula::TARGET_CWND_SHAPED;
+  } else if (FLAGS_cc_env_reward_formula == "higher_is_better") {
+    cfg.rewardFormula = Config::RewardFormula::HIGHER_IS_BETTER;
+  } else {
+    LOG(FATAL) << "Unknown cc_env_reward_formula: "
+               << FLAGS_cc_env_reward_formula;
+  }
+
+  cfg.uplinkBandwidth = FLAGS_cc_env_uplink_bandwidth;
+  cfg.delayOffset = FLAGS_cc_env_reward_delay_offset;
   cfg.throughputFactor = FLAGS_cc_env_reward_throughput_factor;
   cfg.throughputLogOffset = FLAGS_cc_env_reward_throughput_log_offset;
   cfg.delayFactor = FLAGS_cc_env_reward_delay_factor;
   cfg.delayLogOffset = FLAGS_cc_env_reward_delay_log_offset;
   cfg.packetLossFactor = FLAGS_cc_env_reward_packet_loss_factor;
   cfg.packetLossLogOffset = FLAGS_cc_env_reward_packet_loss_log_offset;
+  cfg.minThroughputRatio = FLAGS_cc_env_reward_min_throughput_ratio;
+  cfg.nPacketsOffset = FLAGS_cc_env_reward_n_packets_offset;
   cfg.maxDelayInReward = FLAGS_cc_env_reward_max_delay;
+  cfg.targetCwnd = FLAGS_cc_env_reward_target_cwnd;
   cfg.fixedCwnd = FLAGS_cc_env_fixed_cwnd;
   cfg.minRTTWindowLength =
       std::chrono::microseconds(FLAGS_cc_env_min_rtt_window_length_us);
