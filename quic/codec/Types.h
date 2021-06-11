@@ -44,7 +44,7 @@ constexpr auto kMaxPacketNumEncodingSize = 4;
 constexpr auto kNumInitialAckBlocksPerFrame = 32;
 
 template <class T>
-using IntervalSetVec = SmallVec<T, kNumInitialAckBlocksPerFrame, uint16_t>;
+using IntervalSetVec = SmallVec<T, kNumInitialAckBlocksPerFrame, uint32_t>;
 using AckBlocks = IntervalSet<PacketNum, 1, IntervalSetVec>;
 
 struct PaddingFrame {
