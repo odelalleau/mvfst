@@ -167,6 +167,14 @@ DEFINE_double(
     cc_env_uplink_bandwidth,
     0.0,
     "Maximum bandwidth (in MBytes/s) achievable by the uplink");
+DEFINE_int32(
+    cc_env_uplink_queue_size_bytes,
+    1,
+    "Size of the uplink queue (in bytes)");
+DEFINE_uint32(
+    cc_env_base_rtt,
+    1,
+    "Minimum RTT that can be achieved based on network settings (in ms)");
 DEFINE_string(
     cc_env_reward_formula,
     "log_ratio",
@@ -204,20 +212,26 @@ DEFINE_double(
 DEFINE_double(
     cc_env_reward_min_throughput_ratio,
     0.9,
-    "Ratio of the maximum achievable bandwidth that we want to reach (r)");
+    "Min ratio of the maximum achievable throughput / target cwnd "
+    "that we want to reach (r).");
+DEFINE_double(
+    cc_env_reward_max_throughput_ratio,
+    1.0,
+    "Max ratio of the maximum achievable throughput / target cwnd "
+    "that we want to reach (r).");
 DEFINE_double(
     cc_env_reward_n_packets_offset,
     1.0,
     "Offset to add to the estimated number of packets in the queue (k).");
+DEFINE_double(
+    cc_env_reward_uplink_queue_max_fill_ratio,
+    0.5,
+    "We allow the uplink queue to be filled up to this ratio without penalty (f)");
 DEFINE_bool(
     cc_env_reward_max_delay,
     true,
     "Whether to take max delay over observations in reward."
     "Otherwise, avg delay is used.");
-DEFINE_uint32(
-    cc_env_reward_target_cwnd,
-    0,
-    "Target CWND that we want the agent to reach.");
 DEFINE_uint32(
     cc_env_fixed_cwnd,
     10,
@@ -226,6 +240,11 @@ DEFINE_uint64(
     cc_env_min_rtt_window_length_us,
     quic::kMinRTTWindowLength.count(),
     "Window length (in us) of min RTT filter used to estimate delay");
+DEFINE_double(
+    cc_env_ack_delay_avg_coeff,
+    0.1,
+    "Moving average coefficient used to compute the average ACK delay "
+    "(weight of new observations: higher values update the average faster)");
 
 namespace quic {
 namespace tperf {
@@ -289,12 +308,22 @@ makeRLCongestionControllerFactory() {
     cfg.rewardFormula = Config::RewardFormula::TARGET_CWND_SHAPED;
   } else if (FLAGS_cc_env_reward_formula == "higher_is_better") {
     cfg.rewardFormula = Config::RewardFormula::HIGHER_IS_BETTER;
+  } else if (FLAGS_cc_env_reward_formula == "above_cwnd") {
+    cfg.rewardFormula = Config::RewardFormula::ABOVE_CWND;
+  } else if (FLAGS_cc_env_reward_formula == "cwnd_range") {
+    cfg.rewardFormula = Config::RewardFormula::CWND_RANGE;
+  } else if (FLAGS_cc_env_reward_formula == "cwnd_range_soft") {
+    cfg.rewardFormula = Config::RewardFormula::CWND_RANGE_SOFT;
+  } else if (FLAGS_cc_env_reward_formula == "cwnd_tradeoff") {
+    cfg.rewardFormula = Config::RewardFormula::CWND_TRADEOFF;
   } else {
     LOG(FATAL) << "Unknown cc_env_reward_formula: "
                << FLAGS_cc_env_reward_formula;
   }
 
   cfg.uplinkBandwidth = FLAGS_cc_env_uplink_bandwidth;
+  cfg.uplinkQueueSizeBytes = FLAGS_cc_env_uplink_queue_size_bytes;
+  cfg.baseRTT = FLAGS_cc_env_base_rtt;
   cfg.delayOffset = FLAGS_cc_env_reward_delay_offset;
   cfg.throughputFactor = FLAGS_cc_env_reward_throughput_factor;
   cfg.throughputLogOffset = FLAGS_cc_env_reward_throughput_log_offset;
@@ -303,12 +332,14 @@ makeRLCongestionControllerFactory() {
   cfg.packetLossFactor = FLAGS_cc_env_reward_packet_loss_factor;
   cfg.packetLossLogOffset = FLAGS_cc_env_reward_packet_loss_log_offset;
   cfg.minThroughputRatio = FLAGS_cc_env_reward_min_throughput_ratio;
+  cfg.maxThroughputRatio = FLAGS_cc_env_reward_max_throughput_ratio;
   cfg.nPacketsOffset = FLAGS_cc_env_reward_n_packets_offset;
+  cfg.uplinkQueueMaxFillRatio = FLAGS_cc_env_reward_uplink_queue_max_fill_ratio;
   cfg.maxDelayInReward = FLAGS_cc_env_reward_max_delay;
-  cfg.targetCwnd = FLAGS_cc_env_reward_target_cwnd;
   cfg.fixedCwnd = FLAGS_cc_env_fixed_cwnd;
   cfg.minRTTWindowLength =
       std::chrono::microseconds(FLAGS_cc_env_min_rtt_window_length_us);
+  cfg.ackDelayAvgCoeff = FLAGS_cc_env_ack_delay_avg_coeff;
 
   auto envFactory = std::make_shared<quic::CongestionControlEnvFactory>(cfg);
   return std::make_shared<quic::RLCongestionControllerFactory>(envFactory);

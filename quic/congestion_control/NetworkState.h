@@ -26,9 +26,11 @@ public:
     RTT_MIN = 0,
     RTT_STANDING,
     LRTT,
+    LDRTT,
     SRTT,
     RTT_VAR,
     DELAY,
+    ACK_DELAY,
 
     // Bytes related
     CWND,

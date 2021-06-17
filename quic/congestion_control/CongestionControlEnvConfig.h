@@ -37,6 +37,10 @@ struct CongestionControlEnvConfig {
     TARGET_CWND,
     TARGET_CWND_SHAPED,
     HIGHER_IS_BETTER,
+    ABOVE_CWND,
+    CWND_RANGE,
+    CWND_RANGE_SOFT,
+    CWND_TRADEOFF,
   };
 
   // Type of aggregation to group state updates
@@ -92,6 +96,8 @@ struct CongestionControlEnvConfig {
   // Parameters for reward components
   RewardFormula rewardFormula{RewardFormula::LOG_RATIO};
   float uplinkBandwidth{0.0};
+  uint32_t uplinkQueueSizeBytes{1}; // 1 by default to avoid division by zero
+  uint32_t baseRTT{1};              // 1 by default to avoid division by zero
   float delayOffset{0.0};
   float throughputFactor{0.1};
   float throughputLogOffset{1.0};
@@ -100,18 +106,23 @@ struct CongestionControlEnvConfig {
   float packetLossFactor{0.0};
   float packetLossLogOffset{1.0};
   float minThroughputRatio{0.9};
+  float maxThroughputRatio{1.0};
   float nPacketsOffset{1.0};
-  float targetCwnd{0.0};
+  float uplinkQueueMaxFillRatio{0.5};
 
   // Whether to use max delay within a window in reward (avg otherwise)
   bool maxDelayInReward{true};
+
+  // Moving average coefficient used to compute the average ACK delay
+  // (weight of new observations: higher values update the average faster)
+  float ackDelayAvgCoeff{0.1};
 
   // 'fixed' env mode only: the target cwnd value we want to reach
   uint32_t fixedCwnd{10};
 
   /// RLCongestionController settings
 
-  // Window duration used to compute the min RTT.
+  // Window duration used to compute the min RTT
   std::chrono::microseconds minRTTWindowLength{kMinRTTWindowLength};
 
   /// Helper functions

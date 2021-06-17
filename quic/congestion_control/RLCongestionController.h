@@ -86,6 +86,7 @@ private:
   uint32_t prevTotalPTOCount_{0};
   uint32_t prevRtxCount_{0};
   uint32_t prevTimeoutBasedRtxCount_{0};
+  float avgAckDelayMs_{0};
 };
 
 } // namespace quic

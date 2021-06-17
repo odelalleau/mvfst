@@ -57,7 +57,7 @@ Bandwidth RLBandwidthSampler::getBandwidth() const noexcept {
     }
   }
 
-  VLOG(10) << __func__ << "Computing bandwidth based on " << ackBytes
+  VLOG(10) << __func__ << ": Computing bandwidth based on " << ackBytes
            << " acknowledged bytes over " << (windowDuration.count() / 1000)
            << " ms";
 

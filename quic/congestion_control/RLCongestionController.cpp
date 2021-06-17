@@ -1,11 +1,11 @@
 /*
-* Copyright (c) Facebook, Inc. and its affiliates.
-* All rights reserved.
-*
-* This source code is licensed under the license found in the
-* LICENSE file in the root directory of this source tree.
-*
-*/
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the license found in the
+ * LICENSE file in the root directory of this source tree.
+ *
+ */
 #include <quic/common/TimeUtil.h>
 #include <quic/congestion_control/CongestionControlFunctions.h>
 #include <quic/congestion_control/Copa.h>
@@ -138,13 +138,24 @@ bool RLCongestionController::setNetworkState(
 
   const float normMs = env_->normMs();
   const float normBytes = env_->normBytes();
+  const CongestionControlEnv::Config &cfg = env_->config();
 
   obs[Field::RTT_MIN] = rttMin.count() / 1000.0 / normMs;
   obs[Field::RTT_STANDING] = rttStanding / 1000.0 / normMs;
+  // `lrtt` is the last observed RTT
+  // `ldrtt` is the last observed RTT *including* ACK delay
+  // `srtt` is a moving average of observed RTTs with coefficient 1/kRttAlpha
   obs[Field::LRTT] = state.lrtt.count() / 1000.0 / normMs;
+  obs[Field::LDRTT] = state.ldrtt.count() / 1000.0 / normMs;
   obs[Field::SRTT] = state.srtt.count() / 1000.0 / normMs;
   obs[Field::RTT_VAR] = state.rttvar.count() / 1000.0 / normMs;
   obs[Field::DELAY] = delay / 1000.0 / normMs;
+
+  // The ACK delay is smoothed with an exponential moving average.
+  avgAckDelayMs_ =
+      (1.f - cfg.ackDelayAvgCoeff) * avgAckDelayMs_ +
+      cfg.ackDelayAvgCoeff * state.lastAckDelay.count() / 1000.f;
+  obs[Field::ACK_DELAY] = avgAckDelayMs_ / normMs;
 
   obs[Field::CWND] = cwndBytes_ / normBytes;
   obs[Field::IN_FLIGHT] = bytesInFlight_ / normBytes;
