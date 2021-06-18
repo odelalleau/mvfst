@@ -20,6 +20,8 @@
 #include <quic/state/stream/StreamSendHandlers.h>
 #include "quic/codec/QuicConnectionId.h"
 
+using namespace testing;
+
 namespace quic {
 namespace test {
 
@@ -264,34 +266,11 @@ void setupCtxWithTestCert(fizz::server::FizzServerContext& ctx) {
   ctx.setCertManager(std::move(certManager));
 }
 
-template <class T>
-std::unique_ptr<T> createNoOpAeadImpl() {
-  // Fake that the handshake has already occured
-  auto aead = std::make_unique<NiceMock<T>>();
-  ON_CALL(*aead, _inplaceEncrypt(_, _, _))
-      .WillByDefault(Invoke([&](auto& buf, auto, auto) {
-        if (buf) {
-          return std::move(buf);
-        } else {
-          return folly::IOBuf::create(0);
-        }
-      }));
-  // Fake that the handshake has already occured and fix the keys.
-  ON_CALL(*aead, _decrypt(_, _, _))
-      .WillByDefault(
-          Invoke([&](auto& buf, auto, auto) { return buf->clone(); }));
-  ON_CALL(*aead, _tryDecrypt(_, _, _))
-      .WillByDefault(
-          Invoke([&](auto& buf, auto, auto) { return buf->clone(); }));
-  ON_CALL(*aead, getCipherOverhead()).WillByDefault(Return(0));
-  return aead;
-}
-
 std::unique_ptr<MockAead> createNoOpAead() {
   return createNoOpAeadImpl<MockAead>();
 }
 
-std::unique_ptr<PacketNumberCipher> createNoOpHeaderCipher() {
+std::unique_ptr<MockPacketNumberCipher> createNoOpHeaderCipher() {
   auto headerCipher = std::make_unique<NiceMock<MockPacketNumberCipher>>();
   ON_CALL(*headerCipher, mask(_)).WillByDefault(Return(HeaderProtectionMask{}));
   ON_CALL(*headerCipher, keyLength()).WillByDefault(Return(16));
@@ -333,7 +312,7 @@ RegularQuicPacketBuilder::Packet createStreamPacket(
   }
   builder->encodePacketHeader();
   builder->accountForCipherOverhead(cipherOverhead);
-  writeStreamFrameHeader(
+  auto dataLen = *writeStreamFrameHeader(
       *builder,
       streamId,
       offset,
@@ -341,7 +320,10 @@ RegularQuicPacketBuilder::Packet createStreamPacket(
       data.computeChainDataLength(),
       eof,
       folly::none /* skipLenHint */);
-  writeStreamFrameData(*builder, data.clone(), data.computeChainDataLength());
+  writeStreamFrameData(
+      *builder,
+      data.clone(),
+      std::min(folly::to<size_t>(dataLen), data.computeChainDataLength()));
   return std::move(*builder).buildPacket();
 }
 
@@ -562,7 +544,8 @@ OutstandingPacket makeTestingWritePacket(
     size_t desiredSize,
     uint64_t totalBytesSent,
     TimePoint sentTime /* = Clock::now() */,
-    uint64_t inflightBytes /* = 0 */) {
+    uint64_t inflightBytes /* = 0 */,
+    uint64_t writeCount /* = 0 */) {
   LongHeader longHeader(
       LongHeader::Types::ZeroRtt,
       getTestConnectionId(1),
@@ -571,7 +554,17 @@ OutstandingPacket makeTestingWritePacket(
       QuicVersion::MVFST);
   RegularQuicWritePacket packet(std::move(longHeader));
   return OutstandingPacket(
-      packet, sentTime, desiredSize, false, totalBytesSent, inflightBytes);
+      packet,
+      sentTime,
+      desiredSize,
+      0,
+      false,
+      totalBytesSent,
+      0,
+      inflightBytes,
+      0,
+      LossState(),
+      writeCount);
 }
 
 CongestionController::AckEvent makeAck(
@@ -775,5 +768,72 @@ void overridePacketWithToken(
       token.size());
 }
 
+bool writableContains(QuicStreamManager& streamManager, StreamId streamId) {
+  return streamManager.writableStreams().count(streamId) > 0 ||
+      streamManager.writableControlStreams().count(streamId) > 0;
+}
+
+std::unique_ptr<PacketNumberCipher>
+FizzCryptoTestFactory::makePacketNumberCipher(fizz::CipherSuite) const {
+  return std::move(packetNumberCipher_);
+}
+
+std::unique_ptr<PacketNumberCipher>
+FizzCryptoTestFactory::makePacketNumberCipher(folly::ByteRange secret) const {
+  return _makePacketNumberCipher(secret);
+}
+
+void FizzCryptoTestFactory::setMockPacketNumberCipher(
+    std::unique_ptr<PacketNumberCipher> packetNumberCipher) {
+  packetNumberCipher_ = std::move(packetNumberCipher);
+}
+
+void FizzCryptoTestFactory::setDefault() {
+  ON_CALL(*this, _makePacketNumberCipher(_))
+      .WillByDefault(Invoke([&](folly::ByteRange secret) {
+        return FizzCryptoFactory::makePacketNumberCipher(secret);
+      }));
+}
+
+void TestPacketBatchWriter::reset() {
+  bufNum_ = 0;
+  bufSize_ = 0;
+}
+
+bool TestPacketBatchWriter::append(
+    std::unique_ptr<folly::IOBuf>&& /*unused*/,
+    size_t size,
+    const folly::SocketAddress& /*unused*/,
+    folly::AsyncUDPSocket* /*unused*/) {
+  bufNum_++;
+  bufSize_ += size;
+  return ((maxBufs_ < 0) || (bufNum_ >= maxBufs_));
+}
+
+ssize_t TestPacketBatchWriter::write(
+    folly::AsyncUDPSocket& /*unused*/,
+    const folly::SocketAddress& /*unused*/) {
+  return bufSize_;
+}
+
+TrafficKey getQuicTestKey() {
+  TrafficKey testKey;
+  testKey.key = folly::IOBuf::copyBuffer(
+      folly::unhexlify("000102030405060708090A0B0C0D0E0F"));
+  testKey.iv =
+      folly::IOBuf::copyBuffer(folly::unhexlify("000102030405060708090A0B"));
+  return testKey;
+}
+
+std::unique_ptr<folly::IOBuf> getProtectionKey() {
+  FizzCryptoFactory factory;
+  auto secret = folly::range(getRandSecret());
+  auto pnCipher =
+      factory.makePacketNumberCipher(fizz::CipherSuite::TLS_AES_128_GCM_SHA256);
+  auto deriver = factory.getFizzFactory()->makeKeyDeriver(
+      fizz::CipherSuite::TLS_AES_128_GCM_SHA256);
+  return deriver->expandLabel(
+      secret, kQuicPNLabel, folly::IOBuf::create(0), pnCipher->keyLength());
+}
 } // namespace test
 } // namespace quic

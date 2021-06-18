@@ -16,6 +16,7 @@
 #include <quic/api/QuicTransportBase.h>
 #include <quic/client/state/ClientStateMachine.h>
 #include <quic/common/BufUtil.h>
+#include <quic/state/QuicConnectionStats.h>
 
 namespace quic {
 
@@ -32,6 +33,14 @@ class QuicClientTransport
       std::unique_ptr<folly::AsyncUDPSocket> socket,
       std::shared_ptr<ClientHandshakeFactory> handshakeFactory,
       size_t connectionIdSize = 0);
+
+  // Testing only API:
+  QuicClientTransport(
+      folly::EventBase* evb,
+      std::unique_ptr<folly::AsyncUDPSocket> socket,
+      std::shared_ptr<ClientHandshakeFactory> handshakeFactory,
+      size_t connectionIdSize,
+      PacketNum startingPacketNum);
 
   ~QuicClientTransport() override;
 
@@ -204,10 +213,10 @@ class QuicClientTransport
   HappyEyeballsConnAttemptDelayTimeout happyEyeballsConnAttemptDelayTimeout_;
 
  private:
-  void setPartialReliabilityTransportParameter();
   void setD6DBasePMTUTransportParameter();
   void setD6DRaiseTimeoutTransportParameter();
   void setD6DProbeTimeoutTransportParameter();
+  void setSupportedExtensionTransportParameters();
   void adjustGROBuffers();
   void trackDatagramReceived(size_t len);
 

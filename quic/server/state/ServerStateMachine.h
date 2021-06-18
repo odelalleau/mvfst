@@ -17,13 +17,12 @@
 #include <quic/congestion_control/CongestionControllerFactory.h>
 #include <quic/congestion_control/QuicCubic.h>
 #include <quic/flowcontrol/QuicFlowController.h>
-#include <quic/logging/QuicLogger.h>
+
 #include <quic/loss/QuicLossFunctions.h>
 #include <quic/server/handshake/ServerHandshake.h>
 #include <quic/server/handshake/ServerHandshakeFactory.h>
 #include <quic/server/state/ServerConnectionIdRejector.h>
 #include <quic/state/AckHandlers.h>
-#include <quic/state/QPRFunctions.h>
 #include <quic/state/QuicStateFunctions.h>
 #include <quic/state/QuicStreamFunctions.h>
 #include <quic/state/SimpleFrameFunctions.h>
@@ -152,15 +151,16 @@ struct QuicServerConnectionState : public QuicConnectionStateBase {
     // TODO: this is wrong, it should be the handshake finish time. But i need
     // a relatively sane time now to make the timestamps all sane.
     connectionTime = Clock::now();
-    supportedVersions =
-        std::vector<QuicVersion>{{QuicVersion::MVFST,
-                                  QuicVersion::MVFST_D24,
-                                  QuicVersion::MVFST_EXPERIMENTAL,
-                                  QuicVersion::QUIC_DRAFT,
-                                  QuicVersion::QUIC_DRAFT_LEGACY}};
+    supportedVersions = std::vector<QuicVersion>{
+        {QuicVersion::MVFST,
+         QuicVersion::MVFST_D24,
+         QuicVersion::MVFST_EXPERIMENTAL,
+         QuicVersion::QUIC_DRAFT,
+         QuicVersion::QUIC_DRAFT_LEGACY}};
     originalVersion = QuicVersion::MVFST;
     DCHECK(handshakeFactory);
-    auto tmpServerHandshake = handshakeFactory->makeServerHandshake(this);
+    auto tmpServerHandshake =
+        std::move(*handshakeFactory).makeServerHandshake(this);
     serverHandshakeLayer = tmpServerHandshake.get();
     handshakeLayer = std::move(tmpServerHandshake);
     // We shouldn't normally need to set this until we're starting the
@@ -220,4 +220,8 @@ void onConnectionMigration(
     QuicServerConnectionState& conn,
     const folly::SocketAddress& newPeerAddress,
     bool isIntentional = false);
+
+std::vector<TransportParameter> setSupportedExtensionTransportParameters(
+    QuicServerConnectionState& conn);
+
 } // namespace quic

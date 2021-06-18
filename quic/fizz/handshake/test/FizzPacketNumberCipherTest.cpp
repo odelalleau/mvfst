@@ -67,6 +67,7 @@ TEST_P(LongPacketNumberCipherTest, TestEncryptDecrypt) {
   auto key = folly::unhexlify(GetParam().key);
   EXPECT_EQ(cipher->keyLength(), key.size());
   cipher->setKey(folly::range(key));
+  EXPECT_TRUE(!memcmp(cipher->getKey()->data(), key.c_str(), key.size()));
   CipherBytes cipherBytes(
       GetParam().sample,
       GetParam().decryptedInitialByte,
@@ -93,20 +94,22 @@ INSTANTIATE_TEST_CASE_P(
     LongPacketNumberCipherTests,
     LongPacketNumberCipherTest,
     ::testing::Values(
-        HeaderParams{fizz::CipherSuite::TLS_AES_128_GCM_SHA256,
-                     folly::StringPiece{"0edd982a6ac527f2eddcbb7348dea5d7"},
-                     folly::StringPiece{"0000f3a694c75775b4e546172ce9e047"},
-                     folly::StringPiece{"0dbc195a"},
-                     folly::StringPiece{"c1"},
-                     folly::StringPiece{"00000002"},
-                     folly::StringPiece{"c3"}},
-        HeaderParams{fizz::CipherSuite::TLS_AES_128_GCM_SHA256,
-                     folly::StringPiece{"94b9452d2b3c7c7f6da7fdd8593537fd"},
-                     folly::StringPiece{"c4c2a2303d297e3c519bf6b22386e3d0"},
-                     folly::StringPiece{"f7ed5f01"},
-                     folly::StringPiece{"c4"},
-                     folly::StringPiece{"00015f01"},
-                     folly::StringPiece{"c1"}},
+        HeaderParams{
+            fizz::CipherSuite::TLS_AES_128_GCM_SHA256,
+            folly::StringPiece{"0edd982a6ac527f2eddcbb7348dea5d7"},
+            folly::StringPiece{"0000f3a694c75775b4e546172ce9e047"},
+            folly::StringPiece{"0dbc195a"},
+            folly::StringPiece{"c1"},
+            folly::StringPiece{"00000002"},
+            folly::StringPiece{"c3"}},
+        HeaderParams{
+            fizz::CipherSuite::TLS_AES_128_GCM_SHA256,
+            folly::StringPiece{"94b9452d2b3c7c7f6da7fdd8593537fd"},
+            folly::StringPiece{"c4c2a2303d297e3c519bf6b22386e3d0"},
+            folly::StringPiece{"f7ed5f01"},
+            folly::StringPiece{"c4"},
+            folly::StringPiece{"00015f01"},
+            folly::StringPiece{"c1"}},
         HeaderParams{
             fizz::CipherSuite::TLS_AES_256_GCM_SHA384,
             folly::StringPiece{

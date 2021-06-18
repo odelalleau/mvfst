@@ -12,6 +12,7 @@
 #include <quic/congestion_control/BbrBandwidthSampler.h>
 #include <quic/congestion_control/BbrRttSampler.h>
 #include <quic/congestion_control/Copa.h>
+#include <quic/congestion_control/Copa2.h>
 #include <quic/congestion_control/NewReno.h>
 #include <quic/congestion_control/QuicCCP.h>
 #include <quic/congestion_control/QuicCubic.h>
@@ -28,11 +29,22 @@ ServerCongestionControllerFactory::makeCongestionController(
     case CongestionControlType::NewReno:
       congestionController = std::make_unique<NewReno>(conn);
       break;
+    case CongestionControlType::CCP:
+#ifdef CCP_ENABLED
+      congestionController = std::make_unique<CCP>(conn);
+      break;
+#else
+      LOG(ERROR)
+          << "Server CC Factory cannot make CCP (unless recompiled with -DCCP_ENABLED). Falling back to cubic.";
+#endif
     case CongestionControlType::Cubic:
       congestionController = std::make_unique<Cubic>(conn);
       break;
     case CongestionControlType::Copa:
       congestionController = std::make_unique<Copa>(conn);
+      break;
+    case CongestionControlType::Copa2:
+      congestionController = std::make_unique<Copa2>(conn);
       break;
     case CongestionControlType::BBR: {
       auto bbr = std::make_unique<BbrCongestionController>(conn);
@@ -42,15 +54,6 @@ ServerCongestionControllerFactory::makeCongestionController(
       congestionController = std::move(bbr);
       break;
     }
-    case CongestionControlType::CCP:
-#ifdef CCP_ENABLED
-      congestionController = std::make_unique<CCP>(conn);
-#else
-      throw QuicInternalException(
-          "ccp not enabled. must be compiled with -DCCP_ENABLED",
-          LocalErrorCode::INTERNAL_ERROR);
-#endif
-      break;
     case CongestionControlType::RL:
       throw QuicInternalException(
           "Use RLCongestionControllerFactory for RL-based congestion control",
@@ -58,7 +61,11 @@ ServerCongestionControllerFactory::makeCongestionController(
       break;
     case CongestionControlType::None:
       break;
+    case CongestionControlType::MAX:
+      throw QuicInternalException(
+          "MAX is not a valid cc algorithm.", LocalErrorCode::INTERNAL_ERROR);
   }
+  QUIC_STATS(conn.statsCallback, onNewCongestionController, type);
   return congestionController;
 }
 } // namespace quic

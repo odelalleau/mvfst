@@ -22,6 +22,7 @@
 #include <quic/logging/QLoggerConstants.h>
 #include <quic/loss/QuicLossFunctions.h>
 #include <quic/state/AckHandlers.h>
+#include <quic/state/DatagramHandlers.h>
 #include <quic/state/QuicPacingFunctions.h>
 #include <quic/state/SimpleFrameFunctions.h>
 #include <quic/state/stream/StreamReceiveHandlers.h>
@@ -37,6 +38,20 @@ QuicClientTransport::QuicClientTransport(
     folly::EventBase* evb,
     std::unique_ptr<folly::AsyncUDPSocket> socket,
     std::shared_ptr<ClientHandshakeFactory> handshakeFactory,
+    size_t connectionIdSize,
+    PacketNum startingPacketNum)
+    : QuicClientTransport(
+          evb,
+          std::move(socket),
+          std::move(handshakeFactory),
+          connectionIdSize) {
+  conn_->ackStates = AckStates(startingPacketNum);
+}
+
+QuicClientTransport::QuicClientTransport(
+    folly::EventBase* evb,
+    std::unique_ptr<folly::AsyncUDPSocket> socket,
+    std::shared_ptr<ClientHandshakeFactory> handshakeFactory,
     size_t connectionIdSize)
     : QuicTransportBase(evb, std::move(socket)),
       happyEyeballsConnAttemptDelayTimeout_(this) {
@@ -45,6 +60,7 @@ QuicClientTransport::QuicClientTransport(
       std::make_unique<QuicClientConnectionState>(std::move(handshakeFactory));
   clientConn_ = tempConn.get();
   conn_.reset(tempConn.release());
+  conn_->observers = observers_;
 
   auto srcConnId = connectionIdSize > 0
       ? ConnectionId::createRandom(connectionIdSize)
@@ -124,6 +140,34 @@ void QuicClientTransport::processUDPData(
       << "Leaving " << udpData.chainLength()
       << " bytes unprocessed after attempting to process "
       << kMaxNumCoalescedPackets << " packets.";
+
+  // Process any pending 1RTT and handshake packets if we have keys.
+  if (conn_->readCodec->getOneRttReadCipher() &&
+      !clientConn_->pendingOneRttData.empty()) {
+    BufQueue pendingPacket;
+    for (auto& pendingData : clientConn_->pendingOneRttData) {
+      pendingPacket.append(std::move(pendingData.networkData.data));
+      processPacketData(
+          pendingData.peer,
+          pendingData.networkData.receiveTimePoint,
+          pendingPacket);
+      pendingPacket.move();
+    }
+    clientConn_->pendingOneRttData.clear();
+  }
+  if (conn_->readCodec->getHandshakeReadCipher() &&
+      !clientConn_->pendingHandshakeData.empty()) {
+    BufQueue pendingPacket;
+    for (auto& pendingData : clientConn_->pendingHandshakeData) {
+      pendingPacket.append(std::move(pendingData.networkData.data));
+      processPacketData(
+          pendingData.peer,
+          pendingData.networkData.receiveTimePoint,
+          pendingPacket);
+      pendingPacket.move();
+    }
+    clientConn_->pendingHandshakeData.clear();
+  }
 }
 
 void QuicClientTransport::processPacketData(
@@ -170,6 +214,10 @@ void QuicClientTransport::processPacketData(
       return;
     }
 
+    if (happyEyeballsEnabled_) {
+      happyEyeballsOnDataReceived(
+          *conn_, happyEyeballsConnAttemptDelayTimeout_, socket_, peer);
+    }
     // Set the destination connection ID to be the value from the source
     // connection id of the retry packet
     clientConn_->initialDestinationConnectionId =
@@ -192,15 +240,58 @@ void QuicClientTransport::processPacketData(
     return;
   }
 
+  auto cipherUnavailable = parsedPacket.cipherUnavailable();
+  if (cipherUnavailable && cipherUnavailable->packet &&
+      !cipherUnavailable->packet->empty() &&
+      (cipherUnavailable->protectionType == ProtectionType::KeyPhaseZero ||
+       cipherUnavailable->protectionType == ProtectionType::Handshake) &&
+      clientConn_->pendingOneRttData.size() +
+              clientConn_->pendingHandshakeData.size() <
+          clientConn_->transportSettings.maxPacketsToBuffer) {
+    auto& pendingData =
+        cipherUnavailable->protectionType == ProtectionType::KeyPhaseZero
+        ? clientConn_->pendingOneRttData
+        : clientConn_->pendingHandshakeData;
+    pendingData.emplace_back(
+        NetworkDataSingle(
+            std::move(cipherUnavailable->packet), receiveTimePoint),
+        peer);
+    if (conn_->qLogger) {
+      conn_->qLogger->addPacketBuffered(
+          cipherUnavailable->packetNum,
+          cipherUnavailable->protectionType,
+          packetSize);
+    }
+    return;
+  }
+
   RegularQuicPacket* regularOptional = parsedPacket.regularPacket();
   if (!regularOptional) {
     QUIC_STATS(statsCallback_, onPacketDropped, PacketDropReason::PARSE_ERROR);
     if (conn_->qLogger) {
       conn_->qLogger->addPacketDrop(packetSize, kParse);
     }
-    QUIC_TRACE(packet_drop, *conn_, "parse");
     return;
   }
+
+  if (regularOptional->frames.empty()) {
+    // This is either a packet that has no data (long-header parsed but no data
+    // found) or a regular packet with a short header and no frames. Both are
+    // protocol violations.
+    QUIC_STATS(
+        conn_->statsCallback,
+        onPacketDropped,
+        PacketDropReason::PROTOCOL_VIOLATION);
+    if (conn_->qLogger) {
+      conn_->qLogger->addPacketDrop(
+          packetSize,
+          QuicTransportStatsCallback::toString(
+              PacketDropReason::PROTOCOL_VIOLATION));
+    }
+    throw QuicTransportException(
+        "Packet has no frames", TransportErrorCode::PROTOCOL_VIOLATION);
+  }
+
   if (happyEyeballsEnabled_) {
     CHECK(socket_);
     happyEyeballsOnDataReceived(
@@ -299,14 +390,7 @@ void QuicClientTransport::processPacketData(
                 // finished message. We can mark the handshake as confirmed and
                 // drop the handshake cipher and outstanding packets after the
                 // processing loop.
-                if (conn_->handshakeWriteCipher) {
-                  conn_->handshakeLayer->handshakeConfirmed();
-                }
-                // TODO reap
-                if (*conn_->version == QuicVersion::MVFST_D24) {
-                  cancelHandshakeCryptoStreamRetransmissions(
-                      *conn_->cryptoState);
-                }
+                conn_->handshakeLayer->handshakeConfirmed();
               }
               switch (packetFrame.type()) {
                 case QuicWriteFrame::Type::WriteAckFrame: {
@@ -478,7 +562,6 @@ void QuicClientTransport::processPacketData(
         if (conn_->qLogger) {
           conn_->qLogger->addTransportStateUpdate(getPeerClose(errMsg));
         }
-        QUIC_TRACE(recvd_close, *conn_, errMsg.c_str());
         conn_->peerConnectionError = std::make_pair(
             QuicErrorCode(connFrame.errorCode), std::move(errMsg));
         throw QuicTransportException(
@@ -487,6 +570,7 @@ void QuicClientTransport::processPacketData(
       }
       case QuicFrame::Type::PingFrame:
         // Ping isn't retransmittable. But we would like to ack them early.
+        // So, make Ping frames count towards ack policy
         pktHasRetransmittableData = true;
         break;
       case QuicFrame::Type::PaddingFrame:
@@ -498,6 +582,16 @@ void QuicClientTransport::processPacketData(
             *conn_, simpleFrame, packetNum, false);
         break;
       }
+      case QuicFrame::Type::DatagramFrame: {
+        DatagramFrame& frame = *quicFrame.asDatagramFrame();
+        VLOG(10) << "Client received datagram data: "
+                 << "len=" << frame.length << " " << *this;
+        // Datagram isn't retransmittable. But we would like to ack them early.
+        // So, make Datagram frames count towards ack policy
+        pktHasRetransmittableData = true;
+        handleDatagram(*conn_, frame);
+        break;
+      }
       default:
         break;
     }
@@ -505,7 +599,7 @@ void QuicClientTransport::processPacketData(
 
   auto handshakeLayer = clientConn_->clientHandshakeLayer;
   if (handshakeLayer->getPhase() == ClientHandshake::Phase::Established &&
-      *conn_->version != QuicVersion::MVFST_D24) {
+      hasInitialOrHandshakeCiphers(*conn_)) {
     handshakeConfirmed(*conn_);
   }
 
@@ -520,8 +614,7 @@ void QuicClientTransport::processPacketData(
       oneRttKeyDerivationTriggered = true;
       updatePacingOnKeyEstablished(*conn_);
     }
-    if (conn_->oneRttWriteCipher && conn_->readCodec->getOneRttReadCipher() &&
-        conn_->version != QuicVersion::MVFST_D24) {
+    if (conn_->oneRttWriteCipher && conn_->readCodec->getOneRttReadCipher()) {
       conn_->zeroRttWriteCipher.reset();
       conn_->zeroRttWriteHeaderCipher.reset();
     }
@@ -530,13 +623,12 @@ void QuicClientTransport::processPacketData(
       if (conn_->qLogger) {
         conn_->qLogger->addTransportStateUpdate(kZeroRttRejected);
       }
-      QUIC_TRACE(zero_rtt, *conn_, "rejected");
       handshakeLayer->removePsk(hostname_);
     } else if (zeroRttRejected.has_value()) {
       if (conn_->qLogger) {
         conn_->qLogger->addTransportStateUpdate(kZeroRttAccepted);
       }
-      QUIC_TRACE(zero_rtt, *conn_, "accepted");
+      conn_->usedZeroRtt = true;
     }
     // We should get transport parameters if we've derived 1-rtt keys and 0-rtt
     // was rejected, or we have derived 1-rtt keys and 0-rtt was never
@@ -581,10 +673,6 @@ void QuicClientTransport::processPacketData(
             maxStreamsBidi.value_or(0),
             maxStreamsUni.value_or(0));
 
-        const auto& statelessResetToken = clientConn_->statelessResetToken;
-        if (statelessResetToken) {
-          conn_->readCodec->setStatelessResetToken(*statelessResetToken);
-        }
         if (zeroRttRejected.has_value() && *zeroRttRejected) {
           // verify that the new flow control parameters are >= the original
           // transport parameters that were use. This is the easy case. If the
@@ -622,6 +710,17 @@ void QuicClientTransport::processPacketData(
             std::min<uint64_t>(*updatedPacketSize, kDefaultMaxUDPPayload);
         conn_->udpSendPacketLen = *updatedPacketSize;
       }
+
+      // TODO this is another bandaid. Explicitly set the stateless reset token
+      // or else conns that use 0-RTT won't be able to parse stateless resets.
+      if (!clientConn_->statelessResetToken) {
+        clientConn_->statelessResetToken =
+            getStatelessResetTokenParameter(serverParams->parameters);
+      }
+      if (clientConn_->statelessResetToken) {
+        conn_->readCodec->setStatelessResetToken(
+            clientConn_->statelessResetToken.value());
+      }
     }
 
     if (zeroRttRejected.has_value() && *zeroRttRejected) {
@@ -632,14 +731,6 @@ void QuicClientTransport::processPacketData(
       markZeroRttPacketsLost(*conn_, markPacketLoss);
     }
   }
-  // TODO this is incorrect and needs to be removed post MVFST_D24
-  if (conn_->version == QuicVersion::MVFST_D24 &&
-      (protectionLevel == ProtectionType::KeyPhaseZero ||
-       protectionLevel == ProtectionType::KeyPhaseOne)) {
-    DCHECK(conn_->oneRttWriteCipher);
-    clientConn_->clientHandshakeLayer->handshakeConfirmed();
-    conn_->readCodec->onHandshakeDone(receiveTimePoint);
-  }
   updateAckSendStateOnRecvPacket(
       *conn_,
       ackState,
@@ -647,7 +738,7 @@ void QuicClientTransport::processPacketData(
       pktHasRetransmittableData,
       pktHasCryptoData);
   if (encryptionLevel == EncryptionLevel::Handshake &&
-      conn_->version != QuicVersion::MVFST_D24 && conn_->initialWriteCipher) {
+      conn_->initialWriteCipher) {
     conn_->initialWriteCipher.reset();
     conn_->initialHeaderCipher.reset();
     conn_->readCodec->setInitialReadCipher(nullptr);
@@ -668,7 +759,6 @@ void QuicClientTransport::onReadData(
     if (conn_->qLogger) {
       conn_->qLogger->addPacketDrop(0, kAlreadyClosed);
     }
-    QUIC_TRACE(packet_drop, *conn_, "already_closed");
     return;
   }
   bool waitingForFirstPacket = !hasReceivedPackets(*conn_);
@@ -727,8 +817,7 @@ void QuicClientTransport::writeData() {
           *conn_->oneRttWriteCipher,
           *conn_->oneRttWriteHeaderCipher);
     }
-    if (conn_->handshakeWriteCipher &&
-        *conn_->version != QuicVersion::MVFST_D24) {
+    if (conn_->handshakeWriteCipher) {
       CHECK(conn_->handshakeWriteHeaderCipher);
       writeLongClose(
           *socket_,
@@ -761,31 +850,38 @@ void QuicClientTransport::writeData() {
       (isConnectionPaced(*conn_)
            ? conn_->pacer->updateAndGetWriteBatchSize(Clock::now())
            : conn_->transportSettings.writeConnectionDataPacketsLimit);
+  // At the end of this function, clear out any probe packets credit we didn't
+  // use.
+  SCOPE_EXIT {
+    conn_->pendingEvents.numProbePackets = {};
+  };
   if (conn_->initialWriteCipher) {
     auto& initialCryptoStream =
         *getCryptoStream(*conn_->cryptoState, EncryptionLevel::Initial);
     CryptoStreamScheduler initialScheduler(*conn_, initialCryptoStream);
-
+    auto& numProbePackets =
+        conn_->pendingEvents.numProbePackets[PacketNumberSpace::Initial];
     if ((initialCryptoStream.retransmissionBuffer.size() &&
-         conn_->outstandings.initialPacketsCount &&
-         conn_->pendingEvents.numProbePackets) ||
+         conn_->outstandings.packetCount[PacketNumberSpace::Initial] &&
+         numProbePackets) ||
         initialScheduler.hasData() ||
         (conn_->ackStates.initialAckState.needsToSendAckImmediately &&
          hasAcksToSchedule(conn_->ackStates.initialAckState))) {
       CHECK(conn_->initialHeaderCipher);
       packetLimit -= writeCryptoAndAckDataToSocket(
-          *socket_,
-          *conn_,
-          srcConnId /* src */,
-          *destConnId /* dst */,
-          LongHeader::Types::Initial,
-          *conn_->initialWriteCipher,
-          *conn_->initialHeaderCipher,
-          version,
-          packetLimit,
-          clientConn_->retryToken);
+                         *socket_,
+                         *conn_,
+                         srcConnId /* src */,
+                         *destConnId /* dst */,
+                         LongHeader::Types::Initial,
+                         *conn_->initialWriteCipher,
+                         *conn_->initialHeaderCipher,
+                         version,
+                         packetLimit,
+                         clientConn_->retryToken)
+                         .packetsWritten;
     }
-    if (!packetLimit && !conn_->pendingEvents.numProbePackets) {
+    if (!packetLimit && !conn_->pendingEvents.anyProbePackets()) {
       return;
     }
   }
@@ -793,25 +889,28 @@ void QuicClientTransport::writeData() {
     auto& handshakeCryptoStream =
         *getCryptoStream(*conn_->cryptoState, EncryptionLevel::Handshake);
     CryptoStreamScheduler handshakeScheduler(*conn_, handshakeCryptoStream);
-    if ((conn_->outstandings.handshakePacketsCount &&
+    auto& numProbePackets =
+        conn_->pendingEvents.numProbePackets[PacketNumberSpace::Handshake];
+    if ((conn_->outstandings.packetCount[PacketNumberSpace::Handshake] &&
          handshakeCryptoStream.retransmissionBuffer.size() &&
-         conn_->pendingEvents.numProbePackets) ||
+         numProbePackets) ||
         handshakeScheduler.hasData() ||
         (conn_->ackStates.handshakeAckState.needsToSendAckImmediately &&
          hasAcksToSchedule(conn_->ackStates.handshakeAckState))) {
       CHECK(conn_->handshakeWriteHeaderCipher);
       packetLimit -= writeCryptoAndAckDataToSocket(
-          *socket_,
-          *conn_,
-          srcConnId /* src */,
-          *destConnId /* dst */,
-          LongHeader::Types::Handshake,
-          *conn_->handshakeWriteCipher,
-          *conn_->handshakeWriteHeaderCipher,
-          version,
-          packetLimit);
+                         *socket_,
+                         *conn_,
+                         srcConnId /* src */,
+                         *destConnId /* dst */,
+                         LongHeader::Types::Handshake,
+                         *conn_->handshakeWriteCipher,
+                         *conn_->handshakeWriteHeaderCipher,
+                         version,
+                         packetLimit)
+                         .packetsWritten;
     }
-    if (!packetLimit && !conn_->pendingEvents.numProbePackets) {
+    if (!packetLimit && !conn_->pendingEvents.anyProbePackets()) {
       return;
     }
   }
@@ -827,7 +926,7 @@ void QuicClientTransport::writeData() {
         version,
         packetLimit);
   }
-  if (!packetLimit && !conn_->pendingEvents.numProbePackets) {
+  if (!packetLimit && !conn_->pendingEvents.anyProbePackets()) {
     return;
   }
   if (conn_->oneRttWriteCipher) {
@@ -872,10 +971,10 @@ void QuicClientTransport::startCryptoHandshake() {
       *clientConn_->initialDestinationConnectionId, version);
 
   // Add partial reliability parameter to customTransportParameters_.
-  setPartialReliabilityTransportParameter();
   setD6DBasePMTUTransportParameter();
   setD6DRaiseTimeoutTransportParameter();
   setD6DProbeTimeoutTransportParameter();
+  setSupportedExtensionTransportParameters();
 
   auto paramsExtension = std::make_shared<ClientTransportParametersExtension>(
       conn_->originalVersion.value(),
@@ -925,11 +1024,6 @@ void QuicClientTransport::errMessage(
       (cmsg.cmsg_level == SOL_IPV6 && cmsg.cmsg_type == IPV6_RECVERR)) {
     const struct sock_extended_err* serr =
         reinterpret_cast<const struct sock_extended_err*>(CMSG_DATA(&cmsg));
-    auto connectionError = (serr->ee_errno == ECONNREFUSED) ||
-        (serr->ee_errno == ENETUNREACH) || (serr->ee_errno == ENETDOWN);
-    if (!connectionError) {
-      return;
-    }
     auto errStr = folly::errnoStr(serr->ee_errno);
     runOnEvbAsync([errString = std::move(errStr)](auto self) {
       auto quicError = std::make_pair(
@@ -982,7 +1076,6 @@ void QuicClientTransport::onDataAvailable(
       if (conn_->qLogger) {
         conn_->qLogger->addPacketDrop(len, kUdpTruncated);
       }
-      QUIC_TRACE(packet_drop, *conn_, "udp_truncated");
       if (conn_->loopDetectorCallback) {
         conn_->readDebugState.noReadReason = NoReadReason::TRUNCATED;
         conn_->loopDetectorCallback->onSuspiciousReadLoops(
@@ -1009,7 +1102,6 @@ void QuicClientTransport::onDataAvailable(
       if (conn_->qLogger) {
         conn_->qLogger->addPacketDrop(delta, kUdpTruncated);
       }
-      QUIC_TRACE(packet_drop, *conn_, "udp_truncated");
     }
 
     data->append(len);
@@ -1172,9 +1264,7 @@ void QuicClientTransport::recvMsg(
     } else {
       networkData.packets.emplace_back(std::move(readBuffer));
     }
-    if (conn_->qLogger) {
-      conn_->qLogger->addDatagramReceived(bytesRead);
-    }
+    trackDatagramReceived(bytesRead);
   }
 }
 
@@ -1326,7 +1416,6 @@ void QuicClientTransport::recvMmsg(
       networkData.packets.emplace_back(std::move(readBuffers[i]));
     }
 
-    QUIC_TRACE(udp_recvd, *conn_, bytesRead);
     trackDatagramReceived(bytesRead);
   }
   for (; i < numPackets; i++) {
@@ -1379,7 +1468,6 @@ void QuicClientTransport::onNotifyDataAvailable(
 
 void QuicClientTransport::
     happyEyeballsConnAttemptDelayTimeoutExpired() noexcept {
-  QUIC_TRACE(happy_eyeballs, *conn_, "delay timer expired");
   // Declare 0-RTT data as lost so that they will be retransmitted over the
   // second socket.
   markZeroRttPacketsLost(*conn_, markPacketLoss);
@@ -1407,8 +1495,9 @@ void QuicClientTransport::start(ConnectionCallback* cb) {
   if (conn_->qLogger) {
     conn_->qLogger->addTransportStateUpdate(kStart);
   }
-  QUIC_TRACE(fst_trace, *conn_, "start");
   setConnectionCallback(cb);
+  clientConn_->pendingOneRttData.reserve(
+      conn_->transportSettings.maxPacketsToBuffer);
   try {
     happyEyeballsSetUpSocket(
         *socket_,
@@ -1496,6 +1585,7 @@ bool QuicClientTransport::setCustomTransportParameter(
   // described by the spec.
   if (static_cast<uint16_t>(customParam->getParameterId()) <
       kCustomTransportParameterThreshold) {
+    LOG(ERROR) << "invalid parameter id";
     return false;
   }
 
@@ -1510,25 +1600,12 @@ bool QuicClientTransport::setCustomTransportParameter(
 
   // if a match has been found, we return failure
   if (it != customTransportParameters_.end()) {
+    LOG(ERROR) << "transport parameter already present";
     return false;
   }
 
   customTransportParameters_.push_back(customParam->encode());
   return true;
-}
-
-void QuicClientTransport::setPartialReliabilityTransportParameter() {
-  uint64_t partialReliabilitySetting = 0;
-  if (conn_->transportSettings.partialReliabilityEnabled) {
-    partialReliabilitySetting = 1;
-  }
-  auto partialReliabilityCustomParam =
-      std::make_unique<CustomIntegralTransportParameter>(
-          kPartialReliabilityParameterId, partialReliabilitySetting);
-
-  if (!setCustomTransportParameter(std::move(partialReliabilityCustomParam))) {
-    LOG(ERROR) << "failed to set partial reliability transport parameter";
-  }
 }
 
 void QuicClientTransport::setD6DBasePMTUTransportParameter() {
@@ -1600,6 +1677,23 @@ void QuicClientTransport::setD6DProbeTimeoutTransportParameter() {
   }
 }
 
+void QuicClientTransport::setSupportedExtensionTransportParameters() {
+  if (conn_->transportSettings.minAckDelay.hasValue()) {
+    auto minAckDelayParam = std::make_unique<CustomIntegralTransportParameter>(
+        static_cast<uint64_t>(TransportParameterId::min_ack_delay),
+        conn_->transportSettings.minAckDelay.value().count());
+    customTransportParameters_.push_back(minAckDelayParam->encode());
+  }
+  if (conn_->transportSettings.datagramConfig.enabled) {
+    auto maxDatagramFrameSize =
+        std::make_unique<CustomIntegralTransportParameter>(
+            static_cast<uint64_t>(
+                TransportParameterId::max_datagram_frame_size),
+            conn_->datagramState.maxReadFrameSize);
+    customTransportParameters_.push_back(maxDatagramFrameSize->encode());
+  }
+}
+
 void QuicClientTransport::adjustGROBuffers() {
   if (socket_ && conn_) {
     if (conn_->transportSettings.numGROBuffers_ > kDefaultNumGROBuffers) {
@@ -1626,7 +1720,12 @@ void QuicClientTransport::unbindConnection() {
 
 void QuicClientTransport::setSupportedVersions(
     const std::vector<QuicVersion>& versions) {
-  conn_->originalVersion = versions.at(0);
+  auto version = versions.at(0);
+  // Disallow setting D24.
+  if (version == QuicVersion::MVFST_D24) {
+    version = QuicVersion::MVFST;
+  }
+  conn_->originalVersion = version;
   auto params = conn_->readCodec->getCodecParameters();
   params.version = conn_->originalVersion.value();
   conn_->readCodec->setCodecParameters(params);

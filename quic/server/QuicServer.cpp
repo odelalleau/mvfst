@@ -144,24 +144,11 @@ void QuicServer::initialize(
     connIdAlgo_ = connIdAlgoFactory_->make();
   }
   if (!ccFactory_) {
-    ccFactory_ = std::make_shared<DefaultCongestionControllerFactory>();
+    ccFactory_ = std::make_shared<ServerCongestionControllerFactory>();
   }
 
-  startCcpIfEnabled();
   initializeWorkers(evbs, useDefaultTransport);
   bindWorkersToSocket(address, evbs);
-}
-
-void QuicServer::startCcpIfEnabled() {
-#ifdef CCP_ENABLED
-  if (isUsingCCP()) {
-    ccpEvb_ = std::make_unique<folly::ScopedEventBaseThread>();
-    // run_forever (unsurpisingly) blocks until explicitly killed, so we start
-    // it in its own evb
-    ccpEvb_->getEventBase()->runInEventBaseThread(
-        [&] { ccp_run_forever(ccpConfig_.c_str(), 1); });
-  }
-#endif
 }
 
 void QuicServer::initializeWorkers(
@@ -227,79 +214,89 @@ void QuicServer::bindWorkersToSocket(
   CHECK(!initialized_);
   boundAddress_ = address;
   auto usingCCP = isUsingCCP();
+  if (!usingCCP) {
+    LOG(INFO) << "NOT using CCP";
+  }
   auto ccpInitFailed = false;
   for (size_t i = 0; i < numWorkers; ++i) {
     auto workerEvb = evbs[i];
-    workerEvb->runInEventBaseThreadAndWait([self = this->shared_from_this(),
-                                            workerEvb,
-                                            numWorkers,
-                                            usingCCP,
-                                            &ccpInitFailed,
-                                            processId = processId_,
-                                            idx = i] {
-      std::lock_guard<std::mutex> guard(self->startMutex_);
-      if (self->shutdown_) {
-        return;
-      }
-      auto workerSocket = self->listenerSocketFactory_->make(workerEvb, -1);
-      auto it = self->evbToWorkers_.find(workerEvb);
-      CHECK(it != self->evbToWorkers_.end());
-      auto worker = it->second;
-      int takeoverOverFd = -1;
-      if (self->listeningFDs_.size() > idx) {
-        takeoverOverFd = self->listeningFDs_[idx];
-      }
-      worker->setSocketOptions(&self->socketOptions_);
-      // dup the takenover socket on only one worker and bind the rest
-      if (takeoverOverFd >= 0) {
-        workerSocket->setFD(
-            folly::NetworkSocket::fromFd(::dup(takeoverOverFd)),
-            // set ownership to OWNS to allow ::close()'ing of of the fd
-            // when this server goes away
-            folly::AsyncUDPSocket::FDOwnership::OWNS);
-        worker->setSocket(std::move(workerSocket));
-        if (idx == 0) {
-          self->boundAddress_ = worker->getAddress();
-        }
-        VLOG(4) << "Set up dup()'ed fd for address=" << self->boundAddress_
-                << " on workerId=" << (int)worker->getWorkerId();
-        worker->applyAllSocketOptions();
-      } else {
-        VLOG(4) << "No valid takenover fd found for address="
-                << self->boundAddress_ << ". binding on worker=" << worker
-                << " workerId=" << (int)worker->getWorkerId()
-                << " processId=" << (int)processId;
-        worker->setSocket(std::move(workerSocket));
-        worker->bind(self->boundAddress_, self->bindOptions_);
-        if (idx == 0) {
-          self->boundAddress_ = worker->getAddress();
-        }
-      }
-      if (usingCCP) {
-        try {
-          worker->getCcpReader()->try_initialize(
-              worker->getEventBase(), worker->getWorkerId());
-        } catch (const folly::AsyncSocketException& ex) {
-          // probably means the unix socket failed to bind
-          LOG(ERROR) << "error initializing ccp: " << ex.what()
-                     << "\nshutting down...";
-          // TODO also update counters
-          ccpInitFailed = true;
-        } catch (const std::exception& ex) {
-          LOG(ERROR) << "error initializing ccp: " << ex.what()
-                     << "\nshutting down...";
-          ccpInitFailed = true;
-        }
-      }
-      if (idx == (numWorkers - 1)) {
-        VLOG(4) << "Initialized all workers in the eventbase";
-        self->initialized_ = true;
-        self->startCv_.notify_all();
-      }
-    });
-    if (usingCCP && ccpInitFailed) {
-      shutdown();
-    }
+    workerEvb->runImmediatelyOrRunInEventBaseThreadAndWait(
+        [self = this->shared_from_this(),
+         workerEvb,
+         numWorkers,
+         usingCCP,
+         &ccpInitFailed,
+         processId = processId_,
+         idx = i] {
+          std::lock_guard<std::mutex> guard(self->startMutex_);
+          if (self->shutdown_) {
+            return;
+          }
+          auto workerSocket = self->listenerSocketFactory_->make(workerEvb, -1);
+          auto it = self->evbToWorkers_.find(workerEvb);
+          CHECK(it != self->evbToWorkers_.end());
+          auto worker = it->second;
+          int takeoverOverFd = -1;
+          if (self->listeningFDs_.size() > idx) {
+            takeoverOverFd = self->listeningFDs_[idx];
+          }
+          worker->setSocketOptions(&self->socketOptions_);
+          // dup the takenover socket on only one worker and bind the rest
+          if (takeoverOverFd >= 0) {
+            workerSocket->setFD(
+                folly::NetworkSocket::fromFd(::dup(takeoverOverFd)),
+                // set ownership to OWNS to allow ::close()'ing of of the fd
+                // when this server goes away
+                folly::AsyncUDPSocket::FDOwnership::OWNS);
+            worker->setSocket(std::move(workerSocket));
+            if (idx == 0) {
+              self->boundAddress_ = worker->getAddress();
+            }
+            VLOG(4) << "Set up dup()'ed fd for address=" << self->boundAddress_
+                    << " on workerId=" << (int)worker->getWorkerId();
+            worker->applyAllSocketOptions();
+          } else {
+            VLOG(4) << "No valid takenover fd found for address="
+                    << self->boundAddress_ << ". binding on worker=" << worker
+                    << " workerId=" << (int)worker->getWorkerId()
+                    << " processId=" << (int)processId;
+            worker->setSocket(std::move(workerSocket));
+            worker->bind(self->boundAddress_, self->bindOptions_);
+            if (idx == 0) {
+              self->boundAddress_ = worker->getAddress();
+            }
+          }
+          if (usingCCP) {
+            auto serverId = self->boundAddress_.getIPAddress().hash() |
+                self->boundAddress_.getPort();
+            try {
+              worker->getCcpReader()->try_initialize(
+                  worker->getEventBase(),
+                  self->ccpId_,
+                  serverId,
+                  worker->getWorkerId());
+              worker->getCcpReader()->connect();
+            } catch (const folly::AsyncSocketException& ex) {
+              // probably means the unix socket failed to bind
+              LOG(ERROR) << "exception while initializing ccp: " << ex.what()
+                         << "\nshutting down...";
+              // TODO also update counters
+              ccpInitFailed = true;
+            } catch (const std::exception& ex) {
+              LOG(ERROR) << "exception initializing ccp: " << ex.what()
+                         << "\nshutting down...";
+              ccpInitFailed = true;
+            }
+          }
+          if (idx == (numWorkers - 1)) {
+            VLOG(4) << "Initialized all workers in the eventbase";
+            self->initialized_ = true;
+            self->startCv_.notify_all();
+          }
+        });
+  }
+  if (usingCCP && ccpInitFailed) {
+    shutdown();
   }
 }
 
@@ -484,15 +481,10 @@ void QuicServer::shutdown(LocalErrorCode error) {
   if (shutdown_) {
     return;
   }
-  for (auto& worker : workers_) {
-    DCHECK(
-        !worker->getEventBase()->isRunning() ||
-        !worker->getEventBase()->isInEventBaseThread());
-  }
   shutdown_ = true;
   auto usingCCP = isUsingCCP();
   for (auto& worker : workers_) {
-    worker->getEventBase()->runInEventBaseThreadAndWait([&] {
+    worker->getEventBase()->runImmediatelyOrRunInEventBaseThreadAndWait([&] {
       worker->shutdownAllConnections(error);
       if (usingCCP) {
         worker->getCcpReader()->shutdown();
@@ -536,7 +528,7 @@ void QuicServer::runOnAllWorkersSync(
     return;
   }
   for (auto& worker : workers_) {
-    worker->getEventBase()->runInEventBaseThreadAndWait(
+    worker->getEventBase()->runImmediatelyOrRunInEventBaseThreadAndWait(
         [&worker, self = this->shared_from_this(), func]() mutable {
           if (self->shutdown_) {
             return;
@@ -610,18 +602,25 @@ void QuicServer::setTransportSettings(TransportSettings transportSettings) {
   });
 }
 
-void QuicServer::setCcpConfig(std::string ccpConfig) {
-  ccpConfig_ = std::move(ccpConfig);
+void QuicServer::setCcpId(uint64_t ccpId) {
+  ccpId_ = ccpId;
 }
 
 bool QuicServer::isUsingCCP() {
-  auto foundConfig = !ccpConfig_.empty();
+  auto foundId = ccpId_ != 0;
 #ifdef CCP_ENABLED
-  return foundConfig;
+  auto default_is_ccp = transportSettings_.defaultCongestionController ==
+      CongestionControlType::CCP;
+  if (foundId && default_is_ccp) {
+    return true;
+  } else {
+    return false;
+  }
+  return foundId;
 #else
-  if (foundConfig) {
+  if (foundId) {
     LOG(ERROR)
-        << "found ccp config, but server was not compiled with ccp support. recompile with -DCCP_ENABLED.";
+        << "found ccp id, but server was not compiled with ccp support. recompile with -DCCP_ENABLED.";
   }
   return false;
 #endif
@@ -631,25 +630,6 @@ void QuicServer::rejectNewConnections(bool reject) {
   rejectNewConnections_ = reject;
   runOnAllWorkers(
       [reject](auto worker) mutable { worker->rejectNewConnections(reject); });
-}
-
-void QuicServer::enablePartialReliability(bool enabled) {
-  transportSettings_.partialReliabilityEnabled = enabled;
-  runOnAllWorkers([enabled](auto worker) mutable {
-    worker->enablePartialReliability(enabled);
-  });
-}
-
-void QuicServer::setEventBaseObserver(
-    std::shared_ptr<folly::EventBaseObserver> observer) {
-  if (shutdown_ || workerEvbs_.empty()) {
-    return;
-  }
-  workerEvbs_.front()->getEventBase()->runInEventBaseThreadAndWait(
-      [&] { evbObserver_ = observer; });
-  runOnAllWorkers([observer](auto worker) {
-    worker->getEventBase()->setObserver(observer);
-  });
 }
 
 void QuicServer::startPacketForwarding(const folly::SocketAddress& destAddr) {
@@ -751,8 +731,8 @@ void QuicServer::getAllConnectionsStats(
       [&stats](auto worker) mutable { worker->getAllConnectionsStats(stats); });
 }
 
-TakeoverProtocolVersion QuicServer::getTakeoverProtocolVersion() const
-    noexcept {
+TakeoverProtocolVersion QuicServer::getTakeoverProtocolVersion()
+    const noexcept {
   return workers_[0]->getTakeoverProtocolVersion();
 }
 

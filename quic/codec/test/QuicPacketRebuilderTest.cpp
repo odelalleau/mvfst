@@ -29,7 +29,17 @@ OutstandingPacket makeDummyOutstandingPacket(
     const RegularQuicWritePacket& writePacket,
     uint64_t totalBytesSentOnConnection) {
   OutstandingPacket packet(
-      writePacket, Clock::now(), 1000, false, totalBytesSentOnConnection, 0);
+      writePacket,
+      Clock::now(),
+      1000,
+      0,
+      false,
+      totalBytesSentOnConnection,
+      0,
+      0,
+      0,
+      LossState(),
+      0);
   return packet;
 }
 
@@ -108,6 +118,10 @@ TEST_F(QuicPacketRebuilderTest, RebuildPacket) {
       std::forward_as_tuple(0),
       std::forward_as_tuple(
           std::make_unique<StreamBuffer>(cryptoBuf->clone(), 0, true)));
+  // Write an updated ackState that should be used when rebuilding the AckFrame
+  conn.ackStates.appDataAckState.acks.insert(1000, 1200);
+  conn.ackStates.appDataAckState.largestRecvdPacketTime.assign(
+      quic::Clock::now());
 
   // rebuild a packet from the built out packet
   ShortHeader shortHeader2(
@@ -160,8 +174,8 @@ TEST_F(QuicPacketRebuilderTest, RebuildPacket) {
       }
       case QuicWriteFrame::Type::WriteAckFrame: {
         const WriteAckFrame& ack = *frame.asWriteAckFrame();
-        EXPECT_EQ(Interval<PacketNum>(10, 100), ack.ackBlocks.back());
-        EXPECT_EQ(Interval<PacketNum>(200, 1000), ack.ackBlocks.front());
+        EXPECT_EQ(1, ack.ackBlocks.size());
+        EXPECT_EQ(Interval<PacketNum>(1000, 1200), ack.ackBlocks.back());
         break;
       }
       case QuicWriteFrame::Type::WriteStreamFrame: {
@@ -454,7 +468,7 @@ TEST_F(QuicPacketRebuilderTest, CloneCounter) {
   PacketRebuilder rebuilder(regularBuilder2, conn);
   rebuilder.rebuildFromPacket(outstandingPacket);
   EXPECT_TRUE(outstandingPacket.associatedEvent.has_value());
-  EXPECT_EQ(1, conn.outstandings.clonedPacketsCount);
+  EXPECT_EQ(1, conn.outstandings.numClonedPackets());
 }
 
 TEST_F(QuicPacketRebuilderTest, PurePingWontRebuild) {
@@ -478,7 +492,7 @@ TEST_F(QuicPacketRebuilderTest, PurePingWontRebuild) {
   PacketRebuilder rebuilder(regularBuilder2, conn);
   EXPECT_EQ(folly::none, rebuilder.rebuildFromPacket(outstandingPacket));
   EXPECT_FALSE(outstandingPacket.associatedEvent.has_value());
-  EXPECT_EQ(0, conn.outstandings.clonedPacketsCount);
+  EXPECT_EQ(0, conn.outstandings.numClonedPackets());
 }
 
 TEST_F(QuicPacketRebuilderTest, LastStreamFrameSkipLen) {

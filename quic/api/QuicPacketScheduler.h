@@ -12,10 +12,14 @@
 #include <quic/QuicConstants.h>
 #include <quic/QuicException.h>
 #include <quic/codec/QuicPacketBuilder.h>
+#include <quic/codec/QuicPacketRebuilder.h>
 #include <quic/codec/QuicWriteCodec.h>
 #include <quic/codec/Types.h>
 #include <quic/flowcontrol/QuicFlowController.h>
+#include <quic/state/QuicStateFunctions.h>
 #include <quic/state/QuicStreamFunctions.h>
+
+#include <folly/lang/Assume.h>
 
 namespace quic {
 
@@ -59,20 +63,6 @@ class QuicPacketScheduler {
   virtual folly::StringPiece name() const = 0;
 };
 
-class RetransmissionScheduler {
- public:
-  explicit RetransmissionScheduler(const QuicConnectionStateBase& conn);
-
-  void writeRetransmissionStreams(PacketBuilderInterface& builder);
-
-  bool hasPendingData() const;
-
- private:
-  bool writeStreamLossBuffers(PacketBuilderInterface& builder, StreamId id);
-
-  const QuicConnectionStateBase& conn_;
-};
-
 class StreamFrameScheduler {
  public:
   explicit StreamFrameScheduler(QuicConnectionStateBase& conn);
@@ -86,6 +76,24 @@ class StreamFrameScheduler {
   bool hasPendingData() const;
 
  private:
+  // Return true if this stream wrote some data
+  bool writeStreamLossBuffers(
+      PacketBuilderInterface& builder,
+      QuicStreamState& stream);
+
+  /**
+   * Write a single stream's write buffer or loss buffer
+   *
+   * lossOnly: if only loss buffer should be written. This param may get mutated
+   *           inside the function.
+   *
+   * Return: true if write should continue after this stream, false otherwise.
+   */
+  bool writeSingleStream(
+      PacketBuilderInterface& builder,
+      QuicStreamState& stream,
+      uint64_t& connWritableBytes);
+
   StreamId writeStreamsHelper(
       PacketBuilderInterface& builder,
       const std::set<StreamId>& writableStreams,
@@ -103,13 +111,11 @@ class StreamFrameScheduler {
    * Helper function to write either stream data if stream is not flow
    * controlled or a blocked frame otherwise.
    *
-   * Return: boolean indicates if anything (either data, or Blocked frame) is
-   *   written into the packet.
-   *
+   * Return: A boolean indicates if write is successful.
    */
-  bool writeNextStreamFrame(
+  bool writeStreamFrame(
       PacketBuilderInterface& builder,
-      StreamId streamId,
+      QuicStreamState& stream,
       uint64_t& connWritableBytes);
 
   QuicConnectionStateBase& conn_;
@@ -119,7 +125,6 @@ class AckScheduler {
  public:
   AckScheduler(const QuicConnectionStateBase& conn, const AckState& ackState);
 
-  template <typename ClockType = Clock>
   folly::Optional<PacketNum> writeNextAcks(PacketBuilderInterface& builder);
 
   bool hasPendingAcks() const;
@@ -180,6 +185,18 @@ class PingFrameScheduler {
   const QuicConnectionStateBase& conn_;
 };
 
+class DatagramFrameScheduler {
+ public:
+  explicit DatagramFrameScheduler(QuicConnectionStateBase& conn);
+
+  FOLLY_NODISCARD bool hasPendingDatagramFrames() const;
+
+  bool writeDatagramFrames(PacketBuilderInterface& builder);
+
+ private:
+  QuicConnectionStateBase& conn_;
+};
+
 class WindowUpdateScheduler {
  public:
   explicit WindowUpdateScheduler(const QuicConnectionStateBase& conn);
@@ -237,7 +254,6 @@ class FrameScheduler : public QuicPacketScheduler {
         PacketNumberSpace packetNumberSpace,
         folly::StringPiece name);
 
-    Builder& streamRetransmissions();
     Builder& streamFrames();
     Builder& ackFrames();
     Builder& resetFrames();
@@ -246,6 +262,7 @@ class FrameScheduler : public QuicPacketScheduler {
     Builder& cryptoFrames();
     Builder& simpleFrames();
     Builder& pingFrames();
+    Builder& datagramFrames();
 
     FrameScheduler build() &&;
 
@@ -256,7 +273,6 @@ class FrameScheduler : public QuicPacketScheduler {
     folly::StringPiece name_;
 
     // schedulers
-    bool retransmissionScheduler_{false};
     bool streamFrameScheduler_{false};
     bool ackScheduler_{false};
     bool rstScheduler_{false};
@@ -265,6 +281,7 @@ class FrameScheduler : public QuicPacketScheduler {
     bool cryptoStreamScheduler_{false};
     bool simpleFrameScheduler_{false};
     bool pingFrameScheduler_{false};
+    bool datagramFrameScheduler_{false};
   };
 
   explicit FrameScheduler(folly::StringPiece name);
@@ -282,7 +299,6 @@ class FrameScheduler : public QuicPacketScheduler {
   FOLLY_NODISCARD folly::StringPiece name() const override;
 
  private:
-  folly::Optional<RetransmissionScheduler> retransmissionScheduler_;
   folly::Optional<StreamFrameScheduler> streamFrameScheduler_;
   folly::Optional<AckScheduler> ackScheduler_;
   folly::Optional<RstStreamScheduler> rstScheduler_;
@@ -291,6 +307,7 @@ class FrameScheduler : public QuicPacketScheduler {
   folly::Optional<CryptoStreamScheduler> cryptoStreamScheduler_;
   folly::Optional<SimpleFrameScheduler> simpleFrameScheduler_;
   folly::Optional<PingFrameScheduler> pingFrameScheduler_;
+  folly::Optional<DatagramFrameScheduler> datagramFrameScheduler_;
   folly::StringPiece name_;
 };
 
@@ -362,4 +379,3 @@ class D6DProbeScheduler : public QuicPacketScheduler {
   bool probeSent_{false};
 };
 } // namespace quic
-#include <quic/api/QuicPacketScheduler-inl.h>

@@ -10,7 +10,6 @@
 #include <quic/state/QuicStreamFunctions.h>
 
 #include <quic/common/TimeUtil.h>
-#include <quic/logging/QuicLogger.h>
 
 namespace {
 std::deque<quic::OutstandingPacket>::reverse_iterator
@@ -74,13 +73,6 @@ void updateRtt(
     conn.qLogger->addMetricUpdate(
         rttSample, conn.lossState.mrtt, conn.lossState.srtt, ackDelay);
   }
-  QUIC_TRACE(
-      update_rtt,
-      conn,
-      rttSample.count(),
-      ackDelay.count(),
-      conn.lossState.mrtt.count(),
-      conn.lossState.srtt.count());
 }
 
 void updateAckSendStateOnRecvPacket(
@@ -92,10 +84,17 @@ void updateAckSendStateOnRecvPacket(
   DCHECK(!pktHasCryptoData || pktHasRetransmittableData);
   auto thresh = kNonRtxRxPacketsPendingBeforeAck;
   if (pktHasRetransmittableData || ackState.numRxPacketsRecvd) {
-    thresh = ackState.largestReceivedPacketNum.value_or(0) >
-            conn.transportSettings.rxPacketsBeforeAckInitThreshold
-        ? conn.transportSettings.rxPacketsBeforeAckAfterInit
-        : conn.transportSettings.rxPacketsBeforeAckBeforeInit;
+    if (ackState.tolerance.hasValue()) {
+      thresh = ackState.tolerance.value();
+    } else {
+      thresh = ackState.largestReceivedPacketNum.value_or(0) >
+              conn.transportSettings.rxPacketsBeforeAckInitThreshold
+          ? conn.transportSettings.rxPacketsBeforeAckAfterInit
+          : conn.transportSettings.rxPacketsBeforeAckBeforeInit;
+    }
+  }
+  if (ackState.ignoreReorder) {
+    pktOutOfOrder = false;
   }
   if (pktHasRetransmittableData) {
     if (pktHasCryptoData || pktOutOfOrder ||
@@ -111,9 +110,7 @@ void updateAckSendStateOnRecvPacket(
                << static_cast<int>(ackState.numNonRxPacketsRecvd);
       conn.pendingEvents.scheduleAckTimeout = false;
       ackState.needsToSendAckImmediately = true;
-      ackState.numRxPacketsRecvd = 0;
-      ackState.numNonRxPacketsRecvd = 0;
-    } else {
+    } else if (!ackState.needsToSendAckImmediately) {
       VLOG(10) << conn << " scheduling ack timeout pktHasCryptoData="
                << pktHasCryptoData << " pktHasRetransmittableData="
                << static_cast<int>(pktHasRetransmittableData)
@@ -122,7 +119,6 @@ void updateAckSendStateOnRecvPacket(
                << " numNonRxPacketsRecvd="
                << static_cast<int>(ackState.numNonRxPacketsRecvd);
       conn.pendingEvents.scheduleAckTimeout = true;
-      ackState.needsToSendAckImmediately = false;
     }
   } else if (
       ++ackState.numNonRxPacketsRecvd + ackState.numRxPacketsRecvd >= thresh) {
@@ -135,6 +131,8 @@ void updateAckSendStateOnRecvPacket(
     // TODO: experiment with outOfOrder and ack timer for NonRxPacket too
     conn.pendingEvents.scheduleAckTimeout = false;
     ackState.needsToSendAckImmediately = true;
+  }
+  if (ackState.needsToSendAckImmediately) {
     ackState.numRxPacketsRecvd = 0;
     ackState.numNonRxPacketsRecvd = 0;
   }

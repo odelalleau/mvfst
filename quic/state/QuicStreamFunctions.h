@@ -22,6 +22,17 @@ namespace quic {
 void writeDataToQuicStream(QuicStreamState& stream, Buf data, bool eof);
 
 /**
+ * Adds data represented in the form of BufferMeta to the end of the Buffer
+ * Meta queue of the stream.
+ *
+ * TODO: move to dsr directory.
+ */
+void writeBufMetaToQuicStream(
+    QuicStreamState& stream,
+    const BufferMeta& data,
+    bool eof);
+
+/**
  * Adds data to the end of the write buffer of the QUIC crypto stream. This
  * data will be written onto the socket.
  */
@@ -133,9 +144,6 @@ std::pair<Buf, bool> readDataInOrderFromReadBuffer(
     uint64_t amount,
     bool sinkData = false);
 
-// TODO reap
-void cancelHandshakeCryptoStreamRetransmissions(QuicCryptoState& cryptoStream);
-
 /**
  * Returns the appropriate crypto stream for the protection type of the packet.
  */
@@ -148,12 +156,4 @@ void processCryptoStreamAck(
     uint64_t offset,
     uint64_t len);
 
-/**
- * Checks if stream frame matches buffer from the retransmit queue.
- *
- */
-bool streamFrameMatchesRetransmitBuffer(
-    const QuicStreamState& stream,
-    const WriteStreamFrame& ackFrame,
-    const StreamBuffer& buf);
 } // namespace quic

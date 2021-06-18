@@ -43,6 +43,7 @@ class MockQuicStats : public QuicTransportStatsCallback {
   MOCK_METHOD0(onStreamFlowControlUpdate, void());
   MOCK_METHOD0(onStreamFlowControlBlocked, void());
   MOCK_METHOD0(onCwndBlocked, void());
+  MOCK_METHOD1(onNewCongestionController, void(CongestionControlType));
   MOCK_METHOD0(onPTO, void());
   MOCK_METHOD1(onRead, void(size_t));
   MOCK_METHOD1(onWrite, void(size_t));
@@ -54,6 +55,8 @@ class MockQuicStats : public QuicTransportStatsCallback {
   MOCK_METHOD1(onTransportKnobApplied, void(TransportKnobType));
   MOCK_METHOD1(onTransportKnobError, void(TransportKnobType));
   MOCK_METHOD0(onServerUnfinishedHandshake, void());
+  MOCK_METHOD0(onZeroRttBuffered, void());
+  MOCK_METHOD0(onZeroRttBufferedPruned, void());
 };
 
 class MockQuicStatsFactory : public QuicTransportStatsCallbackFactory {

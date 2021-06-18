@@ -1536,6 +1536,7 @@ TEST_F(QuicStreamFunctionsTest, RemovedClosedState) {
   auto streamId = stream->id;
   conn.streamManager->readableStreams().emplace(streamId);
   conn.streamManager->peekableStreams().emplace(streamId);
+  writeDataToQuicStream(*stream, folly::IOBuf::copyBuffer("write data"), true);
   conn.streamManager->addWritable(*stream);
   conn.streamManager->queueBlocked(streamId, 0);
   conn.streamManager->addDeliverable(streamId);
@@ -1544,23 +1545,19 @@ TEST_F(QuicStreamFunctionsTest, RemovedClosedState) {
   conn.streamManager->addStopSending(
       streamId, GenericApplicationErrorCode::UNKNOWN);
   conn.streamManager->queueFlowControlUpdated(streamId);
-  conn.streamManager->addDataRejected(streamId);
-  conn.streamManager->addDataExpired(streamId);
   stream->sendState = StreamSendState::Closed;
   stream->recvState = StreamRecvState::Closed;
   conn.streamManager->removeClosedStream(streamId);
   EXPECT_FALSE(conn.streamManager->streamExists(streamId));
   EXPECT_TRUE(conn.streamManager->readableStreams().empty());
   EXPECT_TRUE(conn.streamManager->peekableStreams().empty());
-  EXPECT_FALSE(conn.streamManager->writableContains(streamId));
+  EXPECT_FALSE(writableContains(*conn.streamManager, streamId));
   EXPECT_FALSE(conn.streamManager->hasBlocked());
   EXPECT_FALSE(conn.streamManager->deliverableContains(streamId));
   EXPECT_FALSE(conn.streamManager->hasLoss());
   EXPECT_FALSE(conn.streamManager->pendingWindowUpdate(streamId));
   EXPECT_TRUE(conn.streamManager->stopSendingStreams().empty());
   EXPECT_FALSE(conn.streamManager->flowControlUpdatedContains(streamId));
-  EXPECT_TRUE(conn.streamManager->dataRejectedStreams().empty());
-  EXPECT_TRUE(conn.streamManager->dataExpiredStreams().empty());
 }
 
 TEST_F(QuicServerStreamFunctionsTest, ServerGetClientQuicStream) {
@@ -1970,18 +1967,18 @@ TEST_F(QuicStreamFunctionsTest, WritableList) {
   stream.flowControlState.peerAdvertisedMaxOffset = 200;
 
   conn.streamManager->updateWritableStreams(stream);
-  EXPECT_FALSE(stream.conn.streamManager->writableContains(id));
+  EXPECT_FALSE(writableContains(*stream.conn.streamManager, id));
 
   auto buf = IOBuf::create(100);
   buf->append(100);
   writeDataToQuicStream(stream, std::move(buf), false);
   conn.streamManager->updateWritableStreams(stream);
-  EXPECT_TRUE(stream.conn.streamManager->writableContains(id));
+  EXPECT_TRUE(writableContains(*stream.conn.streamManager, id));
 
   // Flow control
   stream.flowControlState.peerAdvertisedMaxOffset = stream.currentWriteOffset;
   conn.streamManager->updateWritableStreams(stream);
-  EXPECT_FALSE(stream.conn.streamManager->writableContains(id));
+  EXPECT_FALSE(writableContains(*stream.conn.streamManager, id));
 
   // Fin
   writeDataToQuicStream(stream, nullptr, true);
@@ -1989,12 +1986,12 @@ TEST_F(QuicStreamFunctionsTest, WritableList) {
   stream.currentWriteOffset += 100;
   stream.flowControlState.peerAdvertisedMaxOffset = stream.currentWriteOffset;
   conn.streamManager->updateWritableStreams(stream);
-  EXPECT_TRUE(stream.conn.streamManager->writableContains(id));
+  EXPECT_TRUE(writableContains(*stream.conn.streamManager, id));
 
   // After Fin
   stream.currentWriteOffset++;
   conn.streamManager->updateWritableStreams(stream);
-  EXPECT_FALSE(stream.conn.streamManager->writableContains(id));
+  EXPECT_FALSE(writableContains(*stream.conn.streamManager, id));
 }
 
 TEST_F(QuicStreamFunctionsTest, AckCryptoStream) {
@@ -2020,73 +2017,5 @@ TEST_F(QuicStreamFunctionsTest, AckCryptoStreamOffsetLengthMismatch) {
   EXPECT_EQ(cryptoStream.retransmissionBuffer.size(), 1);
 }
 
-TEST_F(
-    QuicStreamFunctionsTest,
-    StreamFrameMatchesRetransmitBufferFullyReliable) {
-  conn.partialReliabilityEnabled = false;
-  StreamId id = 4;
-  QuicStreamState stream(id, conn);
-
-  auto data = IOBuf::copyBuffer("Hello");
-  auto buf = StreamBuffer(data->clone(), 0, true);
-
-  WriteStreamFrame ackFrame(
-      id /* streamId */,
-      0 /* offset */,
-      data->length() /* length */,
-      true /* eof */);
-  EXPECT_TRUE(streamFrameMatchesRetransmitBuffer(stream, ackFrame, buf));
-}
-
-TEST_F(
-    QuicStreamFunctionsTest,
-    StreamFrameMatchesRetransmitBufferPartiallyReliableNoSkip) {
-  conn.partialReliabilityEnabled = true;
-  StreamId id = 4;
-  QuicStreamState stream(id, conn);
-
-  auto data = IOBuf::copyBuffer("Hello");
-  auto buf = StreamBuffer(data->clone(), 0, true);
-
-  WriteStreamFrame ackFrame(
-      id /* streamId */,
-      0 /* offset */,
-      data->length() /* length */,
-      true /* eof */);
-  EXPECT_TRUE(streamFrameMatchesRetransmitBuffer(stream, ackFrame, buf));
-}
-
-TEST_F(
-    QuicStreamFunctionsTest,
-    StreamFrameMatchesRetransmitBufferPartiallyReliableFullBufSkipped) {
-  conn.partialReliabilityEnabled = true;
-  StreamId id = 4;
-  QuicStreamState stream(id, conn);
-
-  auto data = IOBuf::copyBuffer("Hello");
-  auto buf = StreamBuffer(data->clone(), 42, true);
-
-  WriteStreamFrame ackFrame(
-      id /* streamId */,
-      0 /* offset */,
-      data->length() /* length */,
-      true /* eof */);
-  EXPECT_FALSE(streamFrameMatchesRetransmitBuffer(stream, ackFrame, buf));
-}
-
-TEST_F(
-    QuicStreamFunctionsTest,
-    StreamFrameMatchesRetransmitBufferPartiallyReliableHalfBufSkipped) {
-  conn.partialReliabilityEnabled = true;
-  StreamId id = 4;
-  QuicStreamState stream(id, conn);
-
-  auto data = IOBuf::copyBuffer("llo");
-  auto buf = StreamBuffer(data->clone(), 2, true);
-
-  WriteStreamFrame ackFrame(
-      id /* streamId */, 0 /* offset */, 5 /* length */, true /* eof */);
-  EXPECT_TRUE(streamFrameMatchesRetransmitBuffer(stream, ackFrame, buf));
-}
 } // namespace test
 } // namespace quic

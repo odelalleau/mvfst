@@ -9,6 +9,7 @@
 // Copyright 2004-present Facebook.  All rights reserved.
 
 #include <quic/congestion_control/Bbr.h>
+
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
 #include <quic/common/test/TestUtils.h>
@@ -584,6 +585,7 @@ TEST_F(BbrTest, BytesCounting) {
   PacketNum packetNum = 0;
   auto packet = makeTestingWritePacket(packetNum, 1200, 1200);
   conn.outstandings.packets.push_back(packet);
+  conn.outstandings.packetCount[PacketNumberSpace::AppData]++;
   ReadAckFrame ackFrame;
   ackFrame.largestAcked = packetNum;
   ackFrame.ackBlocks.emplace_back(packetNum, packetNum);

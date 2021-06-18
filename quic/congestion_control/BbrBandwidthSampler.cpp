@@ -10,7 +10,6 @@
 
 #include <quic/congestion_control/BbrBandwidthSampler.h>
 #include <quic/logging/QLoggerConstants.h>
-#include <quic/logging/QuicLogger.h>
 
 namespace quic {
 
@@ -27,11 +26,6 @@ void BbrBandwidthSampler::onPacketAcked(
   if (appLimited_) {
     if (appLimitedExitTarget_ < ackEvent.largestAckedPacketSentTime) {
       appLimited_ = false;
-      QUIC_TRACE(
-          bbr_appunlimited,
-          conn_,
-          *ackEvent.largestAckedPacket,
-          appLimitedExitTarget_.time_since_epoch().count());
       if (conn_.qLogger) {
         conn_.qLogger->addAppUnlimitedUpdate();
       }
@@ -71,10 +65,8 @@ void BbrBandwidthSampler::onPacketAcked(
               ackedPacket.lastAckedPacketInfo->totalBytesAcked,
           std::chrono::duration_cast<std::chrono::microseconds>(ackDuration));
     } else if (ackEvent.ackTime > ackedPacket.sentTime) {
-      // No previous ack info from outstanding packet, fallback to units/lrtt.
-      // This is a per packet delivery rate. Given there can be multiple packets
-      // inflight during the time, this is clearly under estimating bandwidth.
-      // But it's better than nothing.
+      // No previous ack info from outstanding packet, default to taking the
+      // total acked bytes / ~RTT.
       //
       // Note that this if condition:
       //   ack.Event.ackTime > ackedPacket.sentTime
@@ -82,7 +74,7 @@ void BbrBandwidthSampler::onPacketAcked(
       // your clock is broken, or isn't steady. Anyway, in the rare cases that
       // it isn't true, divide by zero will crash.
       sendRate = Bandwidth(
-          ackedPacket.encodedSize,
+          ackEvent.ackedBytes,
           std::chrono::duration_cast<std::chrono::microseconds>(
               ackEvent.ackTime - ackedPacket.sentTime));
     }
@@ -105,8 +97,6 @@ void BbrBandwidthSampler::onPacketAcked(
 void BbrBandwidthSampler::onAppLimited() {
   appLimited_ = true;
   appLimitedExitTarget_ = Clock::now();
-  QUIC_TRACE(
-      bbr_applimited, conn_, appLimitedExitTarget_.time_since_epoch().count());
   if (conn_.qLogger) {
     conn_.qLogger->addAppLimitedUpdate();
   }

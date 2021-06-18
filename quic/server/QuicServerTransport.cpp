@@ -11,6 +11,7 @@
 #include <quic/common/WindowedCounter.h>
 #include <quic/d6d/BinarySearchProbeSizeRaiser.h>
 #include <quic/d6d/ConstantStepProbeSizeRaiser.h>
+#include <quic/dsr/frontend/WriteFunctions.h>
 #include <quic/fizz/server/handshake/FizzServerQuicHandshakeContext.h>
 #include <quic/server/handshake/AppToken.h>
 #include <quic/server/handshake/DefaultAppTokenValidator.h>
@@ -24,15 +25,35 @@ QuicServerTransport::QuicServerTransport(
     folly::EventBase* evb,
     std::unique_ptr<folly::AsyncUDPSocket> sock,
     ConnectionCallback& cb,
-    std::shared_ptr<const fizz::server::FizzServerContext> ctx)
+    std::shared_ptr<const fizz::server::FizzServerContext> ctx,
+    std::unique_ptr<CryptoFactory> cryptoFactory,
+    PacketNum startingPacketNum)
+    : QuicServerTransport(
+          evb,
+          std::move(sock),
+          cb,
+          std::move(ctx),
+          std::move(cryptoFactory)) {
+  conn_->ackStates = AckStates(startingPacketNum);
+}
+
+QuicServerTransport::QuicServerTransport(
+    folly::EventBase* evb,
+    std::unique_ptr<folly::AsyncUDPSocket> sock,
+    ConnectionCallback& cb,
+    std::shared_ptr<const fizz::server::FizzServerContext> ctx,
+    std::unique_ptr<CryptoFactory> cryptoFactory)
     : QuicTransportBase(evb, std::move(sock)), ctx_(std::move(ctx)) {
   auto tempConn = std::make_unique<QuicServerConnectionState>(
       FizzServerQuicHandshakeContext::Builder()
           .setFizzServerContext(ctx_)
+          .setCryptoFactory(std::move(cryptoFactory))
           .build());
   tempConn->serverAddr = socket_->address();
   serverConn_ = tempConn.get();
   conn_.reset(tempConn.release());
+  conn_->observers = observers_;
+
   // TODO: generate this when we can encode the packet sequence number
   // correctly.
   // conn_->nextSequenceNum = folly::Random::secureRandom<PacketNum>();
@@ -70,9 +91,6 @@ void QuicServerTransport::setRoutingCallback(
 void QuicServerTransport::setOriginalPeerAddress(
     const folly::SocketAddress& addr) {
   conn_->originalPeerAddress = addr;
-  conn_->udpSendPacketLen = addr.getFamily() == AF_INET6
-      ? kDefaultV6UDPSendPacketLen
-      : kDefaultV4UDPSendPacketLen;
 }
 
 void QuicServerTransport::setServerConnectionIdParams(
@@ -100,15 +118,6 @@ void QuicServerTransport::setServerConnectionIdRejector(
   CHECK(connIdRejector);
   if (serverConn_) {
     serverConn_->connIdRejector = connIdRejector;
-  }
-}
-
-void QuicServerTransport::setCongestionControllerFactory(
-    std::shared_ptr<CongestionControllerFactory> ccFactory) {
-  CHECK(ccFactory);
-  ccFactory_ = ccFactory;
-  if (conn_) {
-    conn_->congestionControllerFactory = ccFactory_;
   }
 }
 
@@ -214,30 +223,37 @@ void QuicServerTransport::writeData() {
       (isConnectionPaced(*conn_)
            ? conn_->pacer->updateAndGetWriteBatchSize(Clock::now())
            : conn_->transportSettings.writeConnectionDataPacketsLimit);
+  // At the end of this function, clear out any probe packets credit we didn't
+  // use.
+  SCOPE_EXIT {
+    conn_->pendingEvents.numProbePackets = {};
+  };
   if (conn_->initialWriteCipher) {
     auto& initialCryptoStream =
         *getCryptoStream(*conn_->cryptoState, EncryptionLevel::Initial);
     CryptoStreamScheduler initialScheduler(*conn_, initialCryptoStream);
-    if ((conn_->pendingEvents.numProbePackets &&
-         initialCryptoStream.retransmissionBuffer.size() &&
-         conn_->outstandings.initialPacketsCount) ||
+    auto& numProbePackets =
+        conn_->pendingEvents.numProbePackets[PacketNumberSpace::Initial];
+    if ((numProbePackets && initialCryptoStream.retransmissionBuffer.size() &&
+         conn_->outstandings.packetCount[PacketNumberSpace::Initial]) ||
         initialScheduler.hasData() ||
         (conn_->ackStates.initialAckState.needsToSendAckImmediately &&
          hasAcksToSchedule(conn_->ackStates.initialAckState))) {
       CHECK(conn_->initialWriteCipher);
       CHECK(conn_->initialHeaderCipher);
       packetLimit -= writeCryptoAndAckDataToSocket(
-          *socket_,
-          *conn_,
-          srcConnId /* src */,
-          destConnId /* dst */,
-          LongHeader::Types::Initial,
-          *conn_->initialWriteCipher,
-          *conn_->initialHeaderCipher,
-          version,
-          packetLimit);
+                         *socket_,
+                         *conn_,
+                         srcConnId /* src */,
+                         destConnId /* dst */,
+                         LongHeader::Types::Initial,
+                         *conn_->initialWriteCipher,
+                         *conn_->initialHeaderCipher,
+                         version,
+                         packetLimit)
+                         .packetsWritten;
     }
-    if (!packetLimit && !conn_->pendingEvents.numProbePackets) {
+    if (!packetLimit && !conn_->pendingEvents.anyProbePackets()) {
       return;
     }
   }
@@ -245,40 +261,51 @@ void QuicServerTransport::writeData() {
     auto& handshakeCryptoStream =
         *getCryptoStream(*conn_->cryptoState, EncryptionLevel::Handshake);
     CryptoStreamScheduler handshakeScheduler(*conn_, handshakeCryptoStream);
-    if ((conn_->outstandings.handshakePacketsCount &&
+    auto& numProbePackets =
+        conn_->pendingEvents.numProbePackets[PacketNumberSpace::Handshake];
+    if ((conn_->outstandings.packetCount[PacketNumberSpace::Handshake] &&
          handshakeCryptoStream.retransmissionBuffer.size() &&
-         conn_->pendingEvents.numProbePackets) ||
+         numProbePackets) ||
         handshakeScheduler.hasData() ||
         (conn_->ackStates.handshakeAckState.needsToSendAckImmediately &&
          hasAcksToSchedule(conn_->ackStates.handshakeAckState))) {
       CHECK(conn_->handshakeWriteCipher);
       CHECK(conn_->handshakeWriteHeaderCipher);
       packetLimit -= writeCryptoAndAckDataToSocket(
-          *socket_,
-          *conn_,
-          srcConnId /* src */,
-          destConnId /* dst */,
-          LongHeader::Types::Handshake,
-          *conn_->handshakeWriteCipher,
-          *conn_->handshakeWriteHeaderCipher,
-          version,
-          packetLimit);
+                         *socket_,
+                         *conn_,
+                         srcConnId /* src */,
+                         destConnId /* dst */,
+                         LongHeader::Types::Handshake,
+                         *conn_->handshakeWriteCipher,
+                         *conn_->handshakeWriteHeaderCipher,
+                         version,
+                         packetLimit)
+                         .packetsWritten;
     }
-    if (!packetLimit && !conn_->pendingEvents.numProbePackets) {
+    if (!packetLimit && !conn_->pendingEvents.anyProbePackets()) {
       return;
     }
   }
   if (conn_->oneRttWriteCipher) {
     CHECK(conn_->oneRttWriteHeaderCipher);
+    // TODO(yangchi): I don't know which one to prioritize. I can see arguments
+    // both ways. I'm going with writing regular packets first since they
+    // contain ack and flow control update and other important info.
     packetLimit -= writeQuicDataToSocket(
-        *socket_,
-        *conn_,
-        srcConnId /* src */,
-        destConnId /* dst */,
-        *conn_->oneRttWriteCipher,
-        *conn_->oneRttWriteHeaderCipher,
-        version,
-        packetLimit);
+                       *socket_,
+                       *conn_,
+                       srcConnId /* src */,
+                       destConnId /* dst */,
+                       *conn_->oneRttWriteCipher,
+                       *conn_->oneRttWriteHeaderCipher,
+                       version,
+                       packetLimit)
+                       .packetsWritten;
+    if (packetLimit && conn_->transportSettings.dsrEnabled) {
+      packetLimit -= writePacketizationRequest(
+          *serverConn_, destConnId, packetLimit, *conn_->oneRttWriteCipher);
+    }
 
     // D6D probes should be paced
     if (packetLimit && conn_->pendingEvents.d6d.sendProbePacket) {
@@ -450,7 +477,6 @@ void QuicServerTransport::maybeWriteNewSessionTicket() {
     if (conn_->qLogger) {
       conn_->qLogger->addTransportStateUpdate(kWriteNst);
     }
-    QUIC_TRACE(fst_trace, *conn_, "write nst");
     newSessionTicketWritten_ = true;
     AppToken appToken;
     appToken.transportParams = createTicketTransportParameters(
@@ -528,7 +554,6 @@ void QuicServerTransport::maybeNotifyTransportReady() {
     if (conn_->qLogger) {
       conn_->qLogger->addTransportStateUpdate(kTransportReady);
     }
-    QUIC_TRACE(fst_trace, *conn_, "transport ready");
     transportReadyNotified_ = true;
     connCallback_->onTransportReady();
   }
@@ -537,7 +562,6 @@ void QuicServerTransport::maybeNotifyTransportReady() {
 void QuicServerTransport::maybeStartD6DProbing() {
   if (!d6dProbingStarted_ && hasReadCipher() &&
       conn_->d6d.state == D6DMachineState::BASE) {
-    QUIC_TRACE(fst_trace, *conn_, "start d6d probing");
     d6dProbingStarted_ = true;
     auto& d6d = conn_->d6d;
     switch (conn_->transportSettings.d6dConfig.raiserType) {
@@ -560,8 +584,10 @@ void QuicServerTransport::maybeStartD6DProbing() {
     // valuable
     conn_->pendingEvents.d6d.sendProbeDelay = kDefaultD6DKickStartDelay;
     QUIC_STATS(conn_->statsCallback, onConnectionD6DStarted);
-    for (const auto& cb : conn_->instrumentationObservers_) {
-      cb->pmtuProbingStarted(this);
+    for (const auto& cb : *(conn_->observers)) {
+      if (cb->getConfig().pmtuEvents) {
+        cb->pmtuProbingStarted(this);
+      }
     }
   }
 }
@@ -633,6 +659,73 @@ void QuicServerTransport::registerAllTransportKnobParamHandlers() {
               << "Knob param received, udpSendPacketLen is forcibly set to max UDP payload size advertised by peer";
         }
       });
+
+  registerTransportKnobParamHandler(
+      static_cast<uint64_t>(TransportKnobParamId::CC_ALGORITHM_KNOB),
+      [](QuicServerConnectionState* server_conn, uint64_t val) {
+        CHECK(server_conn);
+        auto cctype = static_cast<CongestionControlType>(val);
+        LOG(INFO) << "Knob param received, set congestion control type to "
+                  << congestionControlTypeToString(cctype);
+        if (cctype == server_conn->congestionController->type()) {
+          return;
+        }
+        if (cctype == CongestionControlType::CCP) {
+          bool ccpAvailable = false;
+#ifdef CCP_ENABLED
+          ccpAvailable = server_conn->ccpDatapath != nullptr;
+#endif
+          if (!ccpAvailable) {
+            LOG(ERROR) << "ccp not enabled on this server";
+            return;
+          }
+        }
+        server_conn->congestionController =
+            server_conn->congestionControllerFactory->makeCongestionController(
+                *server_conn, cctype);
+      });
+
+  registerTransportKnobParamHandler(
+      static_cast<uint64_t>(TransportKnobParamId::STARTUP_RTT_FACTOR_KNOB),
+      [](QuicServerConnectionState* server_conn, uint64_t val) {
+        CHECK(server_conn);
+        uint8_t numerator = (val / 100);
+        uint8_t denominator = (val - (numerator * 100));
+        LOG(INFO) << "Knob param received, set STARTUP rtt factor to ("
+                  << unsigned(numerator) << "," << unsigned(denominator) << ")";
+        server_conn->transportSettings.startupRttFactor =
+            std::make_pair(numerator, denominator);
+      });
+
+  registerTransportKnobParamHandler(
+      static_cast<uint64_t>(TransportKnobParamId::DEFAULT_RTT_FACTOR_KNOB),
+      [](QuicServerConnectionState* server_conn, uint64_t val) {
+        CHECK(server_conn);
+        auto numerator = (uint8_t)(val / 100);
+        auto denominator = (uint8_t)(val - (numerator * 100));
+        LOG(INFO) << "Knob param received, set DEFAULT rtt factor to ("
+                  << unsigned(numerator) << "," << unsigned(denominator) << ")";
+        server_conn->transportSettings.defaultRttFactor =
+            std::make_pair(numerator, denominator);
+      });
+
+  registerTransportKnobParamHandler(
+      static_cast<uint64_t>(TransportKnobParamId::NOTSENT_BUFFER_SIZE_KNOB),
+      [](QuicServerConnectionState* server_conn, uint64_t val) {
+        CHECK(server_conn);
+        LOG(INFO)
+            << "Knob param received, set total buffer space available to ("
+            << unsigned(val) << ")";
+        server_conn->transportSettings.totalBufferSpaceAvailable = val;
+      });
+}
+
+QuicConnectionStats QuicServerTransport::getConnectionsStats() const {
+  QuicConnectionStats connStats = QuicTransportBase::getConnectionsStats();
+  if (serverConn_) {
+    connStats.localAddress = serverConn_->serverAddr;
+  }
+  return connStats;
 }
 
 } // namespace quic

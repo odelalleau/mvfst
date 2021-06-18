@@ -6,8 +6,6 @@
  *
  */
 
-#include <quic/api/QuicTransportFunctions.h>
-
 #include <quic/QuicConstants.h>
 #include <quic/QuicException.h>
 #include <quic/api/QuicTransportFunctions.h>
@@ -16,7 +14,7 @@
 #include <quic/codec/Types.h>
 #include <quic/flowcontrol/QuicFlowController.h>
 #include <quic/happyeyeballs/QuicHappyEyeballsFunctions.h>
-#include <quic/logging/QuicLogger.h>
+
 #include <quic/state/AckHandlers.h>
 #include <quic/state/QuicStateFunctions.h>
 #include <quic/state/QuicStreamFunctions.h>
@@ -94,7 +92,7 @@ bool toWriteAppDataAcks(const quic::QuicConnectionStateBase& conn) {
 
 using namespace quic;
 
-uint64_t writeQuicDataToSocketImpl(
+WriteQuicDataResult writeQuicDataToSocketImpl(
     folly::AsyncUDPSocket& sock,
     QuicConnectionStateBase& connection,
     const ConnectionId& srcConnId,
@@ -108,8 +106,12 @@ uint64_t writeQuicDataToSocketImpl(
   // TODO: In FrameScheduler, Retx is prioritized over new data. We should
   // add a flag to the Scheduler to control the priority between them and see
   // which way is better.
-  uint64_t written = 0;
-  if (connection.pendingEvents.numProbePackets) {
+  WriteQuicDataResult result;
+  auto& packetsWritten = result.packetsWritten;
+  auto& probesWritten = result.probesWritten;
+  auto& numProbePackets =
+      connection.pendingEvents.numProbePackets[PacketNumberSpace::AppData];
+  if (numProbePackets) {
     auto probeSchedulerBuilder =
         FrameScheduler::Builder(
             connection,
@@ -121,13 +123,12 @@ uint64_t writeQuicDataToSocketImpl(
             .simpleFrames()
             .resetFrames()
             .streamFrames()
-            .streamRetransmissions()
             .pingFrames();
     if (!exceptCryptoStream) {
       probeSchedulerBuilder.cryptoFrames();
     }
     auto probeScheduler = std::move(probeSchedulerBuilder).build();
-    written = writeProbingDataToSocket(
+    probesWritten = writeProbingDataToSocket(
         sock,
         connection,
         srcConnId,
@@ -136,13 +137,14 @@ uint64_t writeQuicDataToSocketImpl(
         EncryptionLevel::AppData,
         PacketNumberSpace::AppData,
         probeScheduler,
-        std::min<uint64_t>(
-            packetLimit, connection.pendingEvents.numProbePackets),
+        numProbePackets, // This possibly bypasses the packetLimit.
         aead,
         headerCipher,
         version);
-    CHECK_GE(connection.pendingEvents.numProbePackets, written);
-    connection.pendingEvents.numProbePackets -= written;
+    // We only get one chance to write out the probes.
+    numProbePackets = 0;
+    packetLimit =
+        probesWritten > packetLimit ? 0 : (packetLimit - probesWritten);
   }
   auto schedulerBuilder =
       FrameScheduler::Builder(
@@ -152,17 +154,17 @@ uint64_t writeQuicDataToSocketImpl(
           exceptCryptoStream ? "FrameSchedulerWithoutCrypto" : "FrameScheduler")
           .streamFrames()
           .ackFrames()
-          .streamRetransmissions()
           .resetFrames()
           .windowUpdateFrames()
           .blockedFrames()
           .simpleFrames()
-          .pingFrames();
+          .pingFrames()
+          .datagramFrames();
   if (!exceptCryptoStream) {
     schedulerBuilder.cryptoFrames();
   }
   FrameScheduler scheduler = std::move(schedulerBuilder).build();
-  written += writeConnectionDataToSocket(
+  packetsWritten = writeConnectionDataToSocket(
       sock,
       connection,
       srcConnId,
@@ -171,17 +173,16 @@ uint64_t writeQuicDataToSocketImpl(
       PacketNumberSpace::AppData,
       scheduler,
       congestionControlWritableBytes,
-      packetLimit - written,
+      packetLimit,
       aead,
       headerCipher,
       version);
-  VLOG_IF(10, written > 0) << nodeToString(connection.nodeType)
-                           << " written data "
-                           << (exceptCryptoStream ? "without crypto data " : "")
-                           << "to socket packets=" << written << " "
-                           << connection;
-  DCHECK_GE(packetLimit, written);
-  return written;
+  VLOG_IF(10, packetsWritten || probesWritten)
+      << nodeToString(connection.nodeType) << " written data "
+      << (exceptCryptoStream ? "without crypto data " : "")
+      << "to socket packets=" << packetsWritten << " probes=" << probesWritten
+      << " " << connection;
+  return result;
 }
 
 DataPathResult continuousMemoryBuildScheduleEncrypt(
@@ -263,6 +264,7 @@ DataPathResult continuousMemoryBuildScheduleEncrypt(
       headerCipher);
   CHECK(!packetBuf->isChained());
   auto encodedSize = packetBuf->length();
+  auto encodedBodySize = encodedSize - headerLen;
   // Include previous packets back.
   packetBuf->prepend(prevSize);
   connection.bufAccessor->release(std::move(packetBuf));
@@ -282,7 +284,8 @@ DataPathResult continuousMemoryBuildScheduleEncrypt(
     QUIC_STATS(connection.statsCallback, onWrite, encodedSize);
     QUIC_STATS(connection.statsCallback, onPacketSent);
   }
-  return DataPathResult::makeWriteResult(ret, std::move(result), encodedSize);
+  return DataPathResult::makeWriteResult(
+      ret, std::move(result), encodedSize, encodedBodySize);
 }
 
 DataPathResult iobufChainBasedBuildScheduleEncrypt(
@@ -346,10 +349,12 @@ DataPathResult iobufChainBasedBuildScheduleEncrypt(
       packetBuf->length() - headerLen,
       headerCipher);
   auto encodedSize = packetBuf->computeChainDataLength();
+  auto encodedBodySize = encodedSize - headerLen;
 #if !FOLLY_MOBILE
   if (encodedSize > connection.udpSendPacketLen) {
     LOG_EVERY_N(ERROR, 5000)
-        << "Quic sending pkt larger than limit, encodedSize=" << encodedSize;
+        << "Quic sending pkt larger than limit, encodedSize=" << encodedSize
+        << " encodedBodySize=" << encodedBodySize;
   }
 #endif
   bool ret = ioBufBatch.write(std::move(packetBuf), encodedSize);
@@ -358,29 +363,46 @@ DataPathResult iobufChainBasedBuildScheduleEncrypt(
     QUIC_STATS(connection.statsCallback, onWrite, encodedSize);
     QUIC_STATS(connection.statsCallback, onPacketSent);
   }
-  return DataPathResult::makeWriteResult(ret, std::move(result), encodedSize);
+  return DataPathResult::makeWriteResult(
+      ret, std::move(result), encodedSize, encodedBodySize);
 }
 
 } // namespace
 
 namespace quic {
 
-void handleNewStreamDataWritten(
-    QuicConnectionStateBase& conn,
-    QuicStreamLike& stream,
+void handleNewStreamBufMetaWritten(
+    QuicStreamState& stream,
+    uint64_t frameLen,
+    bool frameFin);
+
+void handleRetransmissionBufMetaWritten(
+    QuicStreamState& stream,
+    uint64_t frameOffset,
     uint64_t frameLen,
     bool frameFin,
-    PacketNum packetNum,
-    PacketNumberSpace packetNumberSpace) {
+    const decltype(stream.lossBufMetas)::iterator lossBufMetaIter);
+
+bool writeLoopTimeLimit(
+    TimePoint loopBeginTime,
+    const QuicConnectionStateBase& connection) {
+  return connection.lossState.srtt == 0us ||
+      Clock::now() - loopBeginTime < connection.lossState.srtt /
+          connection.transportSettings.writeLimitRttFraction;
+}
+
+void handleNewStreamDataWritten(
+    QuicStreamLike& stream,
+    uint64_t frameLen,
+    bool frameFin) {
   auto originalOffset = stream.currentWriteOffset;
-  VLOG(10) << nodeToString(conn.nodeType) << " sent"
-           << " packetNum=" << packetNum << " space=" << packetNumberSpace
-           << " " << conn;
   // Idealy we should also check this data doesn't exist in either retx buffer
   // or loss buffer, but that's an expensive search.
   stream.currentWriteOffset += frameLen;
   auto bufWritten = stream.writeBuffer.splitAtMost(folly::to<size_t>(frameLen));
   DCHECK_EQ(bufWritten->computeChainDataLength(), frameLen);
+  // TODO: If we want to be able to write FIN out of order for DSR-ed streams,
+  // this needs to be fixed:
   stream.currentWriteOffset += frameFin ? 1 : 0;
   CHECK(stream.retransmissionBuffer
             .emplace(
@@ -391,17 +413,34 @@ void handleNewStreamDataWritten(
             .second);
 }
 
+void handleNewStreamBufMetaWritten(
+    QuicStreamState& stream,
+    uint64_t frameLen,
+    bool frameFin) {
+  CHECK_GT(stream.writeBufMeta.offset, 0);
+  auto originalOffset = stream.writeBufMeta.offset;
+  auto bufMetaSplit = stream.writeBufMeta.split(frameLen);
+  CHECK_EQ(bufMetaSplit.offset, originalOffset);
+  if (frameFin) {
+    // If FIN is written, nothing should be left in the writeBufMeta.
+    CHECK_EQ(0, stream.writeBufMeta.length);
+    ++stream.writeBufMeta.offset;
+    CHECK_GT(stream.writeBufMeta.offset, *stream.finalWriteOffset);
+  }
+  CHECK(stream.retransmissionBufMetas
+            .emplace(
+                std::piecewise_construct,
+                std::forward_as_tuple(originalOffset),
+                std::forward_as_tuple(bufMetaSplit))
+            .second);
+}
+
 void handleRetransmissionWritten(
-    QuicConnectionStateBase& conn,
     QuicStreamLike& stream,
     uint64_t frameOffset,
     uint64_t frameLen,
     bool frameFin,
-    PacketNum packetNum,
     std::deque<StreamBuffer>::iterator lossBufferIter) {
-  conn.lossState.totalBytesRetransmitted += frameLen;
-  VLOG(10) << nodeToString(conn.nodeType) << " sent retransmission"
-           << " packetNum=" << packetNum << " " << conn;
   auto bufferLen = lossBufferIter->data.chainLength();
   Buf bufWritten;
   if (frameLen == bufferLen && frameFin == lossBufferIter->eof) {
@@ -421,6 +460,31 @@ void handleRetransmissionWritten(
             .second);
 }
 
+void handleRetransmissionBufMetaWritten(
+    QuicStreamState& stream,
+    uint64_t frameOffset,
+    uint64_t frameLen,
+    bool frameFin,
+    const decltype(stream.lossBufMetas)::iterator lossBufMetaIter) {
+  if (frameLen == lossBufMetaIter->length && frameFin == lossBufMetaIter->eof) {
+    stream.lossBufMetas.erase(lossBufMetaIter);
+  } else {
+    CHECK_GT(lossBufMetaIter->length, frameLen);
+    lossBufMetaIter->length -= frameLen;
+    lossBufMetaIter->offset += frameLen;
+  }
+  CHECK(stream.retransmissionBufMetas
+            .emplace(
+                std::piecewise_construct,
+                std::forward_as_tuple(frameOffset),
+                std::forward_as_tuple(WriteBufferMeta::Builder()
+                                          .setOffset(frameOffset)
+                                          .setLength(frameLen)
+                                          .setEOF(frameFin)
+                                          .build()))
+            .second);
+}
+
 /**
  * Update the connection and stream state after stream data is written and deal
  * with new data, as well as retranmissions. Returns true if the data sent is
@@ -434,17 +498,25 @@ bool handleStreamWritten(
     bool frameFin,
     PacketNum packetNum,
     PacketNumberSpace packetNumberSpace) {
+  auto writtenNewData = false;
   // Handle new data first
   if (frameOffset == stream.currentWriteOffset) {
+    handleNewStreamDataWritten(stream, frameLen, frameFin);
+    writtenNewData = true;
+  }
+
+  if (writtenNewData) {
     // Count packet. It's based on the assumption that schedluing scheme will
     // only writes one STREAM frame for a stream in a packet. If that doesn't
     // hold, we need to avoid double-counting.
-    stream.numPacketsTxWithNewData++;
-    handleNewStreamDataWritten(
-        conn, stream, frameLen, frameFin, packetNum, packetNumberSpace);
+    ++stream.numPacketsTxWithNewData;
+    VLOG(10) << nodeToString(conn.nodeType) << " sent"
+             << " packetNum=" << packetNum << " space=" << packetNumberSpace
+             << " " << conn;
     return true;
   }
 
+  bool writtenRetx = false;
   // If the data is in the loss buffer, it is a retransmission.
   auto lossBufferIter = std::lower_bound(
       stream.lossBuffer.begin(),
@@ -454,13 +526,14 @@ bool handleStreamWritten(
   if (lossBufferIter != stream.lossBuffer.end() &&
       lossBufferIter->offset == frameOffset) {
     handleRetransmissionWritten(
-        conn,
-        stream,
-        frameOffset,
-        frameLen,
-        frameFin,
-        packetNum,
-        lossBufferIter);
+        stream, frameOffset, frameLen, frameFin, lossBufferIter);
+    writtenRetx = true;
+  }
+
+  if (writtenRetx) {
+    conn.lossState.totalBytesRetransmitted += frameLen;
+    VLOG(10) << nodeToString(conn.nodeType) << " sent retransmission"
+             << " packetNum=" << packetNum << " " << conn;
     QUIC_STATS(conn.statsCallback, onPacketRetransmission);
     return false;
   }
@@ -470,24 +543,74 @@ bool handleStreamWritten(
   return false;
 }
 
+bool handleStreamBufMetaWritten(
+    QuicConnectionStateBase& conn,
+    QuicStreamState& stream,
+    uint64_t frameOffset,
+    uint64_t frameLen,
+    bool frameFin,
+    PacketNum packetNum,
+    PacketNumberSpace packetNumberSpace) {
+  auto writtenNewData = false;
+  // Handle new data first
+  if (stream.writeBufMeta.offset > 0 &&
+      frameOffset == stream.writeBufMeta.offset) {
+    handleNewStreamBufMetaWritten(stream, frameLen, frameFin);
+    writtenNewData = true;
+  }
+
+  if (writtenNewData) {
+    // Count packet. It's based on the assumption that schedluing scheme will
+    // only writes one STREAM frame for a stream in a packet. If that doesn't
+    // hold, we need to avoid double-counting.
+    ++stream.numPacketsTxWithNewData;
+    VLOG(10) << nodeToString(conn.nodeType) << " sent"
+             << " packetNum=" << packetNum << " space=" << packetNumberSpace
+             << " " << conn;
+    return true;
+  }
+
+  auto lossBufMetaIter = std::lower_bound(
+      stream.lossBufMetas.begin(),
+      stream.lossBufMetas.end(),
+      frameOffset,
+      [](const auto& bufMeta, auto offset) { return bufMeta.offset < offset; });
+  // We do not clone BufMeta right now. So the data has to be in lossBufMetas.
+  CHECK(lossBufMetaIter != stream.lossBufMetas.end());
+  CHECK_EQ(lossBufMetaIter->offset, frameOffset);
+  handleRetransmissionBufMetaWritten(
+      stream, frameOffset, frameLen, frameFin, lossBufMetaIter);
+  conn.lossState.totalBytesRetransmitted += frameLen;
+  VLOG(10) << nodeToString(conn.nodeType) << " sent retransmission"
+           << " packetNum=" << packetNum << " " << conn;
+  QUIC_STATS(conn.statsCallback, onPacketRetransmission);
+  return false;
+}
+
 void updateConnection(
     QuicConnectionStateBase& conn,
     folly::Optional<PacketEvent> packetEvent,
     RegularQuicWritePacket packet,
     TimePoint sentTime,
-    uint32_t encodedSize) {
+    uint32_t encodedSize,
+    uint32_t encodedBodySize,
+    bool isDSRPacket) {
   auto packetNum = packet.header.getPacketSequenceNum();
   bool retransmittable = false; // AckFrame and PaddingFrame are not retx-able.
   bool isHandshake = false;
   bool isPing = false;
   uint32_t connWindowUpdateSent = 0;
   uint32_t ackFrameCounter = 0;
+  uint32_t streamBytesSent = 0;
+  uint32_t newStreamBytesSent = 0;
+  OutstandingPacket::Metadata::DetailsPerStream detailsPerStream;
   auto packetNumberSpace = packet.header.getPacketNumberSpace();
   bool isD6DProbe = packetNumberSpace == PacketNumberSpace::AppData &&
       conn.d6d.lastProbe.hasValue() &&
       conn.d6d.lastProbe->packetNum == packetNum;
   VLOG(10) << nodeToString(conn.nodeType) << " sent packetNum=" << packetNum
            << " in space=" << packetNumberSpace << " size=" << encodedSize
+           << " bodySize: " << encodedBodySize << " isDSR=" << isDSRPacket
            << " " << conn;
   if (conn.qLogger) {
     conn.qLogger->addPacket(packet, encodedSize);
@@ -499,22 +622,38 @@ void updateConnection(
         retransmittable = true;
         auto stream = CHECK_NOTNULL(
             conn.streamManager->getStream(writeStreamFrame.streamId));
-        auto newStreamDataWritten = handleStreamWritten(
-            conn,
-            *stream,
-            writeStreamFrame.offset,
-            writeStreamFrame.len,
-            writeStreamFrame.fin,
-            packetNum,
-            packetNumberSpace);
+        bool newStreamDataWritten = false;
+        // TODO: Remove UNLIKELY here when DSR is ready for test.
+        if (UNLIKELY(writeStreamFrame.fromBufMeta)) {
+          newStreamDataWritten = handleStreamBufMetaWritten(
+              conn,
+              *stream,
+              writeStreamFrame.offset,
+              writeStreamFrame.len,
+              writeStreamFrame.fin,
+              packetNum,
+              packetNumberSpace);
+        } else {
+          newStreamDataWritten = handleStreamWritten(
+              conn,
+              *stream,
+              writeStreamFrame.offset,
+              writeStreamFrame.len,
+              writeStreamFrame.fin,
+              packetNum,
+              packetNumberSpace);
+        }
         if (newStreamDataWritten) {
           updateFlowControlOnWriteToSocket(*stream, writeStreamFrame.len);
           maybeWriteBlockAfterSocketWrite(*stream);
           maybeWriteDataBlockedAfterSocketWrite(conn);
-          conn.streamManager->updateWritableStreams(*stream);
           conn.streamManager->addTx(writeStreamFrame.streamId);
+          newStreamBytesSent += writeStreamFrame.len;
         }
+        conn.streamManager->updateWritableStreams(*stream);
         conn.streamManager->updateLossStreams(*stream);
+        streamBytesSent += writeStreamFrame.len;
+        detailsPerStream.addFrame(writeStreamFrame, newStreamDataWritten);
         break;
       }
       case QuicWriteFrame::Type::WriteCryptoFrame: {
@@ -532,7 +671,7 @@ void updateConnection(
             *getCryptoStream(*conn.cryptoState, encryptionLevel),
             writeCryptoFrame.offset,
             writeCryptoFrame.len,
-            false,
+            false /* fin */,
             packetNum,
             packetNumberSpace);
         break;
@@ -661,12 +800,17 @@ void updateConnection(
     conn.pendingEvents.setLossDetectionAlarm = retransmittable;
   }
   conn.lossState.totalBytesSent += encodedSize;
+  conn.lossState.totalBodyBytesSent += encodedBodySize;
   conn.lossState.totalPacketsSent++;
+  conn.lossState.totalStreamBytesSent += streamBytesSent;
+  conn.lossState.totalNewStreamBytesSent += newStreamBytesSent;
 
   if (!retransmittable && !isPing) {
     DCHECK(!packetEvent);
     return;
   }
+  conn.lossState.totalAckElicitingPacketsSent++;
+
   auto packetIt =
       std::find_if(
           conn.outstandings.packets.rbegin(),
@@ -679,12 +823,22 @@ void updateConnection(
   auto& pkt = *conn.outstandings.packets.emplace(
       packetIt,
       std::move(packet),
-      std::move(sentTime),
+      sentTime,
       encodedSize,
+      encodedBodySize,
       isHandshake,
       isD6DProbe,
+      // these numbers should all _include_ the current packet
+      // conn.lossState.inflightBytes isn't updated until below
+      // conn.outstandings.numOutstanding() + 1 since we're emplacing here
       conn.lossState.totalBytesSent,
-      conn.lossState.inflightBytes);
+      conn.lossState.totalBodyBytesSent,
+      conn.lossState.inflightBytes + encodedSize,
+      conn.outstandings.numOutstanding() + 1,
+      conn.lossState,
+      conn.writeCount,
+      std::move(detailsPerStream));
+
   if (isD6DProbe) {
     ++conn.d6d.outstandingProbes;
     ++conn.d6d.meta.totalTxedProbes;
@@ -706,20 +860,13 @@ void updateConnection(
     pkt.associatedEvent = std::move(packetEvent);
     conn.lossState.totalBytesCloned += encodedSize;
   }
+  pkt.isDSRPacket = isDSRPacket;
+  if (isDSRPacket) {
+    ++conn.outstandings.dsrCount;
+  }
 
   if (conn.congestionController) {
     conn.congestionController->onPacketSent(pkt);
-    // An approximation of the app being blocked. The app
-    // technically might not have bytes to write.
-    auto writableBytes = conn.congestionController->getWritableBytes();
-    bool cwndBlocked = writableBytes < kBlockedSizeBytes;
-    if (cwndBlocked) {
-      QUIC_TRACE(
-          cwnd_may_block,
-          conn,
-          writableBytes,
-          conn.congestionController->getCongestionWindow());
-    }
   }
   if (conn.pacer) {
     conn.pacer->onPacketSent();
@@ -728,26 +875,13 @@ void updateConnection(
       (conn.pendingEvents.pathChallenge || conn.outstandingPathValidation)) {
     conn.pathValidationLimiter->onPacketSent(pkt.metadata.encodedSize);
   }
-  if (pkt.metadata.isHandshake) {
-    if (!pkt.associatedEvent) {
-      if (packetNumberSpace == PacketNumberSpace::Initial) {
-        ++conn.outstandings.initialPacketsCount;
-      } else {
-        CHECK_EQ(packetNumberSpace, PacketNumberSpace::Handshake);
-        ++conn.outstandings.handshakePacketsCount;
-      }
-    }
-  }
   conn.lossState.lastRetransmittablePacketSentTime = pkt.metadata.time;
   if (pkt.associatedEvent) {
-    ++conn.outstandings.clonedPacketsCount;
+    ++conn.outstandings.clonedPacketCount[packetNumberSpace];
     ++conn.lossState.timeoutBasedRtxCount;
+  } else {
+    ++conn.outstandings.packetCount[packetNumberSpace];
   }
-
-  auto opCount = conn.outstandings.numOutstanding();
-  DCHECK_GE(opCount, conn.outstandings.initialPacketsCount);
-  DCHECK_GE(opCount, conn.outstandings.handshakePacketsCount);
-  DCHECK_GE(opCount, conn.outstandings.clonedPacketsCount);
 }
 
 uint64_t congestionControlWritableBytes(const QuicConnectionStateBase& conn) {
@@ -812,7 +946,7 @@ HeaderBuilder ShortHeaderBuilder() {
   };
 }
 
-uint64_t writeCryptoAndAckDataToSocket(
+WriteQuicDataResult writeCryptoAndAckDataToSocket(
     folly::AsyncUDPSocket& sock,
     QuicConnectionStateBase& connection,
     const ConnectionId& srcConnId,
@@ -835,12 +969,17 @@ uint64_t writeCryptoAndAckDataToSocket(
                     .cryptoFrames())
           .build();
   auto builder = LongHeaderBuilder(packetType);
-  uint64_t written = 0;
+  WriteQuicDataResult result;
+  auto& packetsWritten = result.packetsWritten;
+  auto& probesWritten = result.probesWritten;
   auto& cryptoStream =
       *getCryptoStream(*connection.cryptoState, encryptionLevel);
-  if (connection.pendingEvents.numProbePackets &&
+  auto& numProbePackets =
+      connection.pendingEvents
+          .numProbePackets[LongHeader::typeToPacketNumberSpace(packetType)];
+  if (numProbePackets &&
       (cryptoStream.retransmissionBuffer.size() || scheduler.hasData())) {
-    written = writeProbingDataToSocket(
+    probesWritten = writeProbingDataToSocket(
         sock,
         connection,
         srcConnId,
@@ -849,17 +988,17 @@ uint64_t writeCryptoAndAckDataToSocket(
         encryptionLevel,
         LongHeader::typeToPacketNumberSpace(packetType),
         scheduler,
-        std::min<uint64_t>(
-            packetLimit, connection.pendingEvents.numProbePackets),
+        numProbePackets, // This possibly bypasses the packetLimit.
         cleartextCipher,
         headerCipher,
         version,
         token);
-    CHECK_GE(connection.pendingEvents.numProbePackets, written);
-    connection.pendingEvents.numProbePackets -= written;
   }
+  packetLimit = probesWritten > packetLimit ? 0 : (packetLimit - probesWritten);
+  // Only get one chance to write probes.
+  numProbePackets = 0;
   // Crypto data is written without aead protection.
-  written += writeConnectionDataToSocket(
+  packetsWritten += writeConnectionDataToSocket(
       sock,
       connection,
       srcConnId,
@@ -868,20 +1007,21 @@ uint64_t writeCryptoAndAckDataToSocket(
       LongHeader::typeToPacketNumberSpace(packetType),
       scheduler,
       congestionControlWritableBytes,
-      packetLimit - written,
+      packetLimit - packetsWritten,
       cleartextCipher,
       headerCipher,
       version,
       token);
-  VLOG_IF(10, written > 0) << nodeToString(connection.nodeType)
-                           << " written crypto and acks data type="
-                           << packetType << " packets=" << written << " "
-                           << connection;
-  CHECK_GE(packetLimit, written);
-  return written;
+  VLOG_IF(10, packetsWritten || probesWritten)
+      << nodeToString(connection.nodeType)
+      << " written crypto and acks data type=" << packetType
+      << " packetsWritten=" << packetsWritten
+      << " probesWritten=" << probesWritten << connection;
+  CHECK_GE(packetLimit, packetsWritten);
+  return result;
 }
 
-uint64_t writeQuicDataToSocket(
+WriteQuicDataResult writeQuicDataToSocket(
     folly::AsyncUDPSocket& sock,
     QuicConnectionStateBase& connection,
     const ConnectionId& srcConnId,
@@ -902,7 +1042,7 @@ uint64_t writeQuicDataToSocket(
       /*exceptCryptoStream=*/false);
 }
 
-uint64_t writeQuicDataExceptCryptoStreamToSocket(
+WriteQuicDataResult writeQuicDataExceptCryptoStreamToSocket(
     folly::AsyncUDPSocket& socket,
     QuicConnectionStateBase& connection,
     const ConnectionId& srcConnId,
@@ -945,7 +1085,6 @@ uint64_t writeZeroRttDataToSocket(
                     LongHeader::typeToPacketNumberSpace(type),
                     "ZeroRttScheduler")
                     .streamFrames()
-                    .streamRetransmissions()
                     .resetFrames()
                     .windowUpdateFrames()
                     .blockedFrames()
@@ -1053,14 +1192,6 @@ void writeCloseCommon(
   if (connection.qLogger) {
     connection.qLogger->addPacket(packet.packet, packetSize);
   }
-  QUIC_TRACE(
-      packet_sent,
-      connection,
-      toString(pnSpace),
-      packetNum,
-      (uint64_t)packetSize,
-      (int)false,
-      (int)false);
   VLOG(10) << nodeToString(connection.nodeType)
            << " sent close packetNum=" << packetNum << " in space=" << pnSpace
            << " " << connection;
@@ -1190,7 +1321,7 @@ uint64_t writeConnectionDataToSocket(
       connection.transportSettings.useThreadLocalBatching,
       sock,
       connection.peerAddress,
-      connection,
+      connection.statsCallback,
       connection.happyEyeballsState);
 
   if (connection.loopDetectorCallback) {
@@ -1201,21 +1332,13 @@ uint64_t writeConnectionDataToSocket(
     }
   }
   auto writeLoopBeginTime = Clock::now();
-  // helper functor to check if we have been write in a loop for longer than the
-  // RTT fraction that we are allowed to write. Only kicks in if we have write
-  // one batch in batching write mode.
-  auto timeLimitHelper = [&]() -> bool {
-    auto batchSize = connection.transportSettings.batchingMode ==
-            quic::QuicBatchingMode::BATCHING_MODE_NONE
-        ? connection.transportSettings.writeConnectionDataPacketsLimit
-        : connection.transportSettings.maxBatchSize;
-    return ioBufBatch.getPktSent() < batchSize ||
-        connection.lossState.srtt == 0us ||
-        Clock::now() - writeLoopBeginTime < connection.lossState.srtt /
-            connection.transportSettings.writeLimitRttFraction;
-  };
+  auto batchSize = connection.transportSettings.batchingMode ==
+          QuicBatchingMode::BATCHING_MODE_NONE
+      ? connection.transportSettings.writeConnectionDataPacketsLimit
+      : connection.transportSettings.maxBatchSize;
   while (scheduler.hasData() && ioBufBatch.getPktSent() < packetLimit &&
-         timeLimitHelper()) {
+         ((ioBufBatch.getPktSent() < batchSize) ||
+          writeLoopTimeLimit(writeLoopBeginTime, connection))) {
     auto packetNum = getNextPacketNum(connection, pnSpace);
     auto header = builder(srcConnId, dstConnId, packetNum, version, token);
     uint32_t writableBytes = folly::to<uint32_t>(std::min<uint64_t>(
@@ -1259,7 +1382,9 @@ uint64_t writeConnectionDataToSocket(
         std::move(result->packetEvent),
         std::move(result->packet->packet),
         Clock::now(),
-        folly::to<uint32_t>(ret.encodedSize));
+        folly::to<uint32_t>(ret.encodedSize),
+        folly::to<uint32_t>(ret.encodedBodySize),
+        false /* isDSRPacket */);
 
     // if ioBufBatch.write returns false
     // it is because a flush() call failed
@@ -1387,7 +1512,16 @@ uint64_t writeD6DProbeToSocket(
 }
 
 WriteDataReason shouldWriteData(const QuicConnectionStateBase& conn) {
-  if (conn.pendingEvents.numProbePackets) {
+  auto& numProbePackets = conn.pendingEvents.numProbePackets;
+  bool shouldWriteInitialProbes =
+      numProbePackets[PacketNumberSpace::Initial] && conn.initialWriteCipher;
+  bool shouldWriteHandshakeProbes =
+      numProbePackets[PacketNumberSpace::Handshake] &&
+      conn.handshakeWriteCipher;
+  bool shouldWriteAppDataProbes =
+      numProbePackets[PacketNumberSpace::AppData] && conn.oneRttWriteCipher;
+  if (shouldWriteInitialProbes || shouldWriteHandshakeProbes ||
+      shouldWriteAppDataProbes) {
     VLOG(10) << nodeToString(conn.nodeType) << " needs write because of PTO"
              << conn;
     return WriteDataReason::PROBES;
@@ -1447,9 +1581,6 @@ WriteDataReason hasNonAckDataToWrite(const QuicConnectionStateBase& conn) {
   }
   if (conn.streamManager->hasBlocked()) {
     return WriteDataReason::BLOCKED;
-  }
-  if (conn.streamManager->hasLoss()) {
-    return WriteDataReason::LOSS;
   }
   if (getSendConnFlowControlBytesWire(conn) != 0 &&
       conn.streamManager->hasWritable()) {
@@ -1561,6 +1692,12 @@ void handshakeConfirmed(QuicConnectionStateBase& conn) {
   conn.readCodec->setHandshakeReadCipher(nullptr);
   conn.readCodec->setHandshakeHeaderCipher(nullptr);
   implicitAckCryptoStream(conn, EncryptionLevel::Handshake);
+}
+
+bool hasInitialOrHandshakeCiphers(QuicConnectionStateBase& conn) {
+  return conn.initialWriteCipher || conn.handshakeWriteCipher ||
+      conn.readCodec->getInitialCipher() ||
+      conn.readCodec->getHandshakeReadCipher();
 }
 
 } // namespace quic

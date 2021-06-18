@@ -7,9 +7,10 @@
  */
 
 #include <quic/state/QuicStreamFunctions.h>
+
 #include <quic/QuicException.h>
 #include <quic/flowcontrol/QuicFlowController.h>
-#include <quic/logging/QuicLogger.h>
+
 #include <quic/state/QuicStreamUtilities.h>
 
 #include <folly/io/Cursor.h>
@@ -28,10 +29,14 @@ void prependToBuf(quic::Buf& buf, quic::Buf toAppend) {
 namespace quic {
 
 void writeDataToQuicStream(QuicStreamState& stream, Buf data, bool eof) {
+  auto neverWrittenBufMeta = (0 == stream.writeBufMeta.offset);
   uint64_t len = 0;
   if (data) {
     len = data->computeChainDataLength();
   }
+  // Once data is written to writeBufMeta, no more data can be written to
+  // writeBuffer. Write only an EOF is fine.
+  CHECK(neverWrittenBufMeta || len == 0);
   if (len > 0) {
     // We call this before updating the writeBuffer because we only want to
     // write a blocked frame first time the stream becomes blocked
@@ -44,6 +49,34 @@ void writeDataToQuicStream(QuicStreamState& stream, Buf data, bool eof) {
     stream.finalWriteOffset = stream.currentWriteOffset + bufferSize;
   }
   updateFlowControlOnWriteToStream(stream, len);
+  stream.conn.streamManager->updateWritableStreams(stream);
+}
+
+void writeBufMetaToQuicStream(
+    QuicStreamState& stream,
+    const BufferMeta& data,
+    bool eof) {
+  if (data.length > 0) {
+    maybeWriteBlockAfterAPIWrite(stream);
+  }
+  auto realDataLength =
+      stream.currentWriteOffset + stream.writeBuffer.chainLength();
+  CHECK_GT(realDataLength, 0)
+      << "Real data has to be written to a stream before any buffer meta is"
+      << "written to it.";
+  if (stream.writeBufMeta.offset == 0) {
+    CHECK(!stream.finalWriteOffset.has_value())
+        << "Buffer meta cannot be appended to a stream after we have seen EOM "
+        << "in real data";
+    stream.writeBufMeta.offset = realDataLength;
+  }
+  stream.writeBufMeta.length += data.length;
+  if (eof) {
+    stream.finalWriteOffset =
+        stream.writeBufMeta.offset + stream.writeBufMeta.length;
+    stream.writeBufMeta.eof = true;
+  }
+  updateFlowControlOnWriteToStream(stream, data.length);
   stream.conn.streamManager->updateWritableStreams(stream);
 }
 
@@ -364,6 +397,18 @@ void appendPendingStreamReset(
     QuicConnectionStateBase& conn,
     const QuicStreamState& stream,
     ApplicationErrorCode errorCode) {
+  /*
+   * When BufMetas are written to the transport, but before they are written to
+   * the network, writeBufMeta.offset would be assigned a value >
+   * currentWriteOffset. For this reason, we can't simply use
+   * min(max(currentWriteOffset, writeBufMeta.offset), finalWriteOffset) as the
+   * final offset. We have to check if any BufMetas have been written to the
+   * network. If we simply use min(max(currentWriteOffset, writeBufMeta.offset),
+   * we risk using a value > peer's flow control limit.
+   */
+  bool writeBufWritten = stream.writeBufMeta.offset &&
+      (stream.currentWriteOffset + stream.writeBuffer.chainLength() !=
+       stream.writeBufMeta.offset);
   conn.pendingEvents.resets.emplace(
       std::piecewise_construct,
       std::forward_as_tuple(stream.id),
@@ -371,7 +416,8 @@ void appendPendingStreamReset(
           stream.id,
           errorCode,
           std::min(
-              stream.currentWriteOffset,
+              writeBufWritten ? stream.writeBufMeta.offset
+                              : stream.currentWriteOffset,
               stream.finalWriteOffset.value_or(
                   std::numeric_limits<uint64_t>::max()))));
 }
@@ -407,17 +453,6 @@ uint64_t getNumPacketsTxWithNewData(const QuicStreamState& stream) {
   return stream.numPacketsTxWithNewData;
 }
 
-// TODO reap
-void cancelHandshakeCryptoStreamRetransmissions(QuicCryptoState& cryptoState) {
-  // Cancel any retransmissions we might want to do for the crypto stream.
-  // This does not include data that is already deemed as lost, or data that
-  // is pending in the write buffer.
-  cryptoState.initialStream.retransmissionBuffer.clear();
-  cryptoState.initialStream.lossBuffer.clear();
-  cryptoState.handshakeStream.retransmissionBuffer.clear();
-  cryptoState.handshakeStream.lossBuffer.clear();
-}
-
 QuicCryptoStream* getCryptoStream(
     QuicCryptoState& cryptoState,
     EncryptionLevel encryptionLevel) {
@@ -432,6 +467,8 @@ QuicCryptoStream* getCryptoStream(
       return &cryptoState.handshakeStream;
     case EncryptionLevel::AppData:
       return &cryptoState.oneRttStream;
+    default:
+      LOG(FATAL) << "Unhandled EncryptionLevel";
   }
   folly::assume_unreachable();
 }
@@ -448,55 +485,5 @@ void processCryptoStreamAck(
     return;
   }
   cryptoStream.retransmissionBuffer.erase(ackedBuffer);
-}
-
-bool streamFrameMatchesRetransmitBuffer(
-    const QuicStreamState& stream,
-    const WriteStreamFrame& streamFrame,
-    const StreamBuffer& buf) {
-  // There are 3 possible situations.
-  // 1) Fully reliable mode: the buffer's and stream frame's offsets and lengths
-  //    must match.
-  // 2) Partially reliable mode: the retransmit queue buffer has been
-  //    fully removed by an egress skip before the stream frame arrived.
-  // 3) Partially reliable mode: the retransmit queue buffer was only
-  //    partially trimmed.
-  //    In this case, the retransmit buffer offset must be >= stream frame
-  //    offset and retransmit buffer length must be <= stream frame len field
-  //    vale. Also, the retransmit buffer [offset + length] must match stream
-  //    frame [offset + length].
-
-  bool match = false;
-  if (stream.conn.partialReliabilityEnabled) {
-    auto frameRightOffset = streamFrame.offset + streamFrame.len;
-    if (frameRightOffset > buf.offset) {
-      // There is overlap, buffer fully or partially matches.
-      DCHECK(buf.offset >= streamFrame.offset);
-      DCHECK(buf.data.chainLength() <= streamFrame.len);
-
-      // The offsets and lengths in the stream frame and buffer may be
-      // different, but their sum should stay the same (e.g. offset grows,
-      // length shrinks but sum must be the same).
-      //
-      // Example: let's say we send data buf with offset=0 and len=11 and we
-      // save a copy in retransmission queue. Then we send egress skip to offset
-      // 6 and that trims that buf copy in retransmission queue to offset=6 and
-      // len=5. Then we get an ACK for the original buf we sent with old
-      // offset=0 and len=11 and comparing it to the already trimmed buf. The
-      // offsets and lengths are going to be different, but their sum will be
-      // the same.
-      DCHECK_EQ(
-          buf.offset + buf.data.chainLength(),
-          streamFrame.offset + streamFrame.len);
-      DCHECK_EQ(buf.eof, streamFrame.fin);
-      match = true;
-    } // else frameRightOffset <= buf.offset { ignore }
-  } else {
-    DCHECK_EQ(buf.offset, streamFrame.offset);
-    DCHECK_EQ(buf.data.chainLength(), streamFrame.len);
-    DCHECK_EQ(buf.eof, streamFrame.fin);
-    match = true;
-  }
-  return match;
 }
 } // namespace quic

@@ -6,10 +6,8 @@
  *
  */
 
-#include <quic/state/AckHandlers.h>
-
-#include <quic/logging/QuicLogger.h>
 #include <quic/loss/QuicLossFunctions.h>
+#include <quic/state/AckHandlers.h>
 #include <quic/state/QuicStateFunctions.h>
 #include <iterator>
 
@@ -49,11 +47,15 @@ void processAckFrame(
   // acks which leads to different number of packets being acked usually.
   ack.ackedPackets.reserve(kDefaultRxPacketsBeforeAckAfterInit);
   auto currentPacketIt = getLastOutstandingPacketIncludingLost(conn, pnSpace);
-  uint64_t initialPacketAcked = 0;
-  uint64_t handshakePacketAcked = 0;
-  uint64_t clonedPacketsAcked = 0;
+  uint64_t dsrPacketsAcked = 0;
   folly::Optional<decltype(conn.lossState.lastAckedPacketSentTime)>
       lastAckedPacketSentTime;
+  folly::Optional<Observer::SpuriousLossEvent> spuriousLossEvent;
+  // Used for debug only.
+  const auto originalPacketCount = conn.outstandings.packetCount;
+  if (conn.observers->size() > 0) {
+    spuriousLossEvent.emplace(ackReceiveTime);
+  }
   auto ackBlockIt = frame.ackBlocks.cbegin();
   while (ackBlockIt != frame.ackBlocks.cend() &&
          currentPacketIt != conn.outstandings.packets.rend()) {
@@ -115,27 +117,30 @@ void processAckFrame(
       // TODO also remove any stream data from the loss buffer.
       if (rPacketIt->declaredLost) {
         CHECK_GT(conn.outstandings.declaredLostCount, 0);
-        conn.lossState.spuriousLossCount++;
+        conn.lossState.totalPacketsSpuriouslyMarkedLost++;
         QUIC_STATS(conn.statsCallback, onPacketSpuriousLoss);
         // Decrement the counter, trust that we will erase this as part of
         // the bulk erase.
         conn.outstandings.declaredLostCount--;
+        if (spuriousLossEvent) {
+          spuriousLossEvent->addSpuriousPacket(*rPacketIt);
+        }
         rPacketIt++;
         continue;
       }
       bool needsProcess = !rPacketIt->associatedEvent ||
           conn.outstandings.packetEvents.count(*rPacketIt->associatedEvent);
-      if (rPacketIt->metadata.isHandshake && needsProcess) {
-        if (currentPacketNumberSpace == PacketNumberSpace::Initial) {
-          ++initialPacketAcked;
-        } else {
-          CHECK_EQ(PacketNumberSpace::Handshake, currentPacketNumberSpace);
-          ++handshakePacketAcked;
-        }
+      if (needsProcess) {
+        CHECK(conn.outstandings.packetCount[currentPacketNumberSpace]);
+        --conn.outstandings.packetCount[currentPacketNumberSpace];
       }
       ack.ackedBytes += rPacketIt->metadata.encodedSize;
       if (rPacketIt->associatedEvent) {
-        ++clonedPacketsAcked;
+        CHECK(conn.outstandings.clonedPacketCount[currentPacketNumberSpace]);
+        --conn.outstandings.clonedPacketCount[currentPacketNumberSpace];
+      }
+      if (rPacketIt->isDSRPacket) {
+        ++dsrPacketsAcked;
       }
       // Update RTT if current packet is the largestAcked in the frame:
       auto ackReceiveTimeOrNow = ackReceiveTime > rPacketIt->metadata.time
@@ -144,12 +149,14 @@ void processAckFrame(
       auto rttSample = std::chrono::duration_cast<std::chrono::microseconds>(
           ackReceiveTimeOrNow - rPacketIt->metadata.time);
       if (!ack.implicit && currentPacketNum == frame.largestAcked) {
-        InstrumentationObserver::PacketRTT packetRTT(
+        Observer::PacketRTT packetRTT(
             ackReceiveTimeOrNow, rttSample, frame.ackDelay, *rPacketIt);
-        for (const auto& observer : conn.instrumentationObservers_) {
+        for (const auto& observer : *(conn.observers)) {
           conn.pendingCallbacks.emplace_back(
               [observer, packetRTT](QuicSocket* qSocket) {
-                observer->rttSampleGenerated(qSocket, packetRTT);
+                if (observer->getConfig().rttSamples) {
+                  observer->rttSampleGenerated(qSocket, packetRTT);
+                }
               });
         }
         updateRtt(conn, rttSample, frame.ackDelay);
@@ -165,10 +172,12 @@ void processAckFrame(
           }
         }
       }
-      // Only invoke AckVisitor if the packet doesn't have an associated
-      // PacketEvent; or the PacketEvent is in conn.outstandings.packetEvents
-      if (needsProcess) {
-        for (auto& packetFrame : rPacketIt->packet.frames) {
+      // Invoke AckVisitor for WriteAckFrames all the time. Invoke it for other
+      // frame types only if the packet doesn't have an associated PacketEvent;
+      // or the PacketEvent is in conn.outstandings.packetEvents
+      for (auto& packetFrame : rPacketIt->packet.frames) {
+        if (needsProcess ||
+            packetFrame.type() == QuicWriteFrame::Type::WriteAckFrame) {
           ackVisitor(*rPacketIt, packetFrame, frame);
         }
       }
@@ -191,6 +200,8 @@ void processAckFrame(
         conn.lossState.totalBytesSentAtLastAck = conn.lossState.totalBytesSent;
         conn.lossState.totalBytesAckedAtLastAck =
             conn.lossState.totalBytesAcked;
+        conn.lossState.totalBodyBytesAcked +=
+            rPacketIt->metadata.encodedBodySize;
         if (!lastAckedPacketSentTime) {
           lastAckedPacketSentTime = rPacketIt->metadata.time;
         }
@@ -223,20 +234,29 @@ void processAckFrame(
   if (lastAckedPacketSentTime) {
     conn.lossState.lastAckedPacketSentTime = *lastAckedPacketSentTime;
   }
-  CHECK_GE(conn.outstandings.initialPacketsCount, initialPacketAcked);
-  conn.outstandings.initialPacketsCount -= initialPacketAcked;
-  CHECK_GE(conn.outstandings.handshakePacketsCount, handshakePacketAcked);
-  conn.outstandings.handshakePacketsCount -= handshakePacketAcked;
-  CHECK_GE(conn.outstandings.clonedPacketsCount, clonedPacketsAcked);
-  conn.outstandings.clonedPacketsCount -= clonedPacketsAcked;
+  CHECK_GE(conn.outstandings.dsrCount, dsrPacketsAcked);
+  conn.outstandings.dsrCount -= dsrPacketsAcked;
   CHECK_GE(
       conn.outstandings.packets.size(), conn.outstandings.declaredLostCount);
   auto updatedOustandingPacketsCount = conn.outstandings.numOutstanding();
-  CHECK_GE(
-      updatedOustandingPacketsCount,
-      conn.outstandings.handshakePacketsCount +
-          conn.outstandings.initialPacketsCount);
-  CHECK_GE(updatedOustandingPacketsCount, conn.outstandings.clonedPacketsCount);
+  const auto& packetCount = conn.outstandings.packetCount;
+  LOG_IF(
+      DFATAL,
+      updatedOustandingPacketsCount <
+          packetCount[PacketNumberSpace::Handshake] +
+              packetCount[PacketNumberSpace::Initial] +
+              packetCount[PacketNumberSpace::AppData])
+      << "QUIC packetCount inconsistency: "
+         "numOutstanding: "
+      << updatedOustandingPacketsCount << " packetCount: {"
+      << packetCount[PacketNumberSpace::Initial] << ","
+      << packetCount[PacketNumberSpace::Handshake] << ","
+      << packetCount[PacketNumberSpace::AppData] << "}"
+      << " originalPacketCount: {"
+      << originalPacketCount[PacketNumberSpace::Initial] << ","
+      << originalPacketCount[PacketNumberSpace::Handshake] << ","
+      << originalPacketCount[PacketNumberSpace::AppData] << "}";
+  CHECK_GE(updatedOustandingPacketsCount, conn.outstandings.numClonedPackets());
   auto lossEvent = handleAckForLoss(conn, lossVisitor, ack, pnSpace);
   if (conn.congestionController &&
       (ack.largestAckedPacket.has_value() || lossEvent)) {
@@ -259,6 +279,16 @@ void processAckFrame(
         std::move(ack), std::move(lossEvent));
   }
   clearOldOutstandingPackets(conn, ackReceiveTime, pnSpace);
+  if (spuriousLossEvent && spuriousLossEvent->hasPackets()) {
+    for (const auto& observer : *(conn.observers)) {
+      conn.pendingCallbacks.emplace_back(
+          [observer, spuriousLossEvent](QuicSocket* qSocket) {
+            if (observer->getConfig().spuriousLossEvents) {
+              observer->spuriousLossDetected(qSocket, *spuriousLossEvent);
+            }
+          });
+    }
+  }
 }
 
 void clearOldOutstandingPackets(

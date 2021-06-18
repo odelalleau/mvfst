@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <folly/container/EvictingCacheMap.h>
 #include <folly/container/F14Map.h>
 #include <folly/container/F14Set.h>
 #include <folly/io/SocketOptionMap.h>
@@ -363,8 +364,8 @@ class QuicServerWorker : public folly::AsyncUDPSocket::ReadCallback,
       const std::vector<ConnectionIdData>& connectionIdData) noexcept override;
 
   // From ServerConnectionIdRejector:
-  bool rejectConnectionId(const ConnectionId& candidate) const
-      noexcept override;
+  bool rejectConnectionId(
+      const ConnectionId& candidate) const noexcept override;
 
   void onReadError(const folly::AsyncSocketException& ex) noexcept override;
 
@@ -542,6 +543,15 @@ class QuicServerWorker : public folly::AsyncUDPSocket::ReadCallback,
   // A server transport's membership is exclusive to only one of these maps.
   ConnIdToTransportMap connectionIdMap_;
   SrcToTransportMap sourceAddressMap_;
+
+  folly::EvictingCacheMap<
+      ConnectionId,
+      folly::small_vector<
+          NetworkData,
+          kDefaultMaxBufferedPackets,
+          folly::small_vector_policy::NoHeap>,
+      ConnectionIdHash>
+      pending0RttData_{20};
 
   // Contains every unique transport that is mapped in connectionIdMap_.
   folly::F14FastMap<QuicServerTransport*, std::weak_ptr<QuicServerTransport>>

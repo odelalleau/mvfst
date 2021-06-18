@@ -239,7 +239,7 @@ bool QuicStreamManager::setStreamPriority(
     // If this stream is already in the writable or loss queus, update the
     // priority there.
     writableStreams_.updateIfExist(id, stream->priority);
-    lossStreams_.updateIfExist(id, stream->priority);
+    writableDSRStreams_.updateIfExist(id, stream->priority);
     return true;
   }
   return false;
@@ -439,16 +439,15 @@ void QuicStreamManager::removeClosedStream(StreamId streamId) {
   readableStreams_.erase(streamId);
   peekableStreams_.erase(streamId);
   writableStreams_.erase(streamId);
+  writableDSRStreams_.erase(streamId);
   writableControlStreams_.erase(streamId);
+  removeLoss(streamId);
   blockedStreams_.erase(streamId);
   deliverableStreams_.erase(streamId);
   txStreams_.erase(streamId);
   windowUpdates_.erase(streamId);
-  lossStreams_.erase(streamId);
   stopSendingStreams_.erase(streamId);
   flowControlUpdated_.erase(streamId);
-  dataRejectedStreams_.erase(streamId);
-  dataExpiredStreams_.erase(streamId);
   if (it->second.isControl) {
     DCHECK_GT(numControlStreams_, 0);
     numControlStreams_--;
@@ -498,16 +497,6 @@ void QuicStreamManager::removeClosedStream(StreamId streamId) {
   updateAppIdleState();
 }
 
-void QuicStreamManager::updateLossStreams(QuicStreamState& stream) {
-  if (stream.lossBuffer.empty()) {
-    // No-op if not present
-    lossStreams_.erase(stream.id);
-  } else {
-    // No-op if already inserted
-    lossStreams_.insertOrUpdate(stream.id, stream.priority);
-  }
-}
-
 void QuicStreamManager::updateReadableStreams(QuicStreamState& stream) {
   updateHolBlockedTime(stream);
   if (stream.hasReadableData() || stream.streamReadError.has_value()) {
@@ -518,15 +507,33 @@ void QuicStreamManager::updateReadableStreams(QuicStreamState& stream) {
 }
 
 void QuicStreamManager::updateWritableStreams(QuicStreamState& stream) {
-  if (stream.hasWritableData() && !stream.streamWriteError.has_value()) {
-    stream.conn.streamManager->addWritable(stream);
+  if (stream.streamWriteError.has_value()) {
+    CHECK(stream.lossBuffer.empty());
+    CHECK(stream.lossBufMetas.empty());
+    removeWritable(stream);
+    removeDSRWritable(stream);
+    return;
+  }
+  if (stream.hasWritableData() || !stream.lossBuffer.empty()) {
+    addWritable(stream);
   } else {
-    stream.conn.streamManager->removeWritable(stream);
+    removeWritable(stream);
+  }
+  if (stream.isControl) {
+    return;
+  }
+  if (stream.dsrSender &&
+      (stream.hasWritableBufMeta() || !stream.lossBufMetas.empty())) {
+    addDSRWritable(stream);
+  } else {
+    removeDSRWritable(stream);
   }
 }
 
 void QuicStreamManager::updatePeekableStreams(QuicStreamState& stream) {
-  if (stream.hasPeekableData() && !stream.streamReadError.has_value()) {
+  // In the PeekCallback, the API peekError() is added, so change the condition
+  // and allow streamReadError in the peekableStreams
+  if (stream.hasPeekableData() || stream.streamReadError.has_value()) {
     peekableStreams_.emplace(stream.id);
   } else {
     peekableStreams_.erase(stream.id);

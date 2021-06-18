@@ -109,14 +109,13 @@ class ClientHandshakeTest : public Test, public boost::static_visitor<> {
             kDefaultIdleTimeout,
             kDefaultAckDelayExponent,
             kDefaultUDPSendPacketLen,
-            kDefaultPartialReliability,
             generateStatelessResetToken(),
             ConnectionId(std::vector<uint8_t>{0xff, 0xfe, 0xfd, 0xfc}),
             ConnectionId(std::vector<uint8_t>()));
     fizzServer.reset(
         new fizz::server::
             FizzServer<ClientHandshakeTest, fizz::server::ServerStateMachine>(
-                serverState, serverReadBuf, *this, dg.get()));
+                serverState, serverReadBuf, readAeadOptions, *this, dg.get()));
     connect();
     processHandshake();
     fizzServer->accept(&evb, serverCtx, serverTransportParameters);
@@ -273,6 +272,7 @@ class ClientHandshakeTest : public Test, public boost::static_visitor<> {
   folly::Optional<fizz::ReportError> handshakeError;
   folly::IOBufQueue serverReadBuf{folly::IOBufQueue::cacheChainLength()};
   std::unique_ptr<DelayedHolder, folly::DelayedDestruction::Destructor> dg;
+  fizz::Aead::AeadOptions readAeadOptions;
 
   std::unique_ptr<Aead> handshakeWriteCipher;
   const Aead* handshakeReadCipher = nullptr;

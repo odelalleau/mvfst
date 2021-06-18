@@ -24,6 +24,7 @@ constexpr auto kCubicSkipLoss = "cubic skip loss";
 constexpr auto kCubicLoss = "cubic loss";
 constexpr auto kCubicSteadyCwnd = "cubic steady cwnd";
 constexpr auto kCubicSkipAck = "cubic skip ack";
+constexpr auto kCubicInit = "cubic init";
 constexpr auto kCongestionPacketAck = "congestion packet ack";
 constexpr auto kCwndNoChange = "cwnd no change";
 constexpr auto kAckInQuiescence = "ack in quiescence";
@@ -81,6 +82,7 @@ constexpr auto kHeaders = "headers";
 constexpr auto kOnHeaders = "on headers";
 constexpr auto kOnError = "on error";
 constexpr auto kPushPromise = "push promise";
+constexpr auto kBody = "body";
 
 constexpr folly::StringPiece kQLogServerVantagePoint = "server";
 constexpr folly::StringPiece kQLogClientVantagePoint = "client";

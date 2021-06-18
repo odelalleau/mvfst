@@ -14,7 +14,9 @@ class QuicPlaintextReadRecordLayer : public fizz::PlaintextReadRecordLayer {
  public:
   ~QuicPlaintextReadRecordLayer() override = default;
 
-  folly::Optional<fizz::TLSMessage> read(folly::IOBufQueue& buf) override {
+  folly::Optional<fizz::TLSMessage> read(
+      folly::IOBufQueue& buf,
+      fizz::Aead::AeadOptions) override {
     if (buf.empty()) {
       return folly::none;
     }
@@ -32,7 +34,9 @@ class QuicEncryptedReadRecordLayer : public fizz::EncryptedReadRecordLayer {
   explicit QuicEncryptedReadRecordLayer(fizz::EncryptionLevel encryptionLevel)
       : fizz::EncryptedReadRecordLayer(encryptionLevel) {}
 
-  folly::Optional<fizz::TLSMessage> read(folly::IOBufQueue& buf) override {
+  folly::Optional<fizz::TLSMessage> read(
+      folly::IOBufQueue& buf,
+      fizz::Aead::AeadOptions) override {
     if (buf.empty()) {
       return folly::none;
     }
@@ -57,8 +61,8 @@ class QuicPlaintextWriteRecordLayer : public fizz::PlaintextWriteRecordLayer {
 
   fizz::TLSContent writeInitialClientHello(
       std::unique_ptr<folly::IOBuf> encodedClientHello) const override {
-    return write(fizz::TLSMessage{fizz::ContentType::handshake,
-                                  std::move(encodedClientHello)});
+    return write(fizz::TLSMessage{
+        fizz::ContentType::handshake, std::move(encodedClientHello)});
   }
 };
 

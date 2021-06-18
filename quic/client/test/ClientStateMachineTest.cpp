@@ -1,6 +1,7 @@
 // Copyright 2004-present Facebook. All Rights Reserved.
 
 #include <quic/client/state/ClientStateMachine.h>
+
 #include <quic/client/handshake/CachedServerTransportParameters.h>
 #include <quic/client/handshake/ClientHandshake.h>
 #include <quic/handshake/CryptoFactory.h>
@@ -35,8 +36,8 @@ class ClientStateMachineTest : public Test {
  public:
   void SetUp() override {
     mockFactory_ = std::make_shared<MockClientHandshakeFactory>();
-    EXPECT_CALL(*mockFactory_, makeClientHandshake(_))
-        .WillOnce(Invoke(
+    EXPECT_CALL(*mockFactory_, _makeClientHandshake(_))
+        .WillRepeatedly(Invoke(
             [&](QuicClientConnectionState* conn)
                 -> std::unique_ptr<quic::ClientHandshake> {
               auto handshake = std::make_unique<MockClientHandshake>(conn);
@@ -85,6 +86,17 @@ TEST_F(ClientStateMachineTest, TestUpdateTransportParamsFromCachedEarlyParams) {
   }
   EXPECT_TRUE(
       client_->streamManager->createNextUnidirectionalStream().hasError());
+}
+
+TEST_F(ClientStateMachineTest, PreserveHappyeyabllsDuringUndo) {
+  folly::EventBase evb;
+  client_->clientConnectionId = ConnectionId::createRandom(8);
+  client_->happyEyeballsState.finished = true;
+  client_->happyEyeballsState.secondSocket =
+      std::make_unique<folly::AsyncUDPSocket>(&evb);
+  auto newConn = undoAllClientStateForRetry(std::move(client_));
+  EXPECT_TRUE(newConn->happyEyeballsState.finished);
+  EXPECT_NE(nullptr, newConn->happyEyeballsState.secondSocket);
 }
 
 } // namespace quic::test

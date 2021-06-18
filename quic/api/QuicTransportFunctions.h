@@ -26,6 +26,7 @@ struct DataPathResult {
   bool writeSuccess{false};
   folly::Optional<SchedulingResult> result;
   uint64_t encodedSize{0};
+  uint64_t encodedBodySize{0};
 
   static DataPathResult makeBuildFailure() {
     return DataPathResult();
@@ -34,8 +35,10 @@ struct DataPathResult {
   static DataPathResult makeWriteResult(
       bool writeSuc,
       SchedulingResult&& res,
-      uint64_t encodedSizeIn) {
-    return DataPathResult(writeSuc, std::move(res), encodedSizeIn);
+      uint64_t encodedSizeIn,
+      uint64_t encodedBodySizeIn) {
+    return DataPathResult(
+        writeSuc, std::move(res), encodedSizeIn, encodedBodySizeIn);
   }
 
  private:
@@ -44,11 +47,13 @@ struct DataPathResult {
   explicit DataPathResult(
       bool writeSuc,
       SchedulingResult&& res,
-      uint64_t encodedSizeIn)
+      uint64_t encodedSizeIn,
+      uint64_t encodedBodySizeIn)
       : buildSuccess(true),
         writeSuccess(writeSuc),
         result(std::move(res)),
-        encodedSize(encodedSizeIn) {}
+        encodedSize(encodedSizeIn),
+        encodedBodySize(encodedBodySizeIn) {}
 };
 
 using DataPathFunc = std::function<DataPathResult(
@@ -73,11 +78,18 @@ using HeaderBuilder = std::function<PacketHeader(
 using WritableBytesFunc =
     std::function<uint64_t(const QuicConnectionStateBase& conn)>;
 
+// Encapsulating the return value for the write functions.
+// Useful because probes can go over the packet limit.
+struct WriteQuicDataResult {
+  uint64_t packetsWritten{};
+  uint64_t probesWritten{};
+};
+
 /**
  * Attempts to write data from all frames in the QUIC connection into the UDP
  * socket supplied with the aead and the headerCipher.
  */
-uint64_t writeQuicDataToSocket(
+WriteQuicDataResult writeQuicDataToSocket(
     folly::AsyncUDPSocket& sock,
     QuicConnectionStateBase& connection,
     const ConnectionId& srcConnId,
@@ -92,7 +104,7 @@ uint64_t writeQuicDataToSocket(
  *
  * return the number of packets written to socket.
  */
-uint64_t writeCryptoAndAckDataToSocket(
+WriteQuicDataResult writeCryptoAndAckDataToSocket(
     folly::AsyncUDPSocket& sock,
     QuicConnectionStateBase& connection,
     const ConnectionId& srcConnId,
@@ -109,7 +121,7 @@ uint64_t writeCryptoAndAckDataToSocket(
  * This is useful when the crypto stream still needs to be sent in separate
  * packets and cannot use the encryption of the data key.
  */
-uint64_t writeQuicDataExceptCryptoStreamToSocket(
+WriteQuicDataResult writeQuicDataExceptCryptoStreamToSocket(
     folly::AsyncUDPSocket& socket,
     QuicConnectionStateBase& connection,
     const ConnectionId& srcConnId,
@@ -146,23 +158,18 @@ WriteDataReason hasNonAckDataToWrite(const QuicConnectionStateBase& conn);
  * Invoked when the written stream data was new stream data.
  */
 void handleNewStreamDataWritten(
-    QuicConnectionStateBase& conn,
     QuicStreamLike& stream,
     uint64_t frameLen,
-    bool frameFin,
-    PacketNum packetNum,
-    PacketNumberSpace packetNumberSpace);
+    bool frameFin);
 
 /**
  * Invoked when the stream data written was retransmitted data.
  */
 void handleRetransmissionWritten(
-    QuicConnectionStateBase& conn,
     QuicStreamLike& stream,
     uint64_t frameOffset,
     uint64_t frameLen,
     bool frameFin,
-    PacketNum packetNum,
     std::deque<StreamBuffer>::iterator lossBufferIter);
 
 /**
@@ -179,6 +186,15 @@ bool handleStreamWritten(
     PacketNum packetNum,
     PacketNumberSpace packetNumberSpace);
 
+bool handleStreamBufMetaWritten(
+    QuicConnectionStateBase& conn,
+    QuicStreamState& stream,
+    uint64_t frameOffset,
+    uint64_t frameLen,
+    bool frameFin,
+    PacketNum packetNum,
+    PacketNumberSpace packetNumberSpace);
+
 /**
  * Update the connection state after sending a new packet.
  */
@@ -187,7 +203,9 @@ void updateConnection(
     folly::Optional<PacketEvent> packetEvent,
     RegularQuicWritePacket packet,
     TimePoint time,
-    uint32_t encodedSize);
+    uint32_t encodedSize,
+    uint32_t encodedBodySize,
+    bool isDSRPacket);
 
 /**
  * Returns the minimum available bytes window out of path validation rate
@@ -300,5 +318,10 @@ void implicitAckCryptoStream(
     QuicConnectionStateBase& conn,
     EncryptionLevel encryptionLevel);
 void handshakeConfirmed(QuicConnectionStateBase& conn);
+bool hasInitialOrHandshakeCiphers(QuicConnectionStateBase& conn);
+
+bool writeLoopTimeLimit(
+    TimePoint loopBeginTime,
+    const QuicConnectionStateBase& connection);
 
 } // namespace quic

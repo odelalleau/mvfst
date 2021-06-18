@@ -1,6 +1,7 @@
 // Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
 #include <quic/state/stream/StreamSendHandlers.h>
+
 #include <quic/flowcontrol/QuicFlowController.h>
 #include <quic/state/QuicStreamFunctions.h>
 
@@ -41,8 +42,9 @@ void sendStopSendingSMHandler(
           isBidirectionalStream(stream.id) ||
           isSendingStream(stream.conn.nodeType, stream.id));
       if (stream.conn.nodeType == QuicNodeType::Server &&
-          getSendStreamFlowControlBytesWire(stream) == 0) {
-        VLOG(2) << "Client gives up a flow control blocked stream";
+          getSendStreamFlowControlBytesWire(stream) == 0 &&
+          !stream.finalWriteOffset) {
+        VLOG_EVERY_N(2, 100) << "Client gives up a flow control blocked stream";
       }
       stream.conn.streamManager->addStopSending(stream.id, frame.errorCode);
       break;
@@ -95,11 +97,10 @@ void sendAckSMHandler(
     const WriteStreamFrame& ackedFrame) {
   switch (stream.sendState) {
     case StreamSendState::Open: {
-      // Clean up the acked buffers from the retransmissionBuffer.
-      auto ackedBuffer = stream.retransmissionBuffer.find(ackedFrame.offset);
-      if (ackedBuffer != stream.retransmissionBuffer.end()) {
-        if (streamFrameMatchesRetransmitBuffer(
-                stream, ackedFrame, *ackedBuffer->second)) {
+      if (!ackedFrame.fromBufMeta) {
+        // Clean up the acked buffers from the retransmissionBuffer.
+        auto ackedBuffer = stream.retransmissionBuffer.find(ackedFrame.offset);
+        if (ackedBuffer != stream.retransmissionBuffer.end()) {
           VLOG(10) << "Open: acked stream data stream=" << stream.id
                    << " offset=" << ackedBuffer->second->offset
                    << " len=" << ackedBuffer->second->data.chainLength()
@@ -109,12 +110,22 @@ void sendAckSMHandler(
               ackedBuffer->second->offset +
                   ackedBuffer->second->data.chainLength());
           stream.retransmissionBuffer.erase(ackedBuffer);
-        } else {
-          VLOG(10)
-              << "Open: received an ack for already discarded buffer; stream="
-              << stream.id << " offset=" << ackedBuffer->second->offset
-              << " len=" << ackedBuffer->second->data.chainLength()
-              << " eof=" << ackedBuffer->second->eof << " " << stream.conn;
+        }
+      } else {
+        auto ackedBuffer =
+            stream.retransmissionBufMetas.find(ackedFrame.offset);
+        if (ackedBuffer != stream.retransmissionBufMetas.end()) {
+          CHECK_EQ(ackedFrame.offset, ackedBuffer->second.offset);
+          CHECK_EQ(ackedFrame.len, ackedBuffer->second.length);
+          CHECK_EQ(ackedFrame.fin, ackedBuffer->second.eof);
+          VLOG(10) << "Open: acked stream data bufmeta=" << stream.id
+                   << " offset=" << ackedBuffer->second.offset
+                   << " len=" << ackedBuffer->second.length
+                   << " eof=" << ackedBuffer->second.eof << " " << stream.conn;
+          stream.ackedIntervals.insert(
+              ackedBuffer->second.offset,
+              ackedBuffer->second.offset + ackedBuffer->second.length);
+          stream.retransmissionBufMetas.erase(ackedBuffer);
         }
       }
 

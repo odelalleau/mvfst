@@ -7,6 +7,7 @@
  */
 
 #include <quic/codec/Types.h>
+
 #include <quic/QuicException.h>
 
 namespace quic {
@@ -227,6 +228,21 @@ ProtectionType longHeaderTypeToProtectionType(
   folly::assume_unreachable();
 }
 
+PacketNumberSpace protectionTypeToPacketNumberSpace(
+    ProtectionType protectionType) {
+  switch (protectionType) {
+    case ProtectionType::Initial:
+      return PacketNumberSpace::Initial;
+    case ProtectionType::Handshake:
+      return PacketNumberSpace::Handshake;
+    case ProtectionType::ZeroRtt:
+    case ProtectionType::KeyPhaseZero:
+    case ProtectionType::KeyPhaseOne:
+      return PacketNumberSpace::AppData;
+  }
+  folly::assume_unreachable();
+}
+
 ShortHeaderInvariant::ShortHeaderInvariant(ConnectionId dcid)
     : destinationConnId(std::move(dcid)) {}
 
@@ -414,14 +430,15 @@ std::string toString(FrameType frame) {
       return "CONNECTION_CLOSE";
     case FrameType::CONNECTION_CLOSE_APP_ERR:
       return "APPLICATION_CLOSE";
-    case FrameType::MIN_STREAM_DATA:
-      return "MIN_STREAM_DATA";
-    case FrameType::EXPIRED_STREAM_DATA:
-      return "EXPIRED_STREAM_DATA";
     case FrameType::HANDSHAKE_DONE:
       return "HANDSHAKE_DONE";
+    case FrameType::DATAGRAM:
+    case FrameType::DATAGRAM_LEN:
+      return "DATAGRAM";
     case FrameType::KNOB:
       return "KNOB";
+    case FrameType::ACK_FREQUENCY:
+      return "ACK_FREQUENCY";
   }
   LOG(WARNING) << "toString has unhandled frame type";
   return "UNKNOWN";

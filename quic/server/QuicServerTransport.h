@@ -60,7 +60,17 @@ class QuicServerTransport
       folly::EventBase* evb,
       std::unique_ptr<folly::AsyncUDPSocket> sock,
       ConnectionCallback& cb,
-      std::shared_ptr<const fizz::server::FizzServerContext> ctx);
+      std::shared_ptr<const fizz::server::FizzServerContext> ctx,
+      std::unique_ptr<CryptoFactory> cryptoFactory = nullptr);
+
+  // Testing only API:
+  QuicServerTransport(
+      folly::EventBase* evb,
+      std::unique_ptr<folly::AsyncUDPSocket> sock,
+      ConnectionCallback& cb,
+      std::shared_ptr<const fizz::server::FizzServerContext> ctx,
+      std::unique_ptr<CryptoFactory> cryptoFactory,
+      PacketNum startingPacketNum);
 
   ~QuicServerTransport() override;
 
@@ -87,14 +97,6 @@ class QuicServerTransport
   void setServerConnectionIdRejector(
       ServerConnectionIdRejector* connIdRejector) noexcept;
 
-  /**
-   * Set factory to create specific congestion controller instances
-   * for a given connection
-   * This must be set before the server is started.
-   */
-  void setCongestionControllerFactory(
-      std::shared_ptr<CongestionControllerFactory> factory) override;
-
   virtual void setClientConnectionId(const ConnectionId& clientConnectionId);
 
   void setClientChosenDestConnectionId(const ConnectionId& serverCid);
@@ -108,6 +110,7 @@ class QuicServerTransport
   void unbindConnection() override;
   bool hasWriteCipher() const override;
   std::shared_ptr<QuicTransportBase> sharedGuard() override;
+  QuicConnectionStats getConnectionsStats() const override;
 
   const fizz::server::FizzServerContext& getCtx() {
     return *ctx_;

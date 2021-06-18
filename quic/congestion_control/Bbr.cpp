@@ -9,12 +9,12 @@
 // Copyright 2004-present Facebook.  All rights reserved.
 
 #include <quic/congestion_control/Bbr.h>
+
 #include <folly/Random.h>
 #include <quic/QuicConstants.h>
 #include <quic/common/TimeUtil.h>
 #include <quic/congestion_control/CongestionControlFunctions.h>
 #include <quic/logging/QLoggerConstants.h>
-#include <quic/logging/QuicLogger.h>
 
 using namespace std::chrono_literals;
 
@@ -38,9 +38,7 @@ BbrCongestionController::BbrCongestionController(QuicConnectionStateBase& conn)
       pacingWindow_(
           conn.udpSendPacketLen * conn.transportSettings.initCwndInMss),
       // TODO: experiment with longer window len for ack aggregation filter
-      maxAckHeightFilter_(kBandwidthWindowLength, 0, 0) {
-  QUIC_TRACE(initcwnd, conn_, initialCwnd_);
-}
+      maxAckHeightFilter_(kBandwidthWindowLength, 0, 0) {}
 
 CongestionControlType BbrCongestionController::type() const noexcept {
   return CongestionControlType::BBR;
@@ -102,13 +100,6 @@ void BbrCongestionController::onPacketLoss(
           bbrStateToString(state_),
           bbrRecoveryStateToString(recoveryState_));
     }
-    QUIC_TRACE(
-        bbr_persistent_congestion,
-        conn_,
-        bbrStateToString(state_),
-        bbrRecoveryStateToString(recoveryState_),
-        recoveryWindow_,
-        conn_.lossState.inflightBytes);
   }
 }
 
@@ -186,15 +177,6 @@ void BbrCongestionController::onPacketAcked(
           bbrStateToString(state_),
           bbrRecoveryStateToString(recoveryState_));
     }
-    QUIC_TRACE(
-        bbr_ack,
-        conn_,
-        bbrStateToString(state_),
-        bbrRecoveryStateToString(recoveryState_),
-        getCongestionWindow(),
-        cwnd_,
-        sendQuantum_,
-        conn_.lossState.inflightBytes);
   };
   if (ack.implicit) {
     // This is an implicit ACK during the handshake, we can't trust very
@@ -289,11 +271,13 @@ void BbrCongestionController::updatePacing() noexcept {
   }
   // TODO: slower pacing if we are in STARTUP and loss has happened
   if (state_ == BbrState::Startup) {
-    // This essentially paces at a 200% rate.
-    conn_.pacer->setRttFactor(1, 2);
+    conn_.pacer->setRttFactor(
+        conn_.transportSettings.startupRttFactor.first,
+        conn_.transportSettings.startupRttFactor.second);
   } else {
-    // Otherwise pace at a 120% rate.
-    conn_.pacer->setRttFactor(4, 5);
+    conn_.pacer->setRttFactor(
+        conn_.transportSettings.defaultRttFactor.first,
+        conn_.transportSettings.defaultRttFactor.second);
   }
   conn_.pacer->refreshPacingRate(pacingWindow_, mrtt);
   if (state_ == BbrState::Drain) {
@@ -464,8 +448,8 @@ bool BbrCongestionController::inRecovery() const noexcept {
   return recoveryState_ != BbrCongestionController::RecoveryState::NOT_RECOVERY;
 }
 
-BbrCongestionController::BbrState BbrCongestionController::state() const
-    noexcept {
+BbrCongestionController::BbrState BbrCongestionController::state()
+    const noexcept {
   return state_;
 }
 
@@ -483,8 +467,8 @@ Bandwidth BbrCongestionController::bandwidth() const noexcept {
   return bandwidthSampler_ ? bandwidthSampler_->getBandwidth() : Bandwidth();
 }
 
-uint64_t BbrCongestionController::calculateTargetCwnd(float gain) const
-    noexcept {
+uint64_t BbrCongestionController::calculateTargetCwnd(
+    float gain) const noexcept {
   auto bandwidthEst = bandwidth();
   auto minRttEst = minRtt();
   if (!bandwidthEst || minRttEst == 0us) {
@@ -538,7 +522,6 @@ void BbrCongestionController::setAppIdle(
   if (conn_.qLogger) {
     conn_.qLogger->addAppIdleUpdate(kAppIdle, idle);
   }
-  QUIC_TRACE(bbr_appidle, conn_, idle);
   /*
    * No-op for bbr.
    * We are not necessarily app-limite when we are app-idle. For example, the

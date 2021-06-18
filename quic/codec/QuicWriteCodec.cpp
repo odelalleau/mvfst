@@ -47,18 +47,18 @@ folly::Optional<uint64_t> writeStreamFrameHeader(
   }
   StreamTypeField::Builder streamTypeBuilder;
   QuicInteger idInt(id);
-  QuicInteger offsetInt(offset);
   // First account for the things that are non-optional: frame type and stream
   // id.
   uint64_t headerSize = sizeof(uint8_t) + idInt.getSize();
-  if (offset != 0) {
-    streamTypeBuilder.setOffset();
-    headerSize += offsetInt.getSize();
-  }
   if (builder.remainingSpaceInPkt() < headerSize) {
     VLOG(4) << "No space in packet for stream header. stream=" << id
             << " remaining=" << builder.remainingSpaceInPkt();
     return folly::none;
+  }
+  QuicInteger offsetInt(offset);
+  if (offset != 0) {
+    streamTypeBuilder.setOffset();
+    headerSize += offsetInt.getSize();
   }
   // Next we have to deal with the data length. This is trickier. The length of
   // data we are able to send depends on 3 things: how much we have in the
@@ -346,47 +346,6 @@ size_t writeSimpleFrame(
       // no space left in packet
       return size_t(0);
     }
-    case QuicSimpleFrame::Type::MinStreamDataFrame: {
-      const MinStreamDataFrame& minStreamDataFrame =
-          *frame.asMinStreamDataFrame();
-      QuicInteger streamId(minStreamDataFrame.streamId);
-      QuicInteger maximumData(minStreamDataFrame.maximumData);
-      QuicInteger minimumStreamOffset(minStreamDataFrame.minimumStreamOffset);
-      QuicInteger frameType(
-          static_cast<FrameTypeType>(FrameType::MIN_STREAM_DATA));
-      auto minStreamDataFrameSize = frameType.getSize() + streamId.getSize() +
-          maximumData.getSize() + minimumStreamOffset.getSize();
-      if (packetSpaceCheck(spaceLeft, minStreamDataFrameSize)) {
-        builder.write(frameType);
-        builder.write(streamId);
-        builder.write(maximumData);
-        builder.write(minimumStreamOffset);
-        builder.appendFrame(QuicSimpleFrame(std::move(minStreamDataFrame)));
-        return minStreamDataFrameSize;
-      }
-      // no space left in packet
-      return size_t(0);
-    }
-    case QuicSimpleFrame::Type::ExpiredStreamDataFrame: {
-      const ExpiredStreamDataFrame& expiredStreamDataFrame =
-          *frame.asExpiredStreamDataFrame();
-      QuicInteger frameType(
-          static_cast<FrameTypeType>(FrameType::EXPIRED_STREAM_DATA));
-      QuicInteger streamId(expiredStreamDataFrame.streamId);
-      QuicInteger minimumStreamOffset(
-          expiredStreamDataFrame.minimumStreamOffset);
-      auto expiredStreamDataFrameSize = frameType.getSize() +
-          streamId.getSize() + minimumStreamOffset.getSize();
-      if (packetSpaceCheck(spaceLeft, expiredStreamDataFrameSize)) {
-        builder.write(frameType);
-        builder.write(streamId);
-        builder.write(minimumStreamOffset);
-        builder.appendFrame(QuicSimpleFrame(std::move(expiredStreamDataFrame)));
-        return expiredStreamDataFrameSize;
-      }
-      // no space left in packet
-      return size_t(0);
-    }
     case QuicSimpleFrame::Type::PathChallengeFrame: {
       const PathChallengeFrame& pathChallengeFrame =
           *frame.asPathChallengeFrame();
@@ -506,6 +465,27 @@ size_t writeSimpleFrame(
         builder.insert(knobFrame.blob->clone());
         builder.appendFrame(QuicSimpleFrame(knobFrame));
         return knobFrameLen;
+      }
+      // no space left in packet
+      return size_t(0);
+    }
+    case QuicSimpleFrame::Type::AckFrequencyFrame: {
+      const auto ackFrequencyFrame = frame.asAckFrequencyFrame();
+      QuicInteger intFrameType(static_cast<uint64_t>(FrameType::ACK_FREQUENCY));
+      QuicInteger intSequenceNumber(ackFrequencyFrame->sequenceNumber);
+      QuicInteger intPacketTolerance(ackFrequencyFrame->packetTolerance);
+      QuicInteger intUpdateMaxAckDelay(ackFrequencyFrame->updateMaxAckDelay);
+      size_t ackFrequencyFrameLen = intFrameType.getSize() +
+          intSequenceNumber.getSize() + intPacketTolerance.getSize() +
+          intUpdateMaxAckDelay.getSize() + 1 /* ignoreOrder */;
+      if (packetSpaceCheck(spaceLeft, ackFrequencyFrameLen)) {
+        builder.write(intFrameType);
+        builder.write(intSequenceNumber);
+        builder.write(intPacketTolerance);
+        builder.write(intUpdateMaxAckDelay);
+        builder.writeBE(ackFrequencyFrame->ignoreOrder);
+        builder.appendFrame(QuicSimpleFrame(*ackFrequencyFrame));
+        return ackFrequencyFrameLen;
       }
       // no space left in packet
       return size_t(0);
@@ -690,6 +670,23 @@ size_t writeFrame(QuicWriteFrame&& frame, PacketBuilderInterface& builder) {
     }
     case QuicWriteFrame::Type::QuicSimpleFrame: {
       return writeSimpleFrame(std::move(*frame.asQuicSimpleFrame()), builder);
+    }
+    case QuicWriteFrame::Type::DatagramFrame: {
+      const DatagramFrame& datagramFrame = *frame.asDatagramFrame();
+      QuicInteger frameTypeQuicInt(
+          static_cast<uint8_t>(FrameType::DATAGRAM_LEN));
+      QuicInteger datagramLenInt(datagramFrame.length);
+      auto datagramFrameLength = frameTypeQuicInt.getSize() +
+          datagramFrame.length + datagramLenInt.getSize();
+      if (packetSpaceCheck(spaceLeft, datagramFrameLength)) {
+        builder.write(frameTypeQuicInt);
+        builder.write(datagramLenInt);
+        builder.insert(std::move(datagramFrame.data), datagramFrame.length);
+        builder.appendFrame(datagramFrame);
+        return datagramFrameLength;
+      }
+      // no space left in packet
+      return size_t(0);
     }
     default: {
       // TODO add support for: RETIRE_CONNECTION_ID and NEW_TOKEN frames

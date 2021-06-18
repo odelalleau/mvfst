@@ -18,6 +18,8 @@
 #include <quic/codec/Types.h>
 #include <quic/common/test/TestUtils.h>
 #include <quic/congestion_control/ServerCongestionControllerFactory.h>
+#include <quic/dsr/Types.h>
+#include <quic/dsr/test/Mocks.h>
 #include <quic/fizz/handshake/FizzCryptoFactory.h>
 #include <quic/fizz/server/handshake/FizzServerHandshake.h>
 #include <quic/fizz/server/handshake/FizzServerQuicHandshakeContext.h>
@@ -39,160 +41,6 @@ namespace {
 using ByteEvent = QuicTransportBase::ByteEvent;
 using PacketDropReason = QuicTransportStatsCallback::PacketDropReason;
 } // namespace
-
-class FakeServerHandshake : public FizzServerHandshake {
- public:
-  explicit FakeServerHandshake(
-      QuicServerConnectionState& conn,
-      std::shared_ptr<FizzServerQuicHandshakeContext> fizzContext,
-      bool chloSync = false,
-      bool cfinSync = false,
-      folly::Optional<uint64_t> clientActiveConnectionIdLimit = folly::none)
-      : FizzServerHandshake(&conn, std::move(fizzContext)),
-        conn_(conn),
-        chloSync_(chloSync),
-        cfinSync_(cfinSync),
-        clientActiveConnectionIdLimit_(clientActiveConnectionIdLimit) {}
-
-  void accept(std::shared_ptr<ServerTransportParametersExtension>) override {}
-
-  MOCK_METHOD1(writeNewSessionTicket, void(const AppToken&));
-
-  void doHandshake(std::unique_ptr<IOBuf> data, EncryptionLevel) override {
-    IOBufEqualTo eq;
-    auto chlo = folly::IOBuf::copyBuffer("CHLO");
-    auto clientFinished = IOBuf::copyBuffer("FINISHED");
-    if (eq(data, chlo)) {
-      if (chloSync_) {
-        // Do NOT invoke onCryptoEventAvailable callback
-        // Fall through and let the ServerStateMachine to process the event
-        writeDataToQuicStream(
-            *getCryptoStream(*conn_.cryptoState, EncryptionLevel::Initial),
-            IOBuf::copyBuffer("SHLO"));
-        if (allowZeroRttKeys_) {
-          validateAndUpdateSourceToken(conn_, sourceAddrs_);
-          phase_ = Phase::KeysDerived;
-          setEarlyKeys();
-        }
-        setHandshakeKeys();
-      } else {
-        // Asynchronously schedule the callback
-        executor_->add([&] {
-          writeDataToQuicStream(
-              *getCryptoStream(*conn_.cryptoState, EncryptionLevel::Initial),
-              IOBuf::copyBuffer("SHLO"));
-          if (allowZeroRttKeys_) {
-            validateAndUpdateSourceToken(conn_, sourceAddrs_);
-            phase_ = Phase::KeysDerived;
-            setEarlyKeys();
-          }
-          setHandshakeKeys();
-          if (callback_) {
-            callback_->onCryptoEventAvailable();
-          }
-        });
-      }
-    } else if (eq(data, clientFinished)) {
-      if (cfinSync_) {
-        // Do NOT invoke onCryptoEventAvailable callback
-        // Fall through and let the ServerStateMachine to process the event
-        setOneRttKeys();
-        phase_ = Phase::Established;
-        handshakeDone_ = true;
-      } else {
-        // Asynchronously schedule the callback
-        executor_->add([&] {
-          setOneRttKeys();
-          phase_ = Phase::Established;
-          handshakeDone_ = true;
-          if (callback_) {
-            callback_->onCryptoEventAvailable();
-          }
-        });
-      }
-    }
-  }
-
-  Optional<ClientTransportParameters> getClientTransportParams() override {
-    std::vector<TransportParameter> transportParams;
-    transportParams.push_back(encodeIntegerParameter(
-        TransportParameterId::initial_max_stream_data_bidi_local,
-        kDefaultStreamWindowSize));
-    transportParams.push_back(encodeIntegerParameter(
-        TransportParameterId::initial_max_stream_data_bidi_remote,
-        kDefaultStreamWindowSize));
-    transportParams.push_back(encodeIntegerParameter(
-        TransportParameterId::initial_max_stream_data_uni,
-        kDefaultStreamWindowSize));
-    transportParams.push_back(encodeIntegerParameter(
-        TransportParameterId::initial_max_streams_bidi,
-        kDefaultMaxStreamsBidirectional));
-    transportParams.push_back(encodeIntegerParameter(
-        TransportParameterId::initial_max_streams_uni,
-        kDefaultMaxStreamsUnidirectional));
-    transportParams.push_back(encodeIntegerParameter(
-        TransportParameterId::initial_max_data, kDefaultConnectionWindowSize));
-    transportParams.push_back(encodeIntegerParameter(
-        TransportParameterId::idle_timeout, kDefaultIdleTimeout.count()));
-    transportParams.push_back(encodeIntegerParameter(
-        TransportParameterId::max_packet_size, maxRecvPacketSize));
-    if (clientActiveConnectionIdLimit_) {
-      transportParams.push_back(encodeIntegerParameter(
-          TransportParameterId::active_connection_id_limit,
-          *clientActiveConnectionIdLimit_));
-    }
-    transportParams.push_back(encodeConnIdParameter(
-        TransportParameterId::initial_source_connection_id,
-        getTestConnectionId()));
-
-    return ClientTransportParameters{std::move(transportParams)};
-  }
-
-  void setEarlyKeys() {
-    oneRttWriteCipher_ = createNoOpAead();
-    oneRttWriteHeaderCipher_ = createNoOpHeaderCipher();
-    zeroRttReadCipher_ = createNoOpAead();
-    zeroRttReadHeaderCipher_ = createNoOpHeaderCipher();
-  }
-
-  void setOneRttKeys() {
-    // Mimic ServerHandshake behavior.
-    // oneRttWriteCipher would already be set during ReportEarlyHandshakeSuccess
-    if (!allowZeroRttKeys_) {
-      oneRttWriteCipher_ = createNoOpAead();
-      oneRttWriteHeaderCipher_ = createNoOpHeaderCipher();
-    }
-    oneRttReadCipher_ = createNoOpAead();
-    oneRttReadHeaderCipher_ = createNoOpHeaderCipher();
-  }
-
-  void setHandshakeKeys() {
-    conn_.handshakeWriteCipher = createNoOpAead();
-    conn_.handshakeWriteHeaderCipher = createNoOpHeaderCipher();
-    handshakeReadCipher_ = createNoOpAead();
-    handshakeReadHeaderCipher_ = createNoOpHeaderCipher();
-  }
-
-  void setHandshakeDone(bool done) {
-    handshakeDone_ = done;
-  }
-
-  void allowZeroRttKeys() {
-    allowZeroRttKeys_ = true;
-  }
-
-  void setSourceTokens(std::vector<folly::IPAddress> srcAddrs) {
-    sourceAddrs_ = srcAddrs;
-  }
-
-  QuicServerConnectionState& conn_;
-  bool chloSync_{false};
-  bool cfinSync_{false};
-  uint64_t maxRecvPacketSize{kDefaultMaxUDPPayload};
-  bool allowZeroRttKeys_{false};
-  std::vector<folly::IPAddress> sourceAddrs_;
-  folly::Optional<uint64_t> clientActiveConnectionIdLimit_;
-};
 
 bool verifyFramePresent(
     std::vector<std::unique_ptr<folly::IOBuf>>& socketWrites,
@@ -321,6 +169,7 @@ class QuicServerTransportTest : public Test {
     server = std::make_shared<TestingQuicServerTransport>(
         &evb, std::move(sock), connCallback, serverCtx);
     server->setCongestionControllerFactory(ccFactory_);
+    server->setCongestionControl(CongestionControlType::Cubic);
     server->setRoutingCallback(&routingCallback);
     server->setSupportedVersions(supportedVersions);
     server->setOriginalPeerAddress(clientAddr);
@@ -859,7 +708,6 @@ TEST_F(QuicServerTransportTest, IdleTimerNotResetWhenDataOutstanding) {
   server->writeChain(
       streamId,
       IOBuf::copyBuffer("And if the darkness is to keep us apart"),
-      false,
       false);
   loopForWrites();
   // It was the first packet
@@ -871,7 +719,6 @@ TEST_F(QuicServerTransportTest, IdleTimerNotResetWhenDataOutstanding) {
   server->writeChain(
       streamId,
       IOBuf::copyBuffer("And if the daylight feels like it's a long way off"),
-      false,
       false);
   loopForWrites();
   EXPECT_FALSE(server->idleTimeout().isScheduled());
@@ -1005,7 +852,7 @@ TEST_F(QuicServerTransportTest, TestClientAddressChanges) {
 TEST_F(QuicServerTransportTest, TestCloseConnectionWithNoErrorPendingStreams) {
   auto streamId = server->createBidirectionalStream().value();
 
-  server->writeChain(streamId, IOBuf::copyBuffer("hello"), true, false);
+  server->writeChain(streamId, IOBuf::copyBuffer("hello"), true);
   loopForWrites();
 
   AckBlocks acks;
@@ -1212,12 +1059,11 @@ TEST_F(QuicServerTransportTest, TestOpenAckStreamFrame) {
 
   // Remove any packets that might have been queued.
   server->getNonConstConn().outstandings.packets.clear();
-  server->getNonConstConn().outstandings.initialPacketsCount = 0;
-  server->getNonConstConn().outstandings.handshakePacketsCount = 0;
-  server->writeChain(streamId, data->clone(), false, false);
+  server->getNonConstConn().outstandings.packetCount = {};
+  server->writeChain(streamId, data->clone(), false);
   loopForWrites();
-  server->writeChain(streamId, data->clone(), false, false);
-  server->writeChain(streamId, data->clone(), false, false);
+  server->writeChain(streamId, data->clone(), false);
+  server->writeChain(streamId, data->clone(), false);
   loopForWrites();
 
   auto stream = server->getNonConstConn().streamManager->getStream(streamId);
@@ -1300,7 +1146,7 @@ TEST_F(QuicServerTransportTest, TestOpenAckStreamFrame) {
   EXPECT_EQ(stream->recvState, StreamRecvState::Open);
 
   auto empty = IOBuf::create(0);
-  server->writeChain(streamId, std::move(empty), true, false);
+  server->writeChain(streamId, std::move(empty), true);
   loopForWrites();
   ASSERT_FALSE(server->getConn().outstandings.packets.empty());
 
@@ -1807,8 +1653,7 @@ TEST_F(QuicServerTransportTest, TestCloneStopSending) {
   server->getNonConstConn().qLogger = qLogger;
   server->getNonConstConn().streamManager->getStream(streamId);
   // knock every handshake outstanding packets out
-  server->getNonConstConn().outstandings.initialPacketsCount = 0;
-  server->getNonConstConn().outstandings.handshakePacketsCount = 0;
+  server->getNonConstConn().outstandings.packetCount = {};
   server->getNonConstConn().outstandings.packets.clear();
   for (auto& t : server->getNonConstConn().lossState.lossTimes) {
     t.reset();
@@ -2070,7 +1915,7 @@ TEST_F(QuicServerTransportTest, DestroyWithoutClosing) {
   EXPECT_CALL(connCallback, onConnectionEnd()).Times(0);
   MockDeliveryCallback deliveryCallback;
   auto write = IOBuf::copyBuffer("no");
-  server->writeChain(streamId, write->clone(), true, false, &deliveryCallback);
+  server->writeChain(streamId, write->clone(), true, &deliveryCallback);
 
   EXPECT_CALL(deliveryCallback, onCanceled(_, _));
   EXPECT_CALL(readCb, readError(_, _));
@@ -2087,7 +1932,7 @@ TEST_F(QuicServerTransportTest, DestroyWithoutClosingCancelByteEvents) {
   EXPECT_CALL(connCallback, onConnectionError(_)).Times(0);
   EXPECT_CALL(connCallback, onConnectionEnd()).Times(0);
   auto write = IOBuf::copyBuffer("no");
-  server->writeChain(streamId, write->clone(), true, false);
+  server->writeChain(streamId, write->clone(), true);
 
   MockByteEventCallback txCallback;
   MockByteEventCallback deliveryCallback;
@@ -2122,20 +1967,6 @@ TEST_F(QuicServerTransportTest, SetCongestionControl) {
 
 TEST_F(QuicServerTransportTest, TestServerNotDetachable) {
   EXPECT_FALSE(server->isDetachable());
-}
-
-TEST_F(QuicServerTransportTest, SetOriginalPeerAddressSetsPacketSize) {
-  folly::SocketAddress v4Address("0.0.0.0", 0);
-  ASSERT_TRUE(v4Address.getFamily() == AF_INET);
-  server->setOriginalPeerAddress(v4Address);
-  EXPECT_EQ(kDefaultV4UDPSendPacketLen, server->getConn().udpSendPacketLen);
-
-  folly::SocketAddress v6Address("::", 0);
-  ASSERT_TRUE(v6Address.getFamily() == AF_INET6);
-  server->setOriginalPeerAddress(v6Address);
-  EXPECT_EQ(kDefaultV6UDPSendPacketLen, server->getConn().udpSendPacketLen);
-
-  server->closeNow(folly::none);
 }
 
 TEST_F(
@@ -2213,6 +2044,102 @@ TEST_F(QuicServerTransportTest, SwitchServerCidsMultipleCids) {
   auto replacedCid = conn.clientConnectionId;
   EXPECT_NE(originalCid, *replacedCid);
   EXPECT_EQ(secondCid.connId, *replacedCid);
+}
+
+TEST_F(QuicServerTransportTest, ShortHeaderPacketWithNoFrames) {
+  auto qLogger = std::make_shared<FileQLogger>(VantagePoint::Server);
+  server->getNonConstConn().qLogger = qLogger;
+  // Use large packet number to make sure packet is long enough to parse
+  PacketNum nextPacket = 0x11111111;
+  // Add some dummy data to make body parseable
+  auto dummyDataLen = 20;
+  server->getNonConstConn().serverConnectionId = getTestConnectionId();
+  auto aead = dynamic_cast<const MockAead*>(
+      server->getNonConstConn().readCodec->getOneRttReadCipher());
+  // Override the Aead mock to remove the 20 bytes of dummy data added below
+  ON_CALL(*aead, _tryDecrypt(_, _, _))
+      .WillByDefault(Invoke([&](auto& buf, auto, auto) {
+        buf->trimEnd(20);
+        return buf->clone();
+      }));
+  ShortHeader header(
+      ProtectionType::KeyPhaseZero,
+      *server->getConn().serverConnectionId,
+      nextPacket);
+  RegularQuicPacketBuilder builder(
+      server->getConn().udpSendPacketLen,
+      std::move(header),
+      0 /* largestAcked */);
+  builder.encodePacketHeader();
+  ASSERT_TRUE(builder.canBuildPacket());
+  auto packet = std::move(builder).buildPacket();
+  auto buf = packetToBuf(packet);
+  buf->coalesce();
+  buf->reserve(0, 200);
+  buf->append(dummyDataLen);
+  EXPECT_THROW(deliverData(std::move(buf)), std::runtime_error);
+  std::vector<int> indices =
+      getQLogEventIndices(QLogEventType::PacketDrop, qLogger);
+  EXPECT_EQ(indices.size(), 1);
+
+  auto tmp = std::move(qLogger->logs[indices[0]]);
+  auto event = dynamic_cast<QLogPacketDropEvent*>(tmp.get());
+  EXPECT_EQ(
+      event->dropReason,
+      QuicTransportStatsCallback::toString(
+          PacketDropReason::PROTOCOL_VIOLATION));
+}
+
+TEST_F(QuicServerTransportTest, ShortHeaderPacketWithNoFramesAfterClose) {
+  auto qLogger = std::make_shared<FileQLogger>(VantagePoint::Server);
+  server->getNonConstConn().qLogger = qLogger;
+  // Use large packet number to make sure packet is long enough to parse
+  PacketNum nextPacket = 0x11111111;
+  // Add some dummy data to make body parseable
+  auto dummyDataLen = 20;
+  server->getNonConstConn().serverConnectionId = getTestConnectionId();
+  auto aead = dynamic_cast<const MockAead*>(
+      server->getNonConstConn().readCodec->getOneRttReadCipher());
+  // Override the Aead mock to remove the 20 bytes of dummy data added below
+  ON_CALL(*aead, _tryDecrypt(_, _, _))
+      .WillByDefault(Invoke([&](auto& buf, auto, auto) {
+        buf->trimEnd(20);
+        return buf->clone();
+      }));
+
+  // Close the connection
+  server->close(std::make_pair(
+      QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
+      std::string("test close")));
+  server->idleTimeout().cancelTimeout();
+  ASSERT_FALSE(server->idleTimeout().isScheduled());
+
+  ShortHeader header(
+      ProtectionType::KeyPhaseZero,
+      *server->getConn().serverConnectionId,
+      nextPacket);
+  RegularQuicPacketBuilder builder(
+      server->getConn().udpSendPacketLen,
+      std::move(header),
+      0 /* largestAcked */);
+  builder.encodePacketHeader();
+  ASSERT_TRUE(builder.canBuildPacket());
+  auto packet = std::move(builder).buildPacket();
+  auto buf = packetToBuf(packet);
+  buf->coalesce();
+  buf->reserve(0, 200);
+  buf->append(dummyDataLen);
+  EXPECT_THROW(deliverData(std::move(buf)), std::runtime_error);
+  std::vector<int> indices =
+      getQLogEventIndices(QLogEventType::PacketDrop, qLogger);
+  EXPECT_EQ(indices.size(), 1);
+
+  auto tmp = std::move(qLogger->logs[indices[0]]);
+  auto event = dynamic_cast<QLogPacketDropEvent*>(tmp.get());
+  EXPECT_EQ(
+      event->dropReason,
+      QuicTransportStatsCallback::toString(
+          PacketDropReason::PROTOCOL_VIOLATION));
 }
 
 class QuicServerTransportAllowMigrationTest
@@ -3093,7 +3020,7 @@ TEST_F(QuicServerTransportTest, ClientPortChangeNATRebinding) {
 
   StreamId streamId = server->createBidirectionalStream().value();
   auto data1 = IOBuf::copyBuffer("Aloha");
-  server->writeChain(streamId, data1->clone(), false, false);
+  server->writeChain(streamId, data1->clone(), false);
   loopForWrites();
   PacketNum packetNum1 =
       getFirstOutstandingPacket(
@@ -3140,7 +3067,7 @@ TEST_F(QuicServerTransportTest, ClientAddressChangeNATRebinding) {
   server->getNonConstConn().transportSettings.disableMigration = false;
   StreamId streamId = server->createBidirectionalStream().value();
   auto data1 = IOBuf::copyBuffer("Aloha");
-  server->writeChain(streamId, data1->clone(), false, false);
+  server->writeChain(streamId, data1->clone(), false);
   loopForWrites();
   PacketNum packetNum1 =
       getFirstOutstandingPacket(
@@ -3259,6 +3186,55 @@ TEST_F(QuicServerTransportTest, PingIsTreatedAsRetransmittable) {
   auto packet = std::move(builder).buildPacket();
   deliverData(packetToBuf(packet));
   EXPECT_TRUE(server->getConn().pendingEvents.scheduleAckTimeout);
+}
+
+TEST_F(QuicServerTransportTest, ReceiveDatagramFrameAndDiscard) {
+  ShortHeader header(
+      ProtectionType::KeyPhaseZero,
+      *server->getConn().serverConnectionId,
+      clientNextAppDataPacketNum++);
+  RegularQuicPacketBuilder builder(
+      server->getConn().udpSendPacketLen,
+      std::move(header),
+      0 /* largestAcked */);
+  builder.encodePacketHeader();
+  StringPiece datagramPayload = "do not rely on me. I am unreliable";
+  DatagramFrame datagramFrame(
+      datagramPayload.size(), IOBuf::copyBuffer(datagramPayload));
+  writeFrame(datagramFrame, builder);
+  auto packet = std::move(builder).buildPacket();
+  deliverData(packetToBuf(packet));
+  ASSERT_EQ(server->getConn().datagramState.readBuffer.size(), 0);
+}
+
+TEST_F(QuicServerTransportTest, ReceiveDatagramFrameAndStore) {
+  auto& conn = server->getNonConstConn();
+  conn.datagramState.maxReadFrameSize = std::numeric_limits<uint16_t>::max();
+  conn.datagramState.maxReadBufferSize = 10;
+
+  for (uint64_t i = 0; i < conn.datagramState.maxReadBufferSize * 2; i++) {
+    ShortHeader header(
+        ProtectionType::KeyPhaseZero,
+        *server->getConn().serverConnectionId,
+        clientNextAppDataPacketNum++);
+    RegularQuicPacketBuilder builder(
+        server->getConn().udpSendPacketLen,
+        std::move(header),
+        0 /* largestAcked */);
+    builder.encodePacketHeader();
+    StringPiece datagramPayload = "do not rely on me. I am unreliable";
+    DatagramFrame datagramFrame(
+        datagramPayload.size(), IOBuf::copyBuffer(datagramPayload));
+    writeFrame(datagramFrame, builder);
+    auto packet = std::move(builder).buildPacket();
+    deliverData(packetToBuf(packet));
+    if (i < conn.datagramState.maxReadBufferSize) {
+      ASSERT_EQ(server->getConn().datagramState.readBuffer.size(), i + 1);
+    }
+  }
+  ASSERT_EQ(
+      server->getConn().datagramState.readBuffer.size(),
+      conn.datagramState.maxReadBufferSize);
 }
 
 TEST_F(QuicServerTransportTest, RecvNewConnectionIdValid) {
@@ -3663,7 +3639,7 @@ TEST_F(QuicUnencryptedServerTransportTest, TestWriteHandshakeAndZeroRtt) {
   recvClientHello();
 
   auto streamId = server->createBidirectionalStream().value();
-  server->writeChain(streamId, IOBuf::copyBuffer("hello"), true, false);
+  server->writeChain(streamId, IOBuf::copyBuffer("hello"), true);
   loopForWrites();
   auto clientCodec = makeClientEncryptedCodec(true);
 
@@ -3735,10 +3711,11 @@ TEST_F(
   std::vector<int> indices =
       getQLogEventIndices(QLogEventType::TransportStateUpdate, qLogger);
   EXPECT_EQ(indices.size(), 4);
-  std::array<::std::string, 4> updateArray = {kDerivedZeroRttReadCipher,
-                                              kDerivedOneRttWriteCipher,
-                                              kTransportReady,
-                                              kDerivedOneRttReadCipher};
+  std::array<::std::string, 4> updateArray = {
+      kDerivedZeroRttReadCipher,
+      kDerivedOneRttWriteCipher,
+      kTransportReady,
+      kDerivedOneRttReadCipher};
   for (int i = 0; i < 4; ++i) {
     auto tmp = std::move(qLogger->logs[indices[i]]);
     auto event = dynamic_cast<QLogTransportStateUpdateEvent*>(tmp.get());
@@ -3807,11 +3784,9 @@ TEST_F(
 
 TEST_F(QuicUnencryptedServerTransportTest, MaxReceivePacketSizeTooLarge) {
   getFakeHandshakeLayer()->allowZeroRttKeys();
-  auto originalUdpSize = server->getConn().udpSendPacketLen;
   fakeHandshake->maxRecvPacketSize = 4096;
   setupClientReadCodec();
   recvClientHello();
-  EXPECT_NE(originalUdpSize, server->getConn().udpSendPacketLen);
   EXPECT_EQ(server->getConn().udpSendPacketLen, kDefaultUDPSendPacketLen);
 }
 
@@ -4247,9 +4222,11 @@ TEST_P(
   testSetupConnection();
 }
 
-TEST_P(QuicServerTransportHandshakeTest, TestD6DStartInstrumentationCallback) {
-  auto mockObserver = std::make_unique<MockInstrumentationObserver>();
-  server->addInstrumentationObserver(mockObserver.get());
+TEST_P(QuicServerTransportHandshakeTest, TestD6DStartCallback) {
+  Observer::Config config = {};
+  config.pmtuEvents = true;
+  auto mockObserver = std::make_unique<MockObserver>(config);
+  server->addObserver(mockObserver.get());
   // Set oneRttReader so that maybeStartD6DPriobing passes its check
   auto codec = std::make_unique<QuicReadCodec>(QuicNodeType::Server);
   codec->setOneRttReadCipher(createNoOpAead());
@@ -4259,7 +4236,22 @@ TEST_P(QuicServerTransportHandshakeTest, TestD6DStartInstrumentationCallback) {
   EXPECT_CALL(*mockObserver, pmtuProbingStarted(_)).Times(1);
   // CHLO should be enough to trigger probing
   recvClientHello();
-  server->removeInstrumentationObserver(mockObserver.get());
+  server->removeObserver(mockObserver.get());
+}
+
+TEST_F(QuicUnencryptedServerTransportTest, DuplicateOneRttWriteCipher) {
+  setupClientReadCodec();
+  recvClientHello();
+  recvClientFinished();
+  loopForWrites();
+  try {
+    recvClientHello();
+    recvClientFinished();
+    FAIL();
+  } catch (const std::runtime_error& ex) {
+    EXPECT_THAT(ex.what(), HasSubstr("Crypto error"));
+  }
+  EXPECT_TRUE(server->isClosed());
 }
 
 TEST_F(QuicServerTransportTest, TestRegisterAndHandleTransportKnobParams) {
@@ -4320,6 +4312,31 @@ TEST_F(
             TransportKnobParamId::FORCIBLY_SET_UDP_PAYLOAD_SIZE),
         1}});
   EXPECT_EQ(server->getConn().udpSendPacketLen, 1452);
+}
+
+TEST_F(QuicServerTransportTest, WriteDSR) {
+  server->getNonConstConn().transportSettings.dsrEnabled = true;
+  // Make sure we are post-handshake
+  ASSERT_NE(nullptr, server->getConn().oneRttWriteCipher);
+  // Rinse anything pending
+  server->writeData();
+  loopForWrites();
+  server->getNonConstConn().outstandings.packets.clear();
+  getFakeHandshakeLayer()->setCipherSuite(
+      fizz::CipherSuite::TLS_AES_128_GCM_SHA256);
+  auto streamId = server->createBidirectionalStream().value();
+  server->writeChain(
+      streamId, folly::IOBuf::copyBuffer("Allegro Maestoso"), false);
+  auto mockDSRSender = std::make_unique<MockDSRPacketizationRequestSender>();
+  auto rawDSRSender = mockDSRSender.get();
+  server->setDSRPacketizationRequestSender(streamId, std::move(mockDSRSender));
+  BufferMeta bufMeta(2000);
+  server->writeBufMeta(streamId, bufMeta, true);
+  server->writeData();
+  EXPECT_FALSE(server->getConn().outstandings.packets.empty());
+  EXPECT_TRUE(server->getConn().outstandings.packets.back().isDSRPacket);
+  EXPECT_CALL(*rawDSRSender, release()).Times(1);
+  server->resetStream(streamId, GenericApplicationErrorCode::NO_ERROR);
 }
 
 } // namespace test

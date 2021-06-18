@@ -151,22 +151,6 @@ class QuicTransportBase : public QuicSocket {
       std::pair<LocalErrorCode, folly::Optional<uint64_t>>>
   consume(StreamId id, uint64_t offset, size_t amount) override;
 
-  folly::Expected<folly::Unit, LocalErrorCode> setDataExpiredCallback(
-      StreamId id,
-      DataExpiredCallback* cb) override;
-
-  folly::Expected<folly::Optional<uint64_t>, LocalErrorCode> sendDataExpired(
-      StreamId id,
-      uint64_t offset) override;
-
-  folly::Expected<folly::Unit, LocalErrorCode> setDataRejectedCallback(
-      StreamId id,
-      DataRejectedCallback* cb) override;
-
-  folly::Expected<folly::Optional<uint64_t>, LocalErrorCode> sendDataRejected(
-      StreamId id,
-      uint64_t offset) override;
-
   folly::Expected<StreamId, LocalErrorCode> createBidirectionalStream(
       bool replaySafe = true) override;
   folly::Expected<StreamId, LocalErrorCode> createUnidirectionalStream(
@@ -192,8 +176,19 @@ class QuicTransportBase : public QuicSocket {
       StreamId id,
       Buf data,
       bool eof,
-      bool cork,
-      DeliveryCallback* cb = nullptr) override;
+      ByteEventCallback* cb = nullptr) override;
+
+  // TODO: Maybe I should virtualize DSR related APIs and only implement in
+  // QuicServerTransport
+  WriteResult writeBufMeta(
+      StreamId id,
+      const BufferMeta& data,
+      bool eof,
+      ByteEventCallback* cb = nullptr) override;
+
+  WriteResult setDSRPacketizationRequestSender(
+      StreamId id,
+      std::unique_ptr<DSRPacketizationRequestSender> sender) override;
 
   folly::Expected<folly::Unit, LocalErrorCode> registerDeliveryCallback(
       StreamId id,
@@ -260,7 +255,9 @@ class QuicTransportBase : public QuicSocket {
 
   /**
    * Set factory to create specific congestion controller instances
-   * for a given connection
+   * for a given connection.
+   * Deletes current congestion controller instance, to create new controller
+   * call setCongestionControl() or setTransportSettings().
    */
   virtual void setCongestionControllerFactory(
       std::shared_ptr<CongestionControllerFactory> factory);
@@ -315,12 +312,13 @@ class QuicTransportBase : public QuicSocket {
    */
   virtual std::shared_ptr<QuicTransportBase> sharedGuard() = 0;
 
-  bool isPartiallyReliableTransport() const override;
-
   folly::Expected<folly::Unit, LocalErrorCode> setStreamPriority(
       StreamId id,
       PriorityLevel level,
       bool incremental) override;
+
+  folly::Expected<Priority, LocalErrorCode> getStreamPriority(
+      StreamId id) override;
 
   /**
    * Invoke onCanceled on all the delivery callbacks registered for streamId.
@@ -386,6 +384,15 @@ class QuicTransportBase : public QuicSocket {
    * Cancel all byte event callbacks of all streams of the given type.
    */
   void cancelByteEventCallbacks(const ByteEvent::Type type) override;
+
+  /**
+   * Reset or send a stop sending on all non-control streams. Leaves the
+   * connection otherwise unmodified. Note this will also trigger the
+   * onStreamWriteError and readError callbacks immediately.
+   */
+  void resetNonControlStreams(
+      ApplicationErrorCode error,
+      folly::StringPiece errorMsg) override;
 
   /**
    * Get the number of pending byte events for the given stream.
@@ -590,7 +597,7 @@ class QuicTransportBase : public QuicSocket {
       const std::pair<QuicErrorCode, folly::StringPiece>& error) noexcept;
 
   /**
-   * Adds a lifecycle observer.
+   * Adds an observer.
    *
    * Observers can tie their lifetime to aspects of this socket's lifecycle /
    * lifetime and perform inspection at various states.
@@ -598,51 +605,52 @@ class QuicTransportBase : public QuicSocket {
    * This enables instrumentation to be added without changing / interfering
    * with how the application uses the socket.
    *
-   * @param observer     Observer to add (implements LifecycleObserver).
+   * @param observer     Observer to add (implements Observer).
    */
-  void addLifecycleObserver(LifecycleObserver* observer) override;
+  void addObserver(Observer* observer) override;
 
   /**
-   * Removes a lifecycle observer.
+   * Removes an observer.
    *
    * @param observer     Observer to remove.
    * @return             Whether observer found and removed from list.
    */
-  bool removeLifecycleObserver(LifecycleObserver* observer) override;
+  bool removeObserver(Observer* observer) override;
 
   /**
-   * Returns installed lifecycle observers.
+   * Returns installed observers.
    *
    * @return             Reference to const vector with installed observers.
    */
-  FOLLY_NODISCARD const LifecycleObserverVec& getLifecycleObservers()
-      const override;
+  FOLLY_NODISCARD const ObserverVec& getObservers() const override;
+
+  FOLLY_NODISCARD QuicConnectionStats getConnectionsStats() const override;
 
   /**
-   * Adds a instrumentation observer.
-   *
-   * Instrumentation observers get notified of various socket events.
-   *
-   * @param observer     Observer to add (implements InstrumentationObserver).
+   * Set the read callback for Datagrams
    */
-  void addInstrumentationObserver(InstrumentationObserver* observer) override;
+  folly::Expected<folly::Unit, LocalErrorCode> setDatagramCallback(
+      DatagramCallback* cb) override;
 
   /**
-   * Removes a instrumentation observer.
-   *
-   * @param observer     Observer to remove.
-   * @return             Whether observer found and removed from list.
+   * Returns the maximum allowed Datagram payload size.
+   * 0 means Datagram is not supported
    */
-  bool removeInstrumentationObserver(
-      InstrumentationObserver* observer) override;
+  FOLLY_NODISCARD uint16_t getDatagramSizeLimit() const override;
 
   /**
-   * Returns installed instrumentation observers.
-   *
-   * @return             Reference to const vector with installed observers.
+   * Writes a Datagram frame. If buf is larger than the size limit returned by
+   * getDatagramSizeLimit(), or if the write buffer is full, buf will simply be
+   * dropped, and a LocalErrorCode will be returned to caller.
    */
-  FOLLY_NODISCARD const InstrumentationObserverVec&
-  getInstrumentationObservers() const override;
+  folly::Expected<folly::Unit, LocalErrorCode> writeDatagram(Buf buf) override;
+
+  /**
+   * Returns the currently available received Datagrams.
+   * Returns all datagrams if atMost is 0.
+   */
+  folly::Expected<std::vector<Buf>, LocalErrorCode> readDatagrams(
+      size_t atMost = 0) override;
 
  protected:
   void updateCongestionControlSettings(
@@ -651,8 +659,6 @@ class QuicTransportBase : public QuicSocket {
   void processCallbacksAfterNetworkData();
   void invokeReadDataAndCallbacks();
   void invokePeekDataAndCallbacks();
-  void invokeDataExpiredCallbacks();
-  void invokeDataRejectedCallbacks();
   void invokeStreamsAvailableCallbacks();
   void updateReadLooper();
   void updatePeekLooper();
@@ -736,6 +742,14 @@ class QuicTransportBase : public QuicSocket {
   void scheduleD6DProbeTimeout();
   void scheduleD6DTxTimeout();
 
+  void validateCongestionAndPacing(CongestionControlType& type);
+
+  // Helpers to notify all registered observers about specific events during
+  // socket write (if enabled in the observer's config).
+  void notifyStartWritingFromAppRateLimited();
+  void notifyPacketsWritten();
+  void notifyAppRateLimited();
+
   /**
    * Callback when we receive a transport knob
    */
@@ -795,29 +809,14 @@ class QuicTransportBase : public QuicSocket {
     PeekCallbackData(PeekCallback* peekCallback) : peekCb(peekCallback) {}
   };
 
-  struct DataExpiredCallbackData {
-    DataExpiredCallback* dataExpiredCb;
-    bool resumed{true};
-
-    DataExpiredCallbackData(DataExpiredCallback* cb) : dataExpiredCb(cb) {}
-  };
-
-  struct DataRejectedCallbackData {
-    DataRejectedCallback* dataRejectedCb;
-    bool resumed{true};
-
-    DataRejectedCallbackData(DataRejectedCallback* cb) : dataRejectedCb(cb) {}
-  };
-
   folly::F14FastMap<StreamId, ReadCallbackData> readCallbacks_;
   folly::F14FastMap<StreamId, PeekCallbackData> peekCallbacks_;
 
   ByteEventMap deliveryCallbacks_;
   ByteEventMap txCallbacks_;
 
-  folly::F14FastMap<StreamId, DataExpiredCallbackData> dataExpiredCallbacks_;
-  folly::F14FastMap<StreamId, DataRejectedCallbackData> dataRejectedCallbacks_;
-  PingCallback* pingCallback_;
+  DatagramCallback* datagramCallback_{nullptr};
+  PingCallback* pingCallback_{nullptr};
 
   WriteCallback* connWriteCallback_{nullptr};
   std::map<StreamId, WriteCallback*> pendingWriteCallbacks_;
@@ -841,16 +840,12 @@ class QuicTransportBase : public QuicSocket {
   // TODO: This is silly. We need a better solution.
   // Uninitialied local address as a fallback answer when socket isn't bound.
   folly::SocketAddress localFallbackAddress;
-  // CongestionController factory
-  std::shared_ptr<CongestionControllerFactory> ccFactory_{nullptr};
 
   folly::Optional<std::string> exceptionCloseWhat_;
 
-  // Lifecycle observers
-  LifecycleObserverVec lifecycleObservers_;
+  // Observers
 
-  // Instrumentation observers
-  InstrumentationObserverVec instrumentationObservers_;
+  std::shared_ptr<ObserverVec> observers_{std::make_shared<ObserverVec>()};
 
   uint64_t qlogRefcnt_{0};
 };

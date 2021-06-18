@@ -32,7 +32,6 @@ void ClientHandshake::connect(
     if (conn_->qLogger) {
       conn_->qLogger->addTransportStateUpdate(kZeroRttAttempted);
     }
-    QUIC_TRACE(zero_rtt, *conn_, "attempted");
 
     // If zero rtt write cipher is derived, it means the cached psk was valid
     DCHECK(cachedServerTransportParams);
@@ -78,6 +77,8 @@ void ClientHandshake::doHandshake(
     case EncryptionLevel::AppData:
       appDataReadBuf_.append(std::move(data));
       break;
+    default:
+      LOG(FATAL) << "Unhandled EncryptionLevel";
   }
   // Get the current buffer type the transport is accepting.
   waitForData_ = false;
@@ -93,22 +94,14 @@ void ClientHandshake::doHandshake(
       case EncryptionLevel::AppData:
         processSocketData(appDataReadBuf_);
         break;
+      default:
+        LOG(FATAL) << "Unhandled EncryptionLevel";
     }
     throwOnError();
   }
 }
 
 void ClientHandshake::handshakeConfirmed() {
-  if (phase_ != Phase::OneRttKeysDerived &&
-      *conn_->version != QuicVersion::MVFST_D24) {
-    if (phase_ == Phase::Established) {
-      LOG(WARNING) << "Handshake was already established";
-    } else {
-      LOG(WARNING)
-          << "Handshake was expected to be in the OneRttKeysDerived phase";
-    }
-  }
-
   phase_ = Phase::Established;
 }
 

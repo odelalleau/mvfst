@@ -7,6 +7,7 @@
  */
 
 #include <quic/codec/Decode.h>
+
 #include <folly/String.h>
 #include <quic/QuicException.h>
 #include <quic/codec/PacketNumber.h>
@@ -96,6 +97,44 @@ KnobFrame decodeKnobFrame(folly::io::Cursor& cursor) {
   Buf knobBlob;
   cursor.cloneAtMost(knobBlob, knobLen->first);
   return KnobFrame(knobSpace->first, knobId->first, std::move(knobBlob));
+}
+
+AckFrequencyFrame decodeAckFrequencyFrame(folly::io::Cursor& cursor) {
+  auto sequenceNumber = decodeQuicInteger(cursor);
+  if (!sequenceNumber) {
+    throw QuicTransportException(
+        "Bad sequence number",
+        quic::TransportErrorCode::FRAME_ENCODING_ERROR,
+        quic::FrameType::ACK_FREQUENCY);
+  }
+  auto packetTolerance = decodeQuicInteger(cursor);
+  if (!packetTolerance) {
+    throw QuicTransportException(
+        "Bad packet tolerance",
+        quic::TransportErrorCode::FRAME_ENCODING_ERROR,
+        quic::FrameType::ACK_FREQUENCY);
+  }
+  auto updateMaxAckDelay = decodeQuicInteger(cursor);
+  if (!updateMaxAckDelay) {
+    throw QuicTransportException(
+        "Bad update max ack delay",
+        quic::TransportErrorCode::FRAME_ENCODING_ERROR,
+        quic::FrameType::ACK_FREQUENCY);
+  }
+  if (cursor.isAtEnd()) {
+    throw QuicTransportException(
+        "Bad ignore order",
+        quic::TransportErrorCode::FRAME_ENCODING_ERROR,
+        quic::FrameType::ACK_FREQUENCY);
+  }
+  auto ignoreOrder = cursor.readBE<uint8_t>();
+
+  AckFrequencyFrame frame;
+  frame.sequenceNumber = sequenceNumber->first;
+  frame.packetTolerance = packetTolerance->first;
+  frame.updateMaxAckDelay = updateMaxAckDelay->first;
+  frame.ignoreOrder = ignoreOrder;
+  return frame;
 }
 
 ReadAckFrame decodeAckFrame(
@@ -410,7 +449,7 @@ MaxStreamDataFrame decodeMaxStreamDataFrame(folly::io::Cursor& cursor) {
 
 MaxStreamsFrame decodeBiDiMaxStreamsFrame(folly::io::Cursor& cursor) {
   auto streamCount = decodeQuicInteger(cursor);
-  if (!streamCount) {
+  if (!streamCount || streamCount->first > kMaxMaxStreams) {
     throw QuicTransportException(
         "Invalid Bi-directional streamId",
         quic::TransportErrorCode::FRAME_ENCODING_ERROR,
@@ -421,7 +460,7 @@ MaxStreamsFrame decodeBiDiMaxStreamsFrame(folly::io::Cursor& cursor) {
 
 MaxStreamsFrame decodeUniMaxStreamsFrame(folly::io::Cursor& cursor) {
   auto streamCount = decodeQuicInteger(cursor);
-  if (!streamCount) {
+  if (!streamCount || streamCount->first > kMaxMaxStreams) {
     throw QuicTransportException(
         "Invalid Uni-directional streamId",
         quic::TransportErrorCode::FRAME_ENCODING_ERROR,
@@ -628,53 +667,6 @@ ConnectionCloseFrame decodeApplicationClose(folly::io::Cursor& cursor) {
       QuicErrorCode(errorCode), std::move(reasonPhrase));
 }
 
-MinStreamDataFrame decodeMinStreamDataFrame(folly::io::Cursor& cursor) {
-  auto streamId = decodeQuicInteger(cursor);
-  if (!streamId) {
-    throw QuicTransportException(
-        "Invalid streamId",
-        quic::TransportErrorCode::FRAME_ENCODING_ERROR,
-        quic::FrameType::MIN_STREAM_DATA);
-  }
-  auto maximumData = decodeQuicInteger(cursor);
-  if (!maximumData) {
-    throw QuicTransportException(
-        "Invalid maximumData",
-        quic::TransportErrorCode::FRAME_ENCODING_ERROR,
-        quic::FrameType::MIN_STREAM_DATA);
-  }
-  auto minimumStreamOffset = decodeQuicInteger(cursor);
-  if (!minimumStreamOffset) {
-    throw QuicTransportException(
-        "Invalid minimumStreamOffset",
-        quic::TransportErrorCode::FRAME_ENCODING_ERROR,
-        quic::FrameType::MIN_STREAM_DATA);
-  }
-  return MinStreamDataFrame(
-      folly::to<StreamId>(streamId->first),
-      maximumData->first,
-      minimumStreamOffset->first);
-}
-
-ExpiredStreamDataFrame decodeExpiredStreamDataFrame(folly::io::Cursor& cursor) {
-  auto streamId = decodeQuicInteger(cursor);
-  if (!streamId) {
-    throw QuicTransportException(
-        "Invalid streamId",
-        quic::TransportErrorCode::FRAME_ENCODING_ERROR,
-        quic::FrameType::EXPIRED_STREAM_DATA);
-  }
-  auto minimumStreamOffset = decodeQuicInteger(cursor);
-  if (!minimumStreamOffset) {
-    throw QuicTransportException(
-        "Invalid minimumStreamOffset",
-        quic::TransportErrorCode::FRAME_ENCODING_ERROR,
-        quic::FrameType::EXPIRED_STREAM_DATA);
-  }
-  return ExpiredStreamDataFrame(
-      folly::to<StreamId>(streamId->first), minimumStreamOffset->first);
-}
-
 HandshakeDoneFrame decodeHandshakeDoneFrame(folly::io::Cursor& /*cursor*/) {
   return HandshakeDoneFrame();
 }
@@ -725,6 +717,29 @@ folly::Expected<RetryToken, TransportErrorCode> parsePlaintextRetryToken(
   return RetryToken(connId, *ipAddress, clientPort, timestampInMs);
 }
 
+DatagramFrame decodeDatagramFrame(BufQueue& queue, bool hasLen) {
+  folly::io::Cursor cursor(queue.front());
+  size_t length = cursor.length();
+  if (hasLen) {
+    auto decodeLength = decodeQuicInteger(cursor);
+    if (!decodeLength) {
+      throw QuicTransportException(
+          "Invalid datagram len",
+          TransportErrorCode::FRAME_ENCODING_ERROR,
+          FrameType::DATAGRAM_LEN);
+    }
+    length = decodeLength->first;
+    if (cursor.length() < length) {
+      throw QuicTransportException(
+          "Invalid datagram frame",
+          TransportErrorCode::FRAME_ENCODING_ERROR,
+          FrameType::DATAGRAM_LEN);
+    }
+    queue.trimStart(decodeLength->second);
+  }
+  return DatagramFrame(length, queue.splitAtMost(length));
+}
+
 QuicFrame parseFrame(
     BufQueue& queue,
     const PacketHeader& header,
@@ -737,10 +752,10 @@ QuicFrame parseFrame(
         "Invalid frame-type field", TransportErrorCode::FRAME_ENCODING_ERROR);
   }
   queue.trimStart(cursor - queue.front());
-  bool isStream = false;
+  bool consumedQueue = false;
   bool error = false;
   SCOPE_EXIT {
-    if (isStream || error) {
+    if (consumedQueue || error) {
       return;
     }
     queue.trimStart(cursor - queue.front());
@@ -773,7 +788,7 @@ QuicFrame parseFrame(
       case FrameType::STREAM_OFF_FIN:
       case FrameType::STREAM_OFF_LEN:
       case FrameType::STREAM_OFF_LEN_FIN:
-        isStream = true;
+        consumedQueue = true;
         return QuicFrame(
             decodeStreamFrame(queue, StreamTypeField(frameTypeInt->first)));
       case FrameType::MAX_DATA:
@@ -804,14 +819,20 @@ QuicFrame parseFrame(
         return QuicFrame(decodeConnectionCloseFrame(cursor));
       case FrameType::CONNECTION_CLOSE_APP_ERR:
         return QuicFrame(decodeApplicationClose(cursor));
-      case FrameType::MIN_STREAM_DATA:
-        return QuicFrame(decodeMinStreamDataFrame(cursor));
-      case FrameType::EXPIRED_STREAM_DATA:
-        return QuicFrame(decodeExpiredStreamDataFrame(cursor));
       case FrameType::HANDSHAKE_DONE:
         return QuicFrame(decodeHandshakeDoneFrame(cursor));
+      case FrameType::DATAGRAM: {
+        consumedQueue = true;
+        return QuicFrame(decodeDatagramFrame(queue, false /* hasLen */));
+      }
+      case FrameType::DATAGRAM_LEN: {
+        consumedQueue = true;
+        return QuicFrame(decodeDatagramFrame(queue, true /* hasLen */));
+      }
       case FrameType::KNOB:
         return QuicFrame(decodeKnobFrame(cursor));
+      case FrameType::ACK_FREQUENCY:
+        return QuicFrame(decodeAckFrequencyFrame(cursor));
     }
   } catch (const std::exception&) {
     error = true;

@@ -84,10 +84,6 @@ MaxDataFrame decodeMaxDataFrame(folly::io::Cursor& cursor);
 
 MaxStreamDataFrame decodeMaxStreamDataFrame(folly::io::Cursor& cursor);
 
-ExpiredStreamDataFrame decodeExpiredStreamDataFrame(folly::io::Cursor& cursor);
-
-MinStreamDataFrame decodeMinStreamDataFrame(folly::io::Cursor& cursor);
-
 MaxStreamsFrame decodeBiDiMaxStreamsFrame(folly::io::Cursor& cursor);
 
 MaxStreamsFrame decodeUniMaxStreamsFrame(folly::io::Cursor& cursor);
@@ -95,6 +91,8 @@ MaxStreamsFrame decodeUniMaxStreamsFrame(folly::io::Cursor& cursor);
 PingFrame decodePingFrame(folly::io::Cursor& cursor);
 
 KnobFrame decodeKnobFrame(folly::io::Cursor& cursor);
+
+AckFrequencyFrame decodeAckFrequencyFrame(folly::io::Cursor& cursor);
 
 DataBlockedFrame decodeDataBlockedFrame(folly::io::Cursor& cursor);
 
@@ -137,6 +135,8 @@ HandshakeDoneFrame decodeHandshakeDoneFrame(folly::io::Cursor& cursor);
 
 folly::Expected<RetryToken, TransportErrorCode> parsePlaintextRetryToken(
     folly::io::Cursor& cursor);
+
+DatagramFrame decodeDatagramFrame(BufQueue& queue, bool hasLen);
 
 /**
  * Parse the Invariant fields in Long Header.

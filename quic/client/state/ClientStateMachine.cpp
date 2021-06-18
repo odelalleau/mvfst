@@ -11,6 +11,7 @@
 #include <folly/io/async/AsyncSocketException.h>
 #include <quic/client/handshake/CachedServerTransportParameters.h>
 #include <quic/common/TimeUtil.h>
+#include <quic/congestion_control/CongestionControllerFactory.h>
 #include <quic/congestion_control/QuicCubic.h>
 #include <quic/flowcontrol/QuicFlowController.h>
 #include <quic/handshake/TransportParameters.h>
@@ -55,6 +56,19 @@ std::unique_ptr<QuicClientConnectionState> undoAllClientStateForRetry(
   newConn->earlyDataAppParamsValidator =
       std::move(conn->earlyDataAppParamsValidator);
   newConn->earlyDataAppParamsGetter = std::move(conn->earlyDataAppParamsGetter);
+  newConn->happyEyeballsState = std::move(conn->happyEyeballsState);
+  newConn->pendingOneRttData.reserve(
+      newConn->transportSettings.maxPacketsToBuffer);
+  if (conn->congestionControllerFactory) {
+    newConn->congestionControllerFactory = conn->congestionControllerFactory;
+    if (conn->congestionController) {
+      // we have to recreate congestion controler
+      // because it holds referencs to the old state
+      newConn->congestionController =
+          newConn->congestionControllerFactory->makeCongestionController(
+              *newConn, conn->congestionController->type());
+    }
+  }
   return newConn;
 }
 
@@ -85,12 +99,11 @@ void processServerInitialParams(
       TransportParameterId::max_packet_size, serverParams.parameters);
   auto statelessResetToken =
       getStatelessResetTokenParameter(serverParams.parameters);
-  auto partialReliability = getIntegerParameter(
-      static_cast<TransportParameterId>(kPartialReliabilityParameterId),
-      serverParams.parameters);
   auto activeConnectionIdLimit = getIntegerParameter(
       TransportParameterId::active_connection_id_limit,
       serverParams.parameters);
+  auto maxDatagramFrameSize = getIntegerParameter(
+      TransportParameterId::max_datagram_frame_size, serverParams.parameters);
   if (conn.version == QuicVersion::QUIC_DRAFT) {
     auto initialSourceConnId = getConnIdParameter(
         TransportParameterId::initial_source_connection_id,
@@ -166,13 +179,6 @@ void processServerInitialParams(
   conn.peerActiveConnectionIdLimit =
       activeConnectionIdLimit.value_or(kDefaultActiveConnectionIdLimit);
 
-  if (partialReliability && *partialReliability != 0 &&
-      conn.transportSettings.partialReliabilityEnabled) {
-    conn.partialReliabilityEnabled = true;
-  }
-  VLOG(10) << "conn.partialReliabilityEnabled="
-           << conn.partialReliabilityEnabled;
-
   conn.statelessResetToken = std::move(statelessResetToken);
   // Update the existing streams, because we allow streams to be created before
   // the connection is established.
@@ -181,11 +187,13 @@ void processServerInitialParams(
     auto windowSize = isUnidirectionalStream(s.id)
         ? conn.transportSettings.advertisedInitialUniStreamWindowSize
         : isLocalStream(conn.nodeType, s.id)
-            ? conn.transportSettings.advertisedInitialBidiLocalStreamWindowSize
-            : conn.transportSettings
-                  .advertisedInitialBidiRemoteStreamWindowSize;
+        ? conn.transportSettings.advertisedInitialBidiLocalStreamWindowSize
+        : conn.transportSettings.advertisedInitialBidiRemoteStreamWindowSize;
     handleStreamWindowUpdate(s, windowSize, packetNum);
   });
+  if (maxDatagramFrameSize.hasValue()) {
+    conn.datagramState.maxWriteFrameSize = maxDatagramFrameSize.value();
+  }
 }
 
 void cacheServerInitialParams(

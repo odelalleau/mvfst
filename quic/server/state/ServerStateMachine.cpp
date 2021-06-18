@@ -16,6 +16,7 @@
 #include <quic/flowcontrol/QuicFlowController.h>
 #include <quic/handshake/TransportParameters.h>
 #include <quic/logging/QLoggerConstants.h>
+#include <quic/state/DatagramHandlers.h>
 #include <quic/state/QuicPacingFunctions.h>
 #include <quic/state/QuicStreamFunctions.h>
 #include <quic/state/QuicTransportStatsCallback.h>
@@ -98,8 +99,17 @@ void setExperimentalSettings(QuicServerConnectionState& conn) {
 void processClientInitialParams(
     QuicServerConnectionState& conn,
     const ClientTransportParameters& clientParams) {
-  // TODO validate that we didn't receive original connection ID, stateless
-  // reset token, or preferred address.
+  auto preferredAddress = getIntegerParameter(
+      TransportParameterId::preferred_address, clientParams.parameters);
+  auto origConnId = getIntegerParameter(
+      TransportParameterId::original_destination_connection_id,
+      clientParams.parameters);
+  auto statelessResetToken = getIntegerParameter(
+      TransportParameterId::stateless_reset_token, clientParams.parameters);
+  auto retrySourceConnId = getIntegerParameter(
+      TransportParameterId::retry_source_connection_id,
+      clientParams.parameters);
+
   auto maxData = getIntegerParameter(
       TransportParameterId::initial_max_data, clientParams.parameters);
   auto maxStreamDataBidiLocal = getIntegerParameter(
@@ -121,9 +131,6 @@ void processClientInitialParams(
       TransportParameterId::ack_delay_exponent, clientParams.parameters);
   auto packetSize = getIntegerParameter(
       TransportParameterId::max_packet_size, clientParams.parameters);
-  auto partialReliability = getIntegerParameter(
-      static_cast<TransportParameterId>(kPartialReliabilityParameterId),
-      clientParams.parameters);
   auto activeConnectionIdLimit = getIntegerParameter(
       TransportParameterId::active_connection_id_limit,
       clientParams.parameters);
@@ -136,6 +143,13 @@ void processClientInitialParams(
   auto d6dProbeTimeout = getIntegerParameter(
       static_cast<TransportParameterId>(kD6DProbeTimeoutParameterId),
       clientParams.parameters);
+  auto minAckDelay = getIntegerParameter(
+      TransportParameterId::min_ack_delay, clientParams.parameters);
+  auto maxAckDelay = getIntegerParameter(
+      TransportParameterId::max_ack_delay, clientParams.parameters);
+  auto maxDatagramFrameSize = getIntegerParameter(
+      TransportParameterId::max_datagram_frame_size, clientParams.parameters);
+
   if (conn.version == QuicVersion::QUIC_DRAFT) {
     auto initialSourceConnId = getConnIdParameter(
         TransportParameterId::initial_source_connection_id,
@@ -147,6 +161,38 @@ void processClientInitialParams(
           "Initial CID does not match.",
           TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
     }
+  }
+
+  // validate that we didn't receive original connection ID, stateless
+  // reset token, or preferred address.
+  if (preferredAddress && *preferredAddress != 0) {
+    throw QuicTransportException(
+        "Preferred Address is received by server",
+        TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
+  }
+
+  if (origConnId && *origConnId != 0) {
+    throw QuicTransportException(
+        "OriginalDestinationConnectionId is received by server",
+        TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
+  }
+
+  if (statelessResetToken && statelessResetToken.value() != 0) {
+    throw QuicTransportException(
+        "Stateless Reset Token is received by server",
+        TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
+  }
+
+  if (retrySourceConnId && retrySourceConnId.value() != 0) {
+    throw QuicTransportException(
+        "Retry Source Connection ID is received by server",
+        TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
+  }
+
+  if (maxAckDelay && *maxAckDelay >= kMaxAckDelay) {
+    throw QuicTransportException(
+        "Max Ack Delay is greater than 2^14 ",
+        TransportErrorCode::TRANSPORT_PARAMETER_ERROR);
   }
 
   // TODO Validate active_connection_id_limit
@@ -186,6 +232,12 @@ void processClientInitialParams(
   }
   conn.peerAckDelayExponent =
       ackDelayExponent.value_or(kDefaultAckDelayExponent);
+  if (minAckDelay.hasValue()) {
+    conn.peerMinAckDelay = std::chrono::microseconds(minAckDelay.value());
+  }
+  if (maxDatagramFrameSize.hasValue()) {
+    conn.datagramState.maxWriteFrameSize = maxDatagramFrameSize.value();
+  }
 
   // Default to max because we can probe PMTU now, and this will be the upper
   // limit
@@ -209,13 +261,6 @@ void processClientInitialParams(
 
   conn.peerActiveConnectionIdLimit =
       activeConnectionIdLimit.value_or(kDefaultActiveConnectionIdLimit);
-
-  if (partialReliability && *partialReliability != 0 &&
-      conn.transportSettings.partialReliabilityEnabled) {
-    conn.partialReliabilityEnabled = true;
-  }
-  VLOG(10) << "conn.partialReliabilityEnabled="
-           << conn.partialReliabilityEnabled;
 
   if (conn.transportSettings.d6dConfig.enabled) {
     // Sanity check
@@ -285,10 +330,10 @@ void updateHandshakeState(QuicServerConnectionState& conn) {
   auto oneRttReadHeaderCipher = handshakeLayer->getOneRttReadHeaderCipher();
 
   if (zeroRttReadCipher) {
+    conn.usedZeroRtt = true;
     if (conn.qLogger) {
       conn.qLogger->addTransportStateUpdate(kDerivedZeroRttReadCipher);
     }
-    QUIC_TRACE(fst_trace, conn, "derived 0-rtt read cipher");
     conn.readCodec->setZeroRttReadCipher(std::move(zeroRttReadCipher));
   }
   if (zeroRttHeaderCipher) {
@@ -305,8 +350,10 @@ void updateHandshakeState(QuicServerConnectionState& conn) {
     if (conn.qLogger) {
       conn.qLogger->addTransportStateUpdate(kDerivedOneRttWriteCipher);
     }
-    QUIC_TRACE(fst_trace, conn, "derived 1-rtt write cipher");
-    CHECK(!conn.oneRttWriteCipher.get());
+    if (conn.oneRttWriteCipher) {
+      throw QuicTransportException(
+          "Duplicate 1-rtt write cipher", TransportErrorCode::CRYPTO_ERROR);
+    }
     conn.oneRttWriteCipher = std::move(oneRttWriteCipher);
 
     updatePacingOnKeyEstablished(conn);
@@ -325,7 +372,6 @@ void updateHandshakeState(QuicServerConnectionState& conn) {
     if (conn.qLogger) {
       conn.qLogger->addTransportStateUpdate(kDerivedOneRttReadCipher);
     }
-    QUIC_TRACE(fst_trace, conn, "derived 1-rtt read cipher");
     // Clear limit because CFIN is received at this point
     conn.writableBytesLimit = folly::none;
     conn.readCodec->setOneRttReadCipher(std::move(oneRttReadCipher));
@@ -526,7 +572,6 @@ void handleCipherUnavailable(
     if (conn.qLogger) {
       conn.qLogger->addPacketDrop(packetSize, kNoData);
     }
-    QUIC_TRACE(packet_drop, conn, "no_data");
     return;
   }
   if (originalData->protectionType != ProtectionType::ZeroRtt &&
@@ -535,7 +580,6 @@ void handleCipherUnavailable(
     if (conn.qLogger) {
       conn.qLogger->addPacketDrop(packetSize, kUnexpectedProtectionLevel);
     }
-    QUIC_TRACE(packet_drop, conn, "unexpected_protection_level");
     return;
   }
 
@@ -547,7 +591,6 @@ void handleCipherUnavailable(
     if (conn.qLogger) {
       conn.qLogger->addPacketDrop(packetSize, kMaxBuffered);
     }
-    QUIC_TRACE(packet_drop, conn, "max_buffered");
     return;
   }
 
@@ -555,12 +598,6 @@ void handleCipherUnavailable(
       ? conn.pendingZeroRttData
       : conn.pendingOneRttData;
   if (pendingData) {
-    QUIC_TRACE(
-        packet_buffered,
-        conn,
-        originalData->packetNum,
-        originalData->protectionType,
-        packetSize);
     if (conn.qLogger) {
       conn.qLogger->addPacketBuffered(
           originalData->packetNum, originalData->protectionType, packetSize);
@@ -579,7 +616,6 @@ void handleCipherUnavailable(
     if (conn.qLogger) {
       conn.qLogger->addPacketDrop(packetSize, kBufferUnavailable);
     }
-    QUIC_TRACE(packet_drop, conn, "buffer_unavailable");
   }
 }
 
@@ -653,6 +689,8 @@ void onServerReadDataFromOpen(
     CHECK(newServerConnIdData.has_value());
     conn.serverConnectionId = newServerConnIdData->connId;
 
+    auto customTransportParams = setSupportedExtensionTransportParameters(conn);
+
     QUIC_STATS(conn.statsCallback, onStatelessReset);
     conn.serverHandshakeLayer->accept(
         std::make_shared<ServerTransportParametersExtension>(
@@ -666,10 +704,10 @@ void onServerReadDataFromOpen(
             conn.transportSettings.idleTimeout,
             conn.transportSettings.ackDelayExponent,
             conn.transportSettings.maxRecvPacketSize,
-            conn.transportSettings.partialReliabilityEnabled,
             *newServerConnIdData->token,
             conn.serverConnectionId.value(),
-            initialDestinationConnectionId));
+            initialDestinationConnectionId,
+            customTransportParams));
     conn.transportParametersEncoded = true;
     const CryptoFactory& cryptoFactory =
         conn.serverHandshakeLayer->getCryptoFactory();
@@ -715,7 +753,6 @@ void onServerReadDataFromOpen(
         if (conn.qLogger) {
           conn.qLogger->addPacketDrop(packetSize, kRetry);
         }
-        QUIC_TRACE(packet_drop, conn, "retry");
         break;
       }
       case CodecResult::Type::STATELESS_RESET: {
@@ -723,7 +760,6 @@ void onServerReadDataFromOpen(
         if (conn.qLogger) {
           conn.qLogger->addPacketDrop(packetSize, kReset);
         }
-        QUIC_TRACE(packet_drop, conn, "reset");
         break;
       }
       case CodecResult::Type::NOTHING: {
@@ -731,7 +767,6 @@ void onServerReadDataFromOpen(
         if (conn.qLogger) {
           conn.qLogger->addPacketDrop(packetSize, kCipherUnavailable);
         }
-        QUIC_TRACE(packet_drop, conn, "cipher_unavailable");
         break;
       }
       case CodecResult::Type::REGULAR_PACKET:
@@ -747,6 +782,24 @@ void onServerReadDataFromOpen(
       QUIC_STATS(
           conn.statsCallback, onPacketDropped, PacketDropReason::PARSE_ERROR);
       continue;
+    }
+    if (regularOptional->frames.empty()) {
+      // This packet had a pareseable header (most probably short header)
+      // but no data. This is a protocol violation so we throw an exception.
+      // This drop has not been recorded in the switch-case block above
+      // so we record it here.
+      if (conn.qLogger) {
+        conn.qLogger->addPacketDrop(
+            packetSize,
+            QuicTransportStatsCallback::toString(
+                PacketDropReason::PROTOCOL_VIOLATION));
+      }
+      QUIC_STATS(
+          conn.statsCallback,
+          onPacketDropped,
+          PacketDropReason::PROTOCOL_VIOLATION);
+      throw QuicTransportException(
+          "Packet has no frames", TransportErrorCode::PROTOCOL_VIOLATION);
     }
 
     auto protectionLevel = regularOptional->header.getProtectionType();
@@ -1052,13 +1105,13 @@ void onServerReadDataFromOpen(
           VLOG(4) << errMsg << " " << conn;
           // we want to deliver app callbacks with the peer supplied error,
           // but send a NO_ERROR to the peer.
-          QUIC_TRACE(recvd_close, conn, errMsg.c_str());
           if (conn.qLogger) {
             conn.qLogger->addTransportStateUpdate(getPeerClose(errMsg));
           }
           conn.peerConnectionError = std::make_pair(
               QuicErrorCode(connFrame.errorCode), std::move(errMsg));
-          if (getSendConnFlowControlBytesWire(conn) == 0) {
+          if (getSendConnFlowControlBytesWire(conn) == 0 &&
+              conn.flowControlState.sumCurStreamBufferLen) {
             VLOG(2) << "Client gives up a flow control blocked connection";
           }
           throw QuicTransportException(
@@ -1078,6 +1131,16 @@ void onServerReadDataFromOpen(
           QuicSimpleFrame& simpleFrame = *quicFrame.asQuicSimpleFrame();
           isNonProbingPacket |= updateSimpleFrameOnPacketReceived(
               conn, simpleFrame, packetNum, readData.peer != conn.peerAddress);
+          break;
+        }
+        case QuicFrame::Type::DatagramFrame: {
+          DatagramFrame& frame = *quicFrame.asDatagramFrame();
+          VLOG(10) << "Server received datagram data: "
+                   << " len=" << frame.length;
+          // Datagram isn't retransmittable. But we would like to ack them
+          // early. So, make Datagram frames count towards ack policy
+          pktHasRetransmittableData = true;
+          handleDatagram(conn, frame);
           break;
         }
         default: {
@@ -1201,7 +1264,6 @@ void onServerReadDataFromClosed(
           QuicTransportStatsCallback::toString(
               PacketDropReason::SERVER_STATE_CLOSED));
     }
-    QUIC_TRACE(packet_drop, conn, "ignoring peer close");
     QUIC_STATS(
         conn.statsCallback,
         onPacketDropped,
@@ -1215,7 +1277,6 @@ void onServerReadDataFromClosed(
       if (conn.qLogger) {
         conn.qLogger->addPacketDrop(packetSize, kCipherUnavailable);
       }
-      QUIC_TRACE(packet_drop, conn, "cipher_unavailable");
       break;
     }
     case CodecResult::Type::RETRY: {
@@ -1224,7 +1285,6 @@ void onServerReadDataFromClosed(
       if (conn.qLogger) {
         conn.qLogger->addPacketDrop(packetSize, kRetry);
       }
-      QUIC_TRACE(packet_drop, conn, "retry");
       break;
     }
     case CodecResult::Type::STATELESS_RESET: {
@@ -1232,7 +1292,6 @@ void onServerReadDataFromClosed(
       if (conn.qLogger) {
         conn.qLogger->addPacketDrop(packetSize, kReset);
       }
-      QUIC_TRACE(packet_drop, conn, "reset");
       break;
     }
     case CodecResult::Type::NOTHING: {
@@ -1240,7 +1299,6 @@ void onServerReadDataFromClosed(
       if (conn.qLogger) {
         conn.qLogger->addPacketDrop(packetSize, kCipherUnavailable);
       }
-      QUIC_TRACE(packet_drop, conn, "cipher_unavailable");
       break;
     }
     case CodecResult::Type::REGULAR_PACKET:
@@ -1258,6 +1316,24 @@ void onServerReadDataFromClosed(
     QUIC_STATS(
         conn.statsCallback, onPacketDropped, PacketDropReason::PARSE_ERROR);
     return;
+  }
+  if (regularOptional->frames.empty()) {
+    // This packet had a pareseable header (most probably short header)
+    // but no data. This is a protocol violation so we throw an exception.
+    // This drop has not been recorded in the switch-case block above
+    // so we record it here.
+    if (conn.qLogger) {
+      conn.qLogger->addPacketDrop(
+          packetSize,
+          QuicTransportStatsCallback::toString(
+              PacketDropReason::PROTOCOL_VIOLATION));
+    }
+    QUIC_STATS(
+        conn.statsCallback,
+        onPacketDropped,
+        PacketDropReason::PROTOCOL_VIOLATION);
+    throw QuicTransportException(
+        "Packet has no frames", TransportErrorCode::PROTOCOL_VIOLATION);
   }
 
   auto& regularPacket = *regularOptional;
@@ -1280,7 +1356,6 @@ void onServerReadDataFromClosed(
         }
         // we want to deliver app callbacks with the peer supplied error,
         // but send a NO_ERROR to the peer.
-        QUIC_TRACE(recvd_close, conn, errMsg.c_str());
         conn.peerConnectionError = std::make_pair(
             QuicErrorCode(connFrame.errorCode), std::move(errMsg));
         break;
@@ -1345,4 +1420,17 @@ QuicServerConnectionState::createAndAddNewSelfConnId() {
   return newConnIdData;
 }
 
+std::vector<TransportParameter> setSupportedExtensionTransportParameters(
+    QuicServerConnectionState& conn) {
+  std::vector<TransportParameter> customTransportParams;
+  if (conn.transportSettings.datagramConfig.enabled) {
+    auto maxDatagramFrameSize =
+        std::make_unique<CustomIntegralTransportParameter>(
+            static_cast<uint64_t>(
+                TransportParameterId::max_datagram_frame_size),
+            conn.datagramState.maxReadFrameSize);
+    customTransportParams.push_back(maxDatagramFrameSize->encode());
+  }
+  return customTransportParams;
+}
 } // namespace quic

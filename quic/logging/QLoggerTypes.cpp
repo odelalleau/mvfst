@@ -6,6 +6,7 @@
  *
  */
 #include <quic/logging/QLoggerTypes.h>
+
 #include <quic/QuicException.h>
 #include <quic/logging/QLoggerConstants.h>
 
@@ -109,6 +110,16 @@ folly::dynamic KnobFrameLog::toDynamic() const {
   return d;
 }
 
+folly::dynamic AckFrequencyFrameLog::toDynamic() const {
+  folly::dynamic d = folly::dynamic::object();
+  d["frame_type"] = toQlogString(FrameType::ACK_FREQUENCY);
+  d["sequence_number"] = sequenceNumber;
+  d["packet_tolerance"] = packetTolerance;
+  d["update_max_ack_delay"] = updateMaxAckDelay;
+  d["ignore_order"] = ignoreOrder;
+  return d;
+}
+
 folly::dynamic StreamDataBlockedFrameLog::toDynamic() const {
   folly::dynamic d = folly::dynamic::object();
   d["frame_type"] = toQlogString(FrameType::STREAM_DATA_BLOCKED);
@@ -140,23 +151,6 @@ folly::dynamic StopSendingFrameLog::toDynamic() const {
   d["frame_type"] = toQlogString(FrameType::STOP_SENDING);
   d["stream_id"] = streamId;
   d["error_code"] = errorCode;
-  return d;
-}
-
-folly::dynamic MinStreamDataFrameLog::toDynamic() const {
-  folly::dynamic d = folly::dynamic::object();
-  d["frame_type"] = toQlogString(FrameType::MIN_STREAM_DATA);
-  d["stream_id"] = streamId;
-  d["maximum_data"] = maximumData;
-  d["minimum_stream_offset"] = minimumStreamOffset;
-  return d;
-}
-
-folly::dynamic ExpiredStreamDataFrameLog::toDynamic() const {
-  folly::dynamic d = folly::dynamic::object();
-  d["frame_type"] = toQlogString(FrameType::EXPIRED_STREAM_DATA);
-  d["stream_id"] = streamId;
-  d["minimum_stream_offset"] = minimumStreamOffset;
   return d;
 }
 
@@ -345,6 +339,10 @@ QLogTransportSummaryEvent::QLogTransportSummaryEvent(
     uint64_t totalBytesClonedIn,
     uint64_t totalCryptoDataWrittenIn,
     uint64_t totalCryptoDataRecvdIn,
+    uint64_t currentWritableBytesIn,
+    uint64_t currentConnFlowControlIn,
+    bool usedZeroRttIn,
+    QuicVersion quicVersionIn,
     std::chrono::microseconds refTimeIn)
     : totalBytesSent{totalBytesSentIn},
       totalBytesRecvd{totalBytesRecvdIn},
@@ -355,7 +353,11 @@ QLogTransportSummaryEvent::QLogTransportSummaryEvent(
       totalStreamBytesCloned{totalStreamBytesClonedIn},
       totalBytesCloned{totalBytesClonedIn},
       totalCryptoDataWritten{totalCryptoDataWrittenIn},
-      totalCryptoDataRecvd{totalCryptoDataRecvdIn} {
+      totalCryptoDataRecvd{totalCryptoDataRecvdIn},
+      currentWritableBytes{currentWritableBytesIn},
+      currentConnFlowControl{currentConnFlowControlIn},
+      usedZeroRtt{usedZeroRttIn},
+      quicVersion{quicVersionIn} {
   eventType = QLogEventType::TransportSummary;
   refTime = refTimeIn;
 }
@@ -379,6 +381,12 @@ folly::dynamic QLogTransportSummaryEvent::toDynamic() const {
   data["total_bytes_cloned"] = totalBytesCloned;
   data["total_crypto_data_written"] = totalCryptoDataWritten;
   data["total_crypto_data_recvd"] = totalCryptoDataRecvd;
+  data["current_writable_bytes"] = currentWritableBytes;
+  data["current_conn_flow_control"] = currentConnFlowControl;
+  data["used_zero_rtt"] = usedZeroRtt;
+  data["quic_version"] =
+      static_cast<std::underlying_type<decltype(quicVersion)>::type>(
+          quicVersion);
 
   d.push_back(std::move(data));
   return d;

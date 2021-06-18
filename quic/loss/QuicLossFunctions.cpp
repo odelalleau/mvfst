@@ -6,8 +6,8 @@
  *
  */
 
-#include "quic/loss/QuicLossFunctions.h"
-#include "quic/state/QuicStreamFunctions.h"
+#include <quic/loss/QuicLossFunctions.h>
+#include <quic/state/QuicStreamFunctions.h>
 
 namespace quic {
 
@@ -33,12 +33,6 @@ bool isPersistentCongestion(
 
 void onPTOAlarm(QuicConnectionStateBase& conn) {
   VLOG(10) << __func__ << " " << conn;
-  QUIC_TRACE(
-      pto_alarm,
-      conn,
-      conn.lossState.largestSent.value_or(0),
-      conn.lossState.ptoCount,
-      conn.outstandings.numOutstanding());
   QUIC_STATS(conn.statsCallback, onPTO);
   conn.lossState.ptoCount++;
   conn.lossState.totalPTOCount++;
@@ -53,11 +47,25 @@ void onPTOAlarm(QuicConnectionStateBase& conn) {
     throw QuicInternalException("Exceeded max PTO", LocalErrorCode::NO_ERROR);
   }
 
-  // If there is only one packet outstanding, no point to clone it twice in the
-  // same write loop.
-  conn.pendingEvents.numProbePackets =
-      std::min<decltype(conn.pendingEvents.numProbePackets)>(
-          conn.outstandings.numOutstanding(), kPacketToSendForPTO);
+  // The number of probes we can probably send is the current packetCount,
+  // which is to say the number of "fresh" packets in the outstanding packet
+  // list + any active previous cloned packet.
+  auto& packetCount = conn.outstandings.packetCount;
+  auto& numProbePackets = conn.pendingEvents.numProbePackets;
+  // Zero it out so we don't try to send probes for spaces without a cipher.
+  numProbePackets = {};
+  if (conn.initialWriteCipher) {
+    numProbePackets[PacketNumberSpace::Initial] = std::min<uint8_t>(
+        packetCount[PacketNumberSpace::Initial], kPacketToSendForPTO);
+  }
+  if (conn.handshakeWriteCipher) {
+    numProbePackets[PacketNumberSpace::Handshake] = std::min<uint8_t>(
+        packetCount[PacketNumberSpace::Handshake], kPacketToSendForPTO);
+  }
+  if (conn.oneRttWriteCipher) {
+    numProbePackets[PacketNumberSpace::AppData] = std::min<uint8_t>(
+        packetCount[PacketNumberSpace::AppData], kPacketToSendForPTO);
+  }
 }
 
 void markPacketLoss(
@@ -104,22 +112,31 @@ void markPacketLoss(
         if (!stream) {
           break;
         }
-        auto bufferItr = stream->retransmissionBuffer.find(frame.offset);
-        if (bufferItr == stream->retransmissionBuffer.end()) {
-          // It's possible that the stream was reset or data on the stream was
-          // skipped while we discovered that its packet was lost so we might
-          // not have the offset.
-          break;
+        if (!frame.fromBufMeta) {
+          auto bufferItr = stream->retransmissionBuffer.find(frame.offset);
+          if (bufferItr == stream->retransmissionBuffer.end()) {
+            // It's possible that the stream was reset or data on the stream was
+            // skipped while we discovered that its packet was lost so we might
+            // not have the offset.
+            break;
+          }
+          stream->insertIntoLossBuffer(std::move(bufferItr->second));
+          stream->retransmissionBuffer.erase(bufferItr);
+        } else {
+          auto retxBufMetaItr =
+              stream->retransmissionBufMetas.find(frame.offset);
+          if (retxBufMetaItr == stream->retransmissionBufMetas.end()) {
+            break;
+          }
+          auto& bufMeta = retxBufMetaItr->second;
+          CHECK_EQ(bufMeta.offset, frame.offset);
+          CHECK_EQ(bufMeta.length, frame.len);
+          CHECK_EQ(bufMeta.eof, frame.fin);
+          stream->insertIntoLossBufMeta(retxBufMetaItr->second);
+          stream->retransmissionBufMetas.erase(retxBufMetaItr);
         }
-        // The original rxmt offset might have been bumped up after it was
-        // shrunk due to egress partially reliable skip.
-        if (!streamFrameMatchesRetransmitBuffer(
-                *stream, frame, *bufferItr->second)) {
-          break;
-        }
-        stream->insertIntoLossBuffer(std::move(bufferItr->second));
-        stream->retransmissionBuffer.erase(bufferItr);
-        conn.streamManager->updateLossStreams(*stream);
+        conn.streamManager->updateWritableStreams(*stream);
+        conn.streamManager->addLoss(stream->id);
         break;
       }
       case QuicWriteFrame::Type::WriteCryptoFrame: {

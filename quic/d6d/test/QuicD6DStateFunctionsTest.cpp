@@ -191,9 +191,12 @@ TEST_F(QuicD6DStateFunctionsTest, D6DProbeAckedInBase) {
   const uint16_t expectPMTU = 1400;
   auto& d6d = conn.d6d;
   auto now = Clock::now();
-  auto mockInstrumentationObserver =
-      std::make_unique<StrictMock<MockInstrumentationObserver>>();
-  conn.instrumentationObservers_.push_back(mockInstrumentationObserver.get());
+  Observer::Config config = {};
+  config.pmtuEvents = true;
+  auto mockObserver = std::make_unique<StrictMock<MockObserver>>(config);
+  auto observers = std::make_shared<ObserverVec>();
+  observers->emplace_back(mockObserver.get());
+  conn.observers = observers;
   d6d.state = D6DMachineState::BASE;
   d6d.outstandingProbes = 1;
   d6d.currentProbeSize = d6d.basePMTU;
@@ -203,10 +206,14 @@ TEST_F(QuicD6DStateFunctionsTest, D6DProbeAckedInBase) {
       makeTestShortPacket(),
       Clock::now(),
       d6d.currentProbeSize,
+      0,
       false,
       true,
       d6d.currentProbeSize,
-      d6d.currentProbeSize);
+      d6d.currentProbeSize,
+      0,
+      LossState(),
+      0);
   d6d.lastProbe = D6DProbePacket(
       pkt.packet.header.getPacketSequenceNum(), pkt.metadata.encodedSize);
   d6d.raiser = std::make_unique<MockProbeSizeRaiser>();
@@ -214,8 +221,7 @@ TEST_F(QuicD6DStateFunctionsTest, D6DProbeAckedInBase) {
   EXPECT_CALL(*mockRaiser, raiseProbeSize(d6d.currentProbeSize))
       .Times(1)
       .WillOnce(Return(expectPMTU));
-  EXPECT_CALL(*mockInstrumentationObserver, pmtuUpperBoundDetected(_, _))
-      .Times(0);
+  EXPECT_CALL(*mockObserver, pmtuUpperBoundDetected(_, _)).Times(0);
   onD6DLastProbeAcked(conn);
   for (auto& callback : conn.pendingCallbacks) {
     callback(nullptr);
@@ -232,9 +238,12 @@ TEST_F(QuicD6DStateFunctionsTest, D6DProbeAckedInSearchingOne) {
   const uint16_t expectPMTU = 1400;
   auto& d6d = conn.d6d;
   auto now = Clock::now();
-  auto mockInstrumentationObserver =
-      std::make_unique<StrictMock<MockInstrumentationObserver>>();
-  conn.instrumentationObservers_.push_back(mockInstrumentationObserver.get());
+  Observer::Config config = {};
+  config.pmtuEvents = true;
+  auto mockObserver = std::make_unique<StrictMock<MockObserver>>(config);
+  auto observers = std::make_shared<ObserverVec>();
+  observers->emplace_back(mockObserver.get());
+  conn.observers = observers;
   d6d.state = D6DMachineState::SEARCHING;
   d6d.outstandingProbes = 1;
   conn.udpSendPacketLen = 1250;
@@ -245,10 +254,14 @@ TEST_F(QuicD6DStateFunctionsTest, D6DProbeAckedInSearchingOne) {
       makeTestShortPacket(),
       Clock::now(),
       d6d.currentProbeSize,
+      0,
       false,
       true,
       d6d.currentProbeSize,
-      d6d.currentProbeSize);
+      d6d.currentProbeSize,
+      0,
+      LossState(),
+      0);
   d6d.lastProbe = D6DProbePacket(
       pkt.packet.header.getPacketSequenceNum(), pkt.metadata.encodedSize);
   d6d.raiser = std::make_unique<MockProbeSizeRaiser>();
@@ -256,8 +269,7 @@ TEST_F(QuicD6DStateFunctionsTest, D6DProbeAckedInSearchingOne) {
   EXPECT_CALL(*mockRaiser, raiseProbeSize(d6d.currentProbeSize))
       .Times(1)
       .WillOnce(Return(expectPMTU));
-  EXPECT_CALL(*mockInstrumentationObserver, pmtuUpperBoundDetected(_, _))
-      .Times(0);
+  EXPECT_CALL(*mockObserver, pmtuUpperBoundDetected(_, _)).Times(0);
   onD6DLastProbeAcked(conn);
   for (auto& callback : conn.pendingCallbacks) {
     callback(nullptr);
@@ -274,9 +286,12 @@ TEST_F(QuicD6DStateFunctionsTest, D6DProbeAckedInSearchingMax) {
   const uint16_t oversize = 1500;
   auto& d6d = conn.d6d;
   auto now = Clock::now();
-  auto mockInstrumentationObserver =
-      std::make_unique<StrictMock<MockInstrumentationObserver>>();
-  conn.instrumentationObservers_.push_back(mockInstrumentationObserver.get());
+  Observer::Config config = {};
+  config.pmtuEvents = true;
+  auto mockObserver = std::make_unique<StrictMock<MockObserver>>(config);
+  auto observers = std::make_shared<ObserverVec>();
+  observers->emplace_back(mockObserver.get());
+  conn.observers = observers;
   d6d.state = D6DMachineState::SEARCHING;
   d6d.outstandingProbes = 3;
   conn.udpSendPacketLen = 1400;
@@ -288,10 +303,14 @@ TEST_F(QuicD6DStateFunctionsTest, D6DProbeAckedInSearchingMax) {
       makeTestShortPacket(),
       Clock::now(),
       d6d.currentProbeSize,
+      0,
       false,
       true,
       d6d.currentProbeSize,
-      d6d.currentProbeSize);
+      d6d.currentProbeSize,
+      0,
+      LossState(),
+      0);
   d6d.lastProbe = D6DProbePacket(
       pkt.packet.header.getPacketSequenceNum(), pkt.metadata.encodedSize);
   d6d.raiser = std::make_unique<MockProbeSizeRaiser>();
@@ -299,19 +318,17 @@ TEST_F(QuicD6DStateFunctionsTest, D6DProbeAckedInSearchingMax) {
   EXPECT_CALL(*mockRaiser, raiseProbeSize(d6d.currentProbeSize))
       .Times(1)
       .WillOnce(Return(oversize));
-  EXPECT_CALL(*mockInstrumentationObserver, pmtuUpperBoundDetected(_, _))
+  EXPECT_CALL(*mockObserver, pmtuUpperBoundDetected(_, _))
       .Times(1)
-      .WillOnce(Invoke(
-          [&](QuicSocket* /* qSocket */,
-              const InstrumentationObserver::PMTUUpperBoundEvent& event) {
-            EXPECT_LT(now, event.upperBoundTime);
-            EXPECT_LT(0us, event.timeSinceLastNonSearchState);
-            EXPECT_EQ(D6DMachineState::BASE, event.lastNonSearchState);
-            EXPECT_EQ(1450, event.upperBoundPMTU);
-            EXPECT_EQ(10, event.cumulativeProbesSent);
-            EXPECT_EQ(
-                ProbeSizeRaiserType::ConstantStep, event.probeSizeRaiserType);
-          }));
+      .WillOnce(Invoke([&](QuicSocket* /* qSocket */,
+                           const Observer::PMTUUpperBoundEvent& event) {
+        EXPECT_LT(now, event.upperBoundTime);
+        EXPECT_LT(0us, event.timeSinceLastNonSearchState);
+        EXPECT_EQ(D6DMachineState::BASE, event.lastNonSearchState);
+        EXPECT_EQ(1450, event.upperBoundPMTU);
+        EXPECT_EQ(10, event.cumulativeProbesSent);
+        EXPECT_EQ(ProbeSizeRaiserType::ConstantStep, event.probeSizeRaiserType);
+      }));
   onD6DLastProbeAcked(conn);
   for (auto& callback : conn.pendingCallbacks) {
     callback(nullptr);
@@ -327,9 +344,12 @@ TEST_F(QuicD6DStateFunctionsTest, D6DProbeAckedInError) {
   QuicConnectionStateBase conn(QuicNodeType::Server);
   auto& d6d = conn.d6d;
   auto now = Clock::now();
-  auto mockInstrumentationObserver =
-      std::make_unique<StrictMock<MockInstrumentationObserver>>();
-  conn.instrumentationObservers_.push_back(mockInstrumentationObserver.get());
+  Observer::Config config = {};
+  config.pmtuEvents = true;
+  auto mockObserver = std::make_unique<StrictMock<MockObserver>>(config);
+  auto observers = std::make_shared<ObserverVec>();
+  observers->emplace_back(mockObserver.get());
+  conn.observers = observers;
   d6d.state = D6DMachineState::ERROR;
   d6d.outstandingProbes = 3;
   conn.udpSendPacketLen = d6d.basePMTU;
@@ -340,10 +360,14 @@ TEST_F(QuicD6DStateFunctionsTest, D6DProbeAckedInError) {
       makeTestShortPacket(),
       Clock::now(),
       d6d.currentProbeSize,
+      0,
       false,
       true,
       d6d.currentProbeSize,
-      d6d.currentProbeSize);
+      d6d.currentProbeSize,
+      0,
+      LossState(),
+      0);
   d6d.lastProbe = D6DProbePacket(
       pkt.packet.header.getPacketSequenceNum(), pkt.metadata.encodedSize);
   d6d.raiser = std::make_unique<MockProbeSizeRaiser>();
@@ -351,8 +375,7 @@ TEST_F(QuicD6DStateFunctionsTest, D6DProbeAckedInError) {
   EXPECT_CALL(*mockRaiser, raiseProbeSize(d6d.currentProbeSize))
       .Times(1)
       .WillOnce(Return(1300)); // Won't be used
-  EXPECT_CALL(*mockInstrumentationObserver, pmtuUpperBoundDetected(_, _))
-      .Times(0);
+  EXPECT_CALL(*mockObserver, pmtuUpperBoundDetected(_, _)).Times(0);
   onD6DLastProbeAcked(conn);
   for (auto& callback : conn.pendingCallbacks) {
     callback(nullptr);
@@ -368,9 +391,12 @@ TEST_F(QuicD6DStateFunctionsTest, BlackholeInSearching) {
   QuicConnectionStateBase conn(QuicNodeType::Server);
   auto& d6d = conn.d6d;
   auto now = Clock::now();
-  auto mockInstrumentationObserver =
-      std::make_unique<StrictMock<MockInstrumentationObserver>>();
-  conn.instrumentationObservers_.push_back(mockInstrumentationObserver.get());
+  Observer::Config config = {};
+  config.pmtuEvents = true;
+  auto mockObserver = std::make_unique<StrictMock<MockObserver>>(config);
+  auto observers = std::make_shared<ObserverVec>();
+  observers->emplace_back(mockObserver.get());
+  conn.observers = observers;
   d6d.state = D6DMachineState::SEARCHING;
   d6d.outstandingProbes = 2;
   conn.udpSendPacketLen = d6d.basePMTU + 20;
@@ -381,10 +407,14 @@ TEST_F(QuicD6DStateFunctionsTest, BlackholeInSearching) {
       makeTestShortPacket(),
       now + 10s,
       d6d.currentProbeSize,
+      0,
       false,
       true,
       d6d.currentProbeSize,
-      d6d.currentProbeSize);
+      d6d.currentProbeSize,
+      0,
+      LossState(),
+      0);
   d6d.lastProbe = D6DProbePacket(
       pkt.packet.header.getPacketSequenceNum(), pkt.metadata.encodedSize);
 
@@ -392,29 +422,33 @@ TEST_F(QuicD6DStateFunctionsTest, BlackholeInSearching) {
       makeTestShortPacket(),
       now + 8s,
       conn.udpSendPacketLen,
+      0,
       false,
       conn.udpSendPacketLen + d6d.currentProbeSize,
-      conn.udpSendPacketLen + d6d.currentProbeSize);
+      0,
+      conn.udpSendPacketLen + d6d.currentProbeSize,
+      0,
+      LossState(),
+      0);
 
   d6d.thresholdCounter = std::make_unique<WindowedCounter<uint64_t, uint64_t>>(
       std::chrono::microseconds(kDefaultD6DBlackholeDetectionWindow).count(),
       1); // Threshold of 1 will cause window to be set to 0
 
-  EXPECT_CALL(*mockInstrumentationObserver, pmtuBlackholeDetected(_, _))
+  EXPECT_CALL(*mockObserver, pmtuBlackholeDetected(_, _))
       .Times(1)
-      .WillOnce(
-          Invoke([&](QuicSocket* /* qSocket */,
-                     const InstrumentationObserver::PMTUBlackholeEvent& event) {
-            EXPECT_LE(d6d.meta.timeLastNonSearchState, event.blackholeTime);
-            EXPECT_EQ(D6DMachineState::BASE, event.lastNonSearchState);
-            EXPECT_EQ(D6DMachineState::SEARCHING, event.currentState);
-            EXPECT_EQ(d6d.basePMTU + 20, event.udpSendPacketLen);
-            EXPECT_EQ(d6d.basePMTU + 30, event.lastProbeSize);
-            EXPECT_EQ(0, event.blackholeDetectionWindow);
-            EXPECT_EQ(1, event.blackholeDetectionThreshold);
-            EXPECT_EQ(
-                d6d.basePMTU + 20, event.triggeringPacketMetadata.encodedSize);
-          }));
+      .WillOnce(Invoke([&](QuicSocket* /* qSocket */,
+                           const Observer::PMTUBlackholeEvent& event) {
+        EXPECT_LE(d6d.meta.timeLastNonSearchState, event.blackholeTime);
+        EXPECT_EQ(D6DMachineState::BASE, event.lastNonSearchState);
+        EXPECT_EQ(D6DMachineState::SEARCHING, event.currentState);
+        EXPECT_EQ(d6d.basePMTU + 20, event.udpSendPacketLen);
+        EXPECT_EQ(d6d.basePMTU + 30, event.lastProbeSize);
+        EXPECT_EQ(0, event.blackholeDetectionWindow);
+        EXPECT_EQ(1, event.blackholeDetectionThreshold);
+        EXPECT_EQ(
+            d6d.basePMTU + 20, event.triggeringPacketMetadata.encodedSize);
+      }));
 
   detectPMTUBlackhole(conn, lostPacket);
   for (auto& callback : conn.pendingCallbacks) {
@@ -432,9 +466,12 @@ TEST_F(QuicD6DStateFunctionsTest, BlackholeInSearchComplete) {
   QuicConnectionStateBase conn(QuicNodeType::Server);
   auto& d6d = conn.d6d;
   auto now = Clock::now();
-  auto mockInstrumentationObserver =
-      std::make_unique<StrictMock<MockInstrumentationObserver>>();
-  conn.instrumentationObservers_.push_back(mockInstrumentationObserver.get());
+  Observer::Config config = {};
+  config.pmtuEvents = true;
+  auto mockObserver = std::make_unique<StrictMock<MockObserver>>(config);
+  auto observers = std::make_shared<ObserverVec>();
+  observers->emplace_back(mockObserver.get());
+  conn.observers = observers;
   d6d.state = D6DMachineState::SEARCH_COMPLETE;
   conn.udpSendPacketLen = d6d.basePMTU + 20;
   d6d.currentProbeSize = d6d.basePMTU + 20;
@@ -444,10 +481,14 @@ TEST_F(QuicD6DStateFunctionsTest, BlackholeInSearchComplete) {
       makeTestShortPacket(),
       now + 10s,
       d6d.currentProbeSize,
+      0,
       false,
       true,
       d6d.currentProbeSize,
-      d6d.currentProbeSize);
+      d6d.currentProbeSize,
+      0,
+      LossState(),
+      0);
   d6d.lastProbe = D6DProbePacket(
       pkt.packet.header.getPacketSequenceNum(), pkt.metadata.encodedSize);
 
@@ -455,29 +496,33 @@ TEST_F(QuicD6DStateFunctionsTest, BlackholeInSearchComplete) {
       makeTestShortPacket(),
       now + 12s,
       conn.udpSendPacketLen,
+      0,
       false,
       conn.udpSendPacketLen + d6d.currentProbeSize,
-      conn.udpSendPacketLen + d6d.currentProbeSize);
+      0,
+      conn.udpSendPacketLen + d6d.currentProbeSize,
+      0,
+      LossState(),
+      0);
 
   d6d.thresholdCounter = std::make_unique<WindowedCounter<uint64_t, uint64_t>>(
       std::chrono::microseconds(kDefaultD6DBlackholeDetectionWindow).count(),
       1); // Threshold of 1 will cause window to be set to 0
 
-  EXPECT_CALL(*mockInstrumentationObserver, pmtuBlackholeDetected(_, _))
+  EXPECT_CALL(*mockObserver, pmtuBlackholeDetected(_, _))
       .Times(1)
-      .WillOnce(
-          Invoke([&](QuicSocket* /* qSocket */,
-                     const InstrumentationObserver::PMTUBlackholeEvent& event) {
-            EXPECT_EQ(d6d.meta.timeLastNonSearchState, event.blackholeTime);
-            EXPECT_EQ(D6DMachineState::BASE, event.lastNonSearchState);
-            EXPECT_EQ(D6DMachineState::SEARCH_COMPLETE, event.currentState);
-            EXPECT_EQ(d6d.basePMTU + 20, event.udpSendPacketLen);
-            EXPECT_EQ(d6d.basePMTU + 20, event.lastProbeSize);
-            EXPECT_EQ(0, event.blackholeDetectionWindow);
-            EXPECT_EQ(1, event.blackholeDetectionThreshold);
-            EXPECT_EQ(
-                d6d.basePMTU + 20, event.triggeringPacketMetadata.encodedSize);
-          }));
+      .WillOnce(Invoke([&](QuicSocket* /* qSocket */,
+                           const Observer::PMTUBlackholeEvent& event) {
+        EXPECT_EQ(d6d.meta.timeLastNonSearchState, event.blackholeTime);
+        EXPECT_EQ(D6DMachineState::BASE, event.lastNonSearchState);
+        EXPECT_EQ(D6DMachineState::SEARCH_COMPLETE, event.currentState);
+        EXPECT_EQ(d6d.basePMTU + 20, event.udpSendPacketLen);
+        EXPECT_EQ(d6d.basePMTU + 20, event.lastProbeSize);
+        EXPECT_EQ(0, event.blackholeDetectionWindow);
+        EXPECT_EQ(1, event.blackholeDetectionThreshold);
+        EXPECT_EQ(
+            d6d.basePMTU + 20, event.triggeringPacketMetadata.encodedSize);
+      }));
 
   detectPMTUBlackhole(conn, lostPacket);
   for (auto& callback : conn.pendingCallbacks) {
@@ -495,9 +540,12 @@ TEST_F(QuicD6DStateFunctionsTest, ReachMaxPMTU) {
   QuicConnectionStateBase conn(QuicNodeType::Server);
   auto& d6d = conn.d6d;
   auto now = Clock::now();
-  auto mockInstrumentationObserver =
-      std::make_unique<StrictMock<MockInstrumentationObserver>>();
-  conn.instrumentationObservers_.push_back(mockInstrumentationObserver.get());
+  Observer::Config config = {};
+  config.pmtuEvents = true;
+  auto mockObserver = std::make_unique<StrictMock<MockObserver>>(config);
+  auto observers = std::make_shared<ObserverVec>();
+  observers->emplace_back(mockObserver.get());
+  conn.observers = observers;
   d6d.state = D6DMachineState::SEARCHING;
   d6d.maxPMTU = 1452;
   d6d.outstandingProbes = 1;
@@ -510,10 +558,14 @@ TEST_F(QuicD6DStateFunctionsTest, ReachMaxPMTU) {
       makeTestShortPacket(),
       Clock::now(),
       d6d.currentProbeSize,
+      0,
       false,
       true,
       d6d.currentProbeSize,
-      d6d.currentProbeSize);
+      d6d.currentProbeSize,
+      0,
+      LossState(),
+      0);
   d6d.lastProbe = D6DProbePacket(
       pkt.packet.header.getPacketSequenceNum(), pkt.metadata.encodedSize);
   d6d.raiser = std::make_unique<MockProbeSizeRaiser>();
@@ -547,10 +599,14 @@ TEST_F(
       makeTestShortPacket(),
       Clock::now(),
       d6d.currentProbeSize,
+      0,
       false,
       true,
       d6d.currentProbeSize,
-      d6d.currentProbeSize);
+      d6d.currentProbeSize,
+      0,
+      LossState(),
+      0);
   d6d.lastProbe = D6DProbePacket(
       pkt.packet.header.getPacketSequenceNum(), pkt.metadata.encodedSize);
   d6d.raiser = std::make_unique<MockProbeSizeRaiser>();
@@ -566,10 +622,14 @@ TEST_F(
       makeTestShortPacket(),
       Clock::now(),
       d6d.currentProbeSize,
+      0,
       false,
       false,
       d6d.currentProbeSize,
-      d6d.currentProbeSize);
+      d6d.currentProbeSize,
+      0,
+      LossState(),
+      0);
   // Generate a false positive blackhole signal
   detectPMTUBlackhole(conn, lostPacket);
   EXPECT_EQ(d6d.state, D6DMachineState::BASE);
@@ -602,10 +662,14 @@ TEST_F(QuicD6DStateFunctionsTest, UpperboundIsBase) {
       makeTestShortPacket(),
       Clock::now(),
       d6d.currentProbeSize,
+      0,
       false,
       true,
       d6d.currentProbeSize,
-      d6d.currentProbeSize);
+      d6d.currentProbeSize,
+      0,
+      LossState(),
+      0);
   d6d.lastProbe = D6DProbePacket(
       pkt.packet.header.getPacketSequenceNum(), pkt.metadata.encodedSize);
   d6d.raiser = std::make_unique<MockProbeSizeRaiser>();

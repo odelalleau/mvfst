@@ -17,6 +17,8 @@
 #include <quic/codec/DefaultConnectionIdAlgo.h>
 #include <quic/common/test/TestUtils.h>
 #include <quic/d6d/test/Mocks.h>
+#include <quic/dsr/Types.h>
+#include <quic/dsr/test/Mocks.h>
 #include <quic/fizz/client/handshake/FizzClientQuicHandshakeContext.h>
 #include <quic/fizz/server/handshake/FizzServerQuicHandshakeContext.h>
 #include <quic/logging/test/Mocks.h>
@@ -29,6 +31,25 @@
 using namespace folly::test;
 using namespace testing;
 using namespace folly;
+
+namespace {
+auto getOutstandingPacketMatcher(
+    quic::PacketNum packetNum,
+    bool lostByReorder,
+    bool lostByTimeout) {
+  return AllOf(
+      testing::Field(
+          &quic::OutstandingPacket::lostByReorder, testing::Eq(lostByReorder)),
+      testing::Field(
+          &quic::OutstandingPacket::lostByTimeout, testing::Eq(lostByTimeout)),
+      testing::Field(
+          &quic::OutstandingPacket::packet,
+          testing::Field(
+              &quic::RegularPacket::header,
+              testing::Property(
+                  &quic::PacketHeader::getPacketSequenceNum, packetNum))));
+}
+} // namespace
 
 namespace quic {
 namespace test {
@@ -94,6 +115,7 @@ class QuicLossFunctionsTest : public TestWithParam<PacketNumberSpace> {
     conn->serverConnectionId = *connIdAlgo_->encodeConnectionId(params);
     // for canSetLossTimerForAppData()
     conn->oneRttWriteCipher = createNoOpAead();
+    conn->observers = std::make_shared<ObserverVec>();
     return conn;
   }
 
@@ -132,9 +154,12 @@ class QuicLossFunctionsTest : public TestWithParam<PacketNumberSpace> {
   std::unique_ptr<MockQuicStats> transportInfoCb_;
   std::unique_ptr<ConnectionIdAlgo> connIdAlgo_;
 
-  auto getLossPacketMatcher(bool lossByReorder, bool lossByTimeout) {
-    return MockInstrumentationObserver::getLossPacketMatcher(
-        lossByReorder, lossByTimeout);
+  auto getLossPacketMatcher(
+      PacketNum packetNum,
+      bool lossByReorder,
+      bool lossByTimeout) {
+    return MockObserver::getLossPacketMatcher(
+        packetNum, lossByReorder, lossByTimeout);
   }
 };
 
@@ -164,7 +189,6 @@ PacketNum QuicLossFunctionsTest::sendPacket(
           *conn.serverConnectionId,
           conn.ackStates.initialAckState.nextPacketNum,
           *conn.version);
-      conn.outstandings.initialPacketsCount++;
       isHandshake = true;
       break;
     case PacketType::Handshake:
@@ -174,7 +198,6 @@ PacketNum QuicLossFunctionsTest::sendPacket(
           *conn.serverConnectionId,
           conn.ackStates.handshakeAckState.nextPacketNum,
           *conn.version);
-      conn.outstandings.handshakePacketsCount++;
       isHandshake = true;
       break;
     case PacketType::ZeroRtt:
@@ -213,19 +236,26 @@ PacketNum QuicLossFunctionsTest::sendPacket(
     packet = std::move(sizeEnforcedBuilder).buildPacket();
   }
   uint32_t encodedSize = 0;
+  uint32_t encodedBodySize = 0;
   if (packet.header) {
     encodedSize += packet.header->computeChainDataLength();
   }
   if (packet.body) {
     encodedSize += packet.body->computeChainDataLength();
+    encodedBodySize += packet.body->computeChainDataLength();
   }
   auto outstandingPacket = OutstandingPacket(
       packet.packet,
       time,
       encodedSize,
+      encodedBodySize,
       isHandshake,
       isD6DProbe,
       encodedSize,
+      encodedBodySize,
+      0,
+      0,
+      LossState(),
       0);
   outstandingPacket.associatedEvent = associatedEvent;
   conn.lossState.lastRetransmittablePacketSentTime = time;
@@ -233,7 +263,7 @@ PacketNum QuicLossFunctionsTest::sendPacket(
     conn.congestionController->onPacketSent(outstandingPacket);
   }
   if (associatedEvent) {
-    conn.outstandings.clonedPacketsCount++;
+    conn.outstandings.clonedPacketCount[packetNumberSpace]++;
     // Simulates what the real writer does.
     auto it = std::find_if(
         conn.outstandings.packets.begin(),
@@ -247,10 +277,12 @@ PacketNum QuicLossFunctionsTest::sendPacket(
     if (it != conn.outstandings.packets.end()) {
       if (!it->associatedEvent) {
         conn.outstandings.packetEvents.emplace(*associatedEvent);
-        conn.outstandings.clonedPacketsCount++;
+        conn.outstandings.clonedPacketCount[packetNumberSpace]++;
         it->associatedEvent = *associatedEvent;
       }
     }
+  } else {
+    conn.outstandings.packetCount[packetNumberSpace]++;
   }
   conn.outstandings.packets.emplace_back(std::move(outstandingPacket));
   conn.lossState.largestSent = getNextPacketNum(conn, packetNumberSpace);
@@ -876,74 +908,6 @@ TEST_F(QuicLossFunctionsTest, RetxBufferSortedAfterLoss) {
   EXPECT_EQ(2, stream->retransmissionBuffer.size());
 }
 
-TEST_F(QuicLossFunctionsTest, TestMarkCryptoLostAfterCancelRetransmission) {
-  folly::EventBase evb;
-  MockAsyncUDPSocket socket(&evb);
-  auto conn = createConn();
-
-  auto packetSeqNum = conn->ackStates.handshakeAckState.nextPacketNum;
-  LongHeader header(
-      LongHeader::Types::Handshake,
-      *conn->clientConnectionId,
-      *conn->serverConnectionId,
-      packetSeqNum,
-      *conn->version);
-  writeDataToQuicStream(
-      conn->cryptoState->handshakeStream, folly::IOBuf::copyBuffer("CFIN"));
-  writeCryptoAndAckDataToSocket(
-      socket,
-      *conn,
-      *conn->clientConnectionId,
-      *conn->serverConnectionId,
-      LongHeader::Types::Handshake,
-      *aead,
-      *headerCipher,
-      *conn->version,
-      conn->transportSettings.writeConnectionDataPacketsLimit);
-  ASSERT_EQ(conn->outstandings.packets.size(), 1);
-  EXPECT_GT(conn->cryptoState->handshakeStream.retransmissionBuffer.size(), 0);
-  auto& packet = conn->outstandings.packets.front().packet;
-  cancelHandshakeCryptoStreamRetransmissions(*conn->cryptoState);
-  markPacketLoss(*conn, packet, false);
-  EXPECT_EQ(conn->cryptoState->handshakeStream.retransmissionBuffer.size(), 0);
-  EXPECT_EQ(conn->cryptoState->handshakeStream.lossBuffer.size(), 0);
-}
-
-TEST_F(QuicLossFunctionsTest, TestMarkCryptoLostCancel) {
-  folly::EventBase evb;
-  MockAsyncUDPSocket socket(&evb);
-  auto conn = createConn();
-
-  auto packetSeqNum = conn->ackStates.handshakeAckState.nextPacketNum;
-  LongHeader header(
-      LongHeader::Types::Handshake,
-      *conn->clientConnectionId,
-      *conn->serverConnectionId,
-      packetSeqNum,
-      *conn->version);
-  writeDataToQuicStream(
-      conn->cryptoState->handshakeStream, folly::IOBuf::copyBuffer("CFIN"));
-  writeCryptoAndAckDataToSocket(
-      socket,
-      *conn,
-      *conn->clientConnectionId,
-      *conn->serverConnectionId,
-      LongHeader::Types::Handshake,
-      *aead,
-      *headerCipher,
-      *conn->version,
-      conn->transportSettings.writeConnectionDataPacketsLimit);
-  ASSERT_EQ(conn->outstandings.packets.size(), 1);
-  EXPECT_GT(conn->cryptoState->handshakeStream.retransmissionBuffer.size(), 0);
-  auto& packet = conn->outstandings.packets.front().packet;
-  markPacketLoss(*conn, packet, false);
-  EXPECT_EQ(conn->cryptoState->handshakeStream.retransmissionBuffer.size(), 0);
-  EXPECT_EQ(conn->cryptoState->handshakeStream.lossBuffer.size(), 1);
-  cancelHandshakeCryptoStreamRetransmissions(*conn->cryptoState);
-  EXPECT_EQ(conn->cryptoState->handshakeStream.retransmissionBuffer.size(), 0);
-  EXPECT_EQ(conn->cryptoState->handshakeStream.lossBuffer.size(), 0);
-}
-
 TEST_F(QuicLossFunctionsTest, TestMarkPacketLossAfterStreamReset) {
   folly::EventBase evb;
   MockAsyncUDPSocket socket(&evb);
@@ -985,7 +949,7 @@ TEST_F(QuicLossFunctionsTest, TestReorderingThreshold) {
   for (int i = 0; i < 6; ++i) {
     sendPacket(*conn, Clock::now(), folly::none, PacketType::Handshake);
   }
-  EXPECT_EQ(6, conn->outstandings.handshakePacketsCount);
+  EXPECT_EQ(6, conn->outstandings.packetCount[PacketNumberSpace::Handshake]);
   // Assume some packets are already acked
   for (auto iter =
            getFirstOutstandingPacket(*conn, PacketNumberSpace::Handshake) + 2;
@@ -993,7 +957,7 @@ TEST_F(QuicLossFunctionsTest, TestReorderingThreshold) {
        getFirstOutstandingPacket(*conn, PacketNumberSpace::Handshake) + 5;
        iter++) {
     if (iter->metadata.isHandshake) {
-      conn->outstandings.handshakePacketsCount--;
+      conn->outstandings.packetCount[PacketNumberSpace::Handshake]--;
     }
   }
   auto firstHandshakeOpIter =
@@ -1015,7 +979,7 @@ TEST_F(QuicLossFunctionsTest, TestReorderingThreshold) {
   EXPECT_EQ(lostPacket.back(), 2);
 
   // Packet 6 is the only thing remaining inflight, it is a handshake pkt
-  EXPECT_EQ(1, conn->outstandings.handshakePacketsCount);
+  EXPECT_EQ(1, conn->outstandings.packetCount[PacketNumberSpace::Handshake]);
 
   // Packet 6 should remain in packet as the delta is less than threshold
   auto numDeclaredLost = std::count_if(
@@ -1043,8 +1007,9 @@ TEST_F(QuicLossFunctionsTest, TestHandleAckForLoss) {
       conn->version.value());
   RegularQuicWritePacket outstandingRegularPacket(std::move(longHeader));
   auto now = Clock::now();
-  conn->outstandings.packets.emplace_back(
-      OutstandingPacket(outstandingRegularPacket, now, 0, false, 0, 0));
+  conn->outstandings.packets.emplace_back(OutstandingPacket(
+      outstandingRegularPacket, now, 0, 0, false, 0, 0, 0, 0, LossState(), 0));
+  conn->outstandings.packetCount[PacketNumberSpace::Handshake]++;
 
   bool testLossMarkFuncCalled = false;
   auto testLossMarkFunc = [&](auto& /* conn */, auto&, bool) {
@@ -1353,6 +1318,8 @@ TEST_F(QuicLossFunctionsTest, PTONoLongerMarksPacketsToBeRetransmitted) {
 
 TEST_F(QuicLossFunctionsTest, PTOWithHandshakePackets) {
   auto conn = createConn();
+  conn->handshakeWriteCipher = createNoOpAead();
+  conn->handshakeWriteHeaderCipher = createNoOpHeaderCipher();
   auto mockQLogger = std::make_shared<MockQLogger>(VantagePoint::Server);
   conn->qLogger = mockQLogger;
   auto mockCongestionController = std::make_unique<MockCongestionController>();
@@ -1375,13 +1342,21 @@ TEST_F(QuicLossFunctionsTest, PTOWithHandshakePackets) {
         expectedLargestLostNum, i % 2 ? sentPacketNum : expectedLargestLostNum);
   }
   EXPECT_CALL(*transportInfoCb_, onPTO());
+  // Verify packet count doesn't change across PTO.
+  auto originalPacketCount = conn->outstandings.packetCount;
   onLossDetectionAlarm<decltype(testingLossMarkFunc(lostPackets)), Clock>(
       *conn, testingLossMarkFunc(lostPackets));
+  EXPECT_EQ(originalPacketCount, conn->outstandings.packetCount);
 
   EXPECT_EQ(0, lostPackets.size());
   EXPECT_EQ(1, conn->lossState.ptoCount);
   EXPECT_EQ(0, conn->lossState.timeoutBasedRtxCount);
-  EXPECT_EQ(conn->pendingEvents.numProbePackets, kPacketToSendForPTO);
+  EXPECT_EQ(
+      conn->pendingEvents.numProbePackets[PacketNumberSpace::Handshake],
+      kPacketToSendForPTO);
+  EXPECT_EQ(
+      conn->pendingEvents.numProbePackets[PacketNumberSpace::AppData],
+      kPacketToSendForPTO);
   EXPECT_EQ(0, conn->lossState.rtxCount);
 }
 
@@ -1513,16 +1488,20 @@ TEST_F(QuicLossFunctionsTest, NoDoubleProcess) {
         }
       };
   // Send 6 packets, so when we ack the last one, we mark the first two loss
+  EXPECT_EQ(1, conn->ackStates.appDataAckState.nextPacketNum);
   PacketNum lastSent;
-  PacketEvent event(PacketNumberSpace::AppData, 0);
+  lastSent = sendPacket(*conn, Clock::now(), folly::none, PacketType::OneRtt);
+  EXPECT_EQ(1, conn->outstandings.packetCount[PacketNumberSpace::AppData]);
+  PacketEvent event(PacketNumberSpace::AppData, lastSent);
   for (size_t i = 0; i < 6; i++) {
     lastSent = sendPacket(*conn, Clock::now(), event, PacketType::OneRtt);
   }
-  EXPECT_EQ(6, conn->outstandings.packets.size());
+  EXPECT_EQ(7, conn->outstandings.packets.size());
+  EXPECT_EQ(1, conn->outstandings.packetCount[PacketNumberSpace::AppData]);
   // Add the PacketEvent to the outstandings.packetEvents set
   conn->outstandings.packetEvents.insert(event);
 
-  // Ack the last sent packet. Despite two losses, lossVisitor only visit one
+  // Ack the last sent packet. Despite three losses, lossVisitor only visit one
   // packet
   detectLossPackets(
       *conn,
@@ -1534,7 +1513,7 @@ TEST_F(QuicLossFunctionsTest, NoDoubleProcess) {
       conn->outstandings.packets.begin(),
       conn->outstandings.packets.end(),
       [](auto& op) { return op.declaredLost; });
-  EXPECT_EQ(2, numDeclaredLost);
+  EXPECT_EQ(3, numDeclaredLost);
   EXPECT_EQ(1, lossVisitorCount);
   EXPECT_EQ(4 + numDeclaredLost, conn->outstandings.packets.size());
 }
@@ -1557,7 +1536,7 @@ TEST_F(QuicLossFunctionsTest, DetectPacketLossClonedPacketsCounter) {
       noopLossMarker,
       Clock::now(),
       PacketNumberSpace::AppData);
-  EXPECT_EQ(0, conn->outstandings.clonedPacketsCount);
+  EXPECT_EQ(0, conn->outstandings.numClonedPackets());
 }
 
 TEST_F(QuicLossFunctionsTest, TestMarkPacketLossProcessedPacket) {
@@ -1733,8 +1712,9 @@ TEST_F(QuicLossFunctionsTest, TestZeroRttRejectedWithClones) {
   }
 
   EXPECT_EQ(6, conn->outstandings.packets.size());
-  ASSERT_EQ(conn->outstandings.clonedPacketsCount, 6);
+  ASSERT_EQ(conn->outstandings.numClonedPackets(), 6);
   ASSERT_EQ(conn->outstandings.packetEvents.size(), 2);
+  ASSERT_EQ(2, conn->outstandings.packetCount[PacketNumberSpace::AppData]);
 
   std::vector<bool> lostPackets;
   // onRemoveBytesFromInflight should still happen
@@ -1745,7 +1725,7 @@ TEST_F(QuicLossFunctionsTest, TestZeroRttRejectedWithClones) {
   ASSERT_EQ(conn->outstandings.packetEvents.size(), 0);
   EXPECT_EQ(3, conn->outstandings.packets.size());
   EXPECT_EQ(lostPackets.size(), 3);
-  ASSERT_EQ(conn->outstandings.clonedPacketsCount, 3);
+  ASSERT_EQ(conn->outstandings.numClonedPackets(), 3);
   size_t numProcessed = 0;
   for (auto lostPacket : lostPackets) {
     numProcessed += lostPacket;
@@ -1803,7 +1783,7 @@ TEST_F(QuicLossFunctionsTest, OutstandingInitialCounting) {
     largestSent =
         sendPacket(*conn, Clock::now(), folly::none, PacketType::Initial);
   }
-  EXPECT_EQ(10, conn->outstandings.initialPacketsCount);
+  EXPECT_EQ(10, conn->outstandings.packetCount[PacketNumberSpace::Initial]);
   auto noopLossVisitor =
       [&](auto& /* conn */, auto& /* packet */, bool /* processed */
       ) {};
@@ -1814,7 +1794,7 @@ TEST_F(QuicLossFunctionsTest, OutstandingInitialCounting) {
       TimePoint(100ms),
       PacketNumberSpace::Initial);
   // [1, 6] are removed, [7, 10] are still in OP list
-  EXPECT_EQ(4, conn->outstandings.initialPacketsCount);
+  EXPECT_EQ(4, conn->outstandings.packetCount[PacketNumberSpace::Initial]);
 }
 
 TEST_F(QuicLossFunctionsTest, OutstandingHandshakeCounting) {
@@ -1826,7 +1806,7 @@ TEST_F(QuicLossFunctionsTest, OutstandingHandshakeCounting) {
     largestSent =
         sendPacket(*conn, Clock::now(), folly::none, PacketType::Handshake);
   }
-  EXPECT_EQ(10, conn->outstandings.handshakePacketsCount);
+  EXPECT_EQ(10, conn->outstandings.packetCount[PacketNumberSpace::Handshake]);
   auto noopLossVisitor =
       [&](auto& /* conn */, auto& /* packet */, bool /* processed */
       ) {};
@@ -1837,12 +1817,12 @@ TEST_F(QuicLossFunctionsTest, OutstandingHandshakeCounting) {
       TimePoint(100ms),
       PacketNumberSpace::Handshake);
   // [1, 6] are removed, [7, 10] are still in OP list
-  EXPECT_EQ(4, conn->outstandings.handshakePacketsCount);
+  EXPECT_EQ(4, conn->outstandings.packetCount[PacketNumberSpace::Handshake]);
 }
 
 TEST_P(QuicLossFunctionsTest, CappedShiftNoCrash) {
   auto conn = createConn();
-  conn->outstandings.handshakePacketsCount = 0;
+  conn->outstandings.packetCount[PacketNumberSpace::Handshake] = 0;
   conn->outstandings.packets.clear();
   conn->lossState.ptoCount =
       std::numeric_limits<decltype(conn->lossState.ptoCount)>::max();
@@ -1875,10 +1855,14 @@ TEST_F(QuicLossFunctionsTest, PersistentCongestion) {
 }
 
 TEST_F(QuicLossFunctionsTest, TestReorderLossObserverCallback) {
-  auto ib = MockInstrumentationObserver();
+  auto observers = std::make_shared<ObserverVec>();
+  Observer::Config config = {};
+  config.lossEvents = true;
+  auto ib = MockObserver(config);
   auto conn = createConn();
-  // Register 1 instrumentation observer
-  conn->instrumentationObservers_.emplace_back(&ib);
+  // Register 1 observer
+  observers->emplace_back(&ib);
+  conn->observers = observers;
   auto noopLossVisitor = [](auto&, auto&, bool) {};
 
   PacketNum largestSent = 0;
@@ -1913,16 +1897,23 @@ TEST_F(QuicLossFunctionsTest, TestReorderLossObserverCallback) {
 
   // Out of 1, 2, 3, 4, 5, 6, 7 -- we deleted (acked) 3,4,5.
   // 1, 2 and 6 are "lost" due to reodering. None lost due to timeout
+  EXPECT_THAT(
+      conn->outstandings.packets,
+      UnorderedElementsAre(
+          getOutstandingPacketMatcher(1, true, false),
+          getOutstandingPacketMatcher(2, true, false),
+          getOutstandingPacketMatcher(6, true, false),
+          getOutstandingPacketMatcher(7, false, false)));
   EXPECT_CALL(
       ib,
       packetLossDetected(
           nullptr,
           Field(
-              &InstrumentationObserver::ObserverLossEvent::lostPackets,
+              &Observer::LossEvent::lostPackets,
               UnorderedElementsAre(
-                  getLossPacketMatcher(true, false),
-                  getLossPacketMatcher(true, false),
-                  getLossPacketMatcher(true, false)))))
+                  getLossPacketMatcher(1, true, false),
+                  getLossPacketMatcher(2, true, false),
+                  getLossPacketMatcher(6, true, false)))))
       .Times(1);
 
   for (auto& callback : conn->pendingCallbacks) {
@@ -1931,10 +1922,14 @@ TEST_F(QuicLossFunctionsTest, TestReorderLossObserverCallback) {
 }
 
 TEST_F(QuicLossFunctionsTest, TestTimeoutLossObserverCallback) {
-  auto ib = MockInstrumentationObserver();
+  auto observers = std::make_shared<ObserverVec>();
+  Observer::Config config = {};
+  config.lossEvents = true;
+  auto ib = MockObserver(config);
   auto conn = createConn();
-  // Register 1 instrumentation observer
-  conn->instrumentationObservers_.emplace_back(&ib);
+  // Register 1 observer
+  observers->emplace_back(&ib);
+  conn->observers = observers;
   auto noopLossVisitor = [](auto&, auto&, bool) {};
 
   PacketNum largestSent = 0;
@@ -1966,20 +1961,31 @@ TEST_F(QuicLossFunctionsTest, TestTimeoutLossObserverCallback) {
   EXPECT_EQ(1, size(conn->pendingCallbacks));
 
   // expecting all packets to be lost due to timeout
+  EXPECT_THAT(
+      conn->outstandings.packets,
+      UnorderedElementsAre(
+          getOutstandingPacketMatcher(1, false, true),
+          getOutstandingPacketMatcher(2, false, true),
+          getOutstandingPacketMatcher(3, false, true),
+          getOutstandingPacketMatcher(4, false, true),
+          getOutstandingPacketMatcher(5, false, true),
+          getOutstandingPacketMatcher(6, false, true),
+          getOutstandingPacketMatcher(7, false, true)));
+
   EXPECT_CALL(
       ib,
       packetLossDetected(
           nullptr,
           Field(
-              &InstrumentationObserver::ObserverLossEvent::lostPackets,
+              &Observer::LossEvent::lostPackets,
               UnorderedElementsAre(
-                  getLossPacketMatcher(false, true),
-                  getLossPacketMatcher(false, true),
-                  getLossPacketMatcher(false, true),
-                  getLossPacketMatcher(false, true),
-                  getLossPacketMatcher(false, true),
-                  getLossPacketMatcher(false, true),
-                  getLossPacketMatcher(false, true)))))
+                  getLossPacketMatcher(1, false, true),
+                  getLossPacketMatcher(2, false, true),
+                  getLossPacketMatcher(3, false, true),
+                  getLossPacketMatcher(4, false, true),
+                  getLossPacketMatcher(5, false, true),
+                  getLossPacketMatcher(6, false, true),
+                  getLossPacketMatcher(7, false, true)))))
       .Times(1);
 
   for (auto& callback : conn->pendingCallbacks) {
@@ -1988,10 +1994,14 @@ TEST_F(QuicLossFunctionsTest, TestTimeoutLossObserverCallback) {
 }
 
 TEST_F(QuicLossFunctionsTest, TestTimeoutAndReorderLossObserverCallback) {
-  auto ib = MockInstrumentationObserver();
+  auto observers = std::make_shared<ObserverVec>();
+  Observer::Config config = {};
+  config.lossEvents = true;
+  auto ib = MockObserver(config);
   auto conn = createConn();
-  // Register 1 instrumentation observer
-  conn->instrumentationObservers_.emplace_back(&ib);
+  // Register 1 observer
+  observers->emplace_back(&ib);
+  conn->observers = observers;
   auto noopLossVisitor = [](auto&, auto&, bool) {};
 
   PacketNum largestSent = 0;
@@ -2029,17 +2039,24 @@ TEST_F(QuicLossFunctionsTest, TestTimeoutAndReorderLossObserverCallback) {
   // Out of 1, 2, 3, 4, 5, 6, 7 -- we deleted (acked) 3,4,5.
   // 1, 2, 6 are lost due to reodering and timeout.
   // 7 just timed out
+  EXPECT_THAT(
+      conn->outstandings.packets,
+      UnorderedElementsAre(
+          getOutstandingPacketMatcher(1, true, true),
+          getOutstandingPacketMatcher(2, true, true),
+          getOutstandingPacketMatcher(6, true, true),
+          getOutstandingPacketMatcher(7, false, true)));
   EXPECT_CALL(
       ib,
       packetLossDetected(
           nullptr,
           Field(
-              &InstrumentationObserver::ObserverLossEvent::lostPackets,
+              &Observer::LossEvent::lostPackets,
               UnorderedElementsAre(
-                  getLossPacketMatcher(true, true),
-                  getLossPacketMatcher(true, true),
-                  getLossPacketMatcher(true, true),
-                  getLossPacketMatcher(false, true)))))
+                  getLossPacketMatcher(1, true, true),
+                  getLossPacketMatcher(2, true, true),
+                  getLossPacketMatcher(6, true, true),
+                  getLossPacketMatcher(7, false, true)))))
       .Times(1);
 
   for (auto& callback : conn->pendingCallbacks) {
@@ -2047,7 +2064,7 @@ TEST_F(QuicLossFunctionsTest, TestTimeoutAndReorderLossObserverCallback) {
   }
 }
 
-TEST_F(QuicLossFunctionsTest, TestNoInstrumentationObserverCallback) {
+TEST_F(QuicLossFunctionsTest, TestNoObserverCallback) {
   auto conn = createConn();
   auto noopLossVisitor = [](auto&, auto&, bool) {};
 
@@ -2239,6 +2256,151 @@ TEST_F(QuicLossFunctionsTest, TotalPacketsMarkedLostByPtoAndReordering) {
   EXPECT_EQ(4, conn->lossState.totalPacketsMarkedLost);
   EXPECT_EQ(4, conn->lossState.totalPacketsMarkedLostByPto);
   EXPECT_EQ(3, conn->lossState.totalPacketsMarkedLostByReorderingThreshold);
+}
+
+TEST_F(QuicLossFunctionsTest, LossVisitorDSRTest) {
+  auto conn = createConn();
+  auto* stream = conn->streamManager->createNextBidirectionalStream().value();
+  stream->dsrSender = std::make_unique<MockDSRPacketizationRequestSender>();
+  writeDataToQuicStream(*stream, folly::IOBuf::copyBuffer("grape"), false);
+  writeBufMetaToQuicStream(*stream, BufferMeta(1000), true);
+  auto bufMetaStartingOffset = stream->writeBufMeta.offset;
+  ASSERT_EQ(1000, stream->writeBufMeta.length);
+  ASSERT_TRUE(stream->writeBufMeta.eof);
+  ASSERT_EQ(bufMetaStartingOffset + 1000, *stream->finalWriteOffset);
+  // Send real data
+  handleStreamWritten(
+      *conn,
+      *stream,
+      0,
+      bufMetaStartingOffset,
+      false,
+      0 /* PacketNum */,
+      PacketNumberSpace::AppData);
+  ASSERT_EQ(0, stream->writeBuffer.chainLength());
+  auto retxIter = stream->retransmissionBuffer.find(0);
+  ASSERT_NE(stream->retransmissionBuffer.end(), retxIter);
+  ASSERT_EQ(0, retxIter->second->offset);
+  ASSERT_FALSE(retxIter->second->eof);
+  ASSERT_TRUE(folly::IOBufEqualTo()(
+      *folly::IOBuf::copyBuffer("grape"), *retxIter->second->data.front()));
+  ASSERT_EQ(stream->currentWriteOffset, bufMetaStartingOffset);
+
+  // Send BufMeta in 3 chunks:
+  handleStreamBufMetaWritten(
+      *conn,
+      *stream,
+      bufMetaStartingOffset,
+      200,
+      false,
+      1 /* PacketNum */,
+      PacketNumberSpace::AppData);
+  ASSERT_EQ(800, stream->writeBufMeta.length);
+  ASSERT_TRUE(stream->writeBufMeta.eof);
+  ASSERT_EQ(bufMetaStartingOffset + 200, stream->writeBufMeta.offset);
+  auto retxBufMetaIter =
+      stream->retransmissionBufMetas.find(bufMetaStartingOffset);
+  ASSERT_NE(stream->retransmissionBufMetas.end(), retxBufMetaIter);
+  ASSERT_EQ(bufMetaStartingOffset, retxBufMetaIter->second.offset);
+  ASSERT_EQ(200, retxBufMetaIter->second.length);
+  ASSERT_FALSE(retxBufMetaIter->second.eof);
+  conn->streamManager->updateWritableStreams(*stream);
+  conn->streamManager->updateLossStreams(*stream);
+  EXPECT_FALSE(conn->streamManager->hasLoss());
+  EXPECT_FALSE(conn->streamManager->writableDSRStreams().empty());
+
+  handleStreamBufMetaWritten(
+      *conn,
+      *stream,
+      bufMetaStartingOffset + 200,
+      400,
+      false,
+      2 /* PacketNum */,
+      PacketNumberSpace::AppData);
+  ASSERT_EQ(400, stream->writeBufMeta.length);
+  ASSERT_TRUE(stream->writeBufMeta.eof);
+  ASSERT_EQ(bufMetaStartingOffset + 600, stream->writeBufMeta.offset);
+  retxBufMetaIter =
+      stream->retransmissionBufMetas.find(bufMetaStartingOffset + 200);
+  ASSERT_NE(stream->retransmissionBufMetas.end(), retxBufMetaIter);
+  ASSERT_EQ(bufMetaStartingOffset + 200, retxBufMetaIter->second.offset);
+  ASSERT_EQ(400, retxBufMetaIter->second.length);
+  ASSERT_FALSE(retxBufMetaIter->second.eof);
+  conn->streamManager->updateWritableStreams(*stream);
+  conn->streamManager->updateLossStreams(*stream);
+  EXPECT_FALSE(conn->streamManager->hasLoss());
+  EXPECT_FALSE(conn->streamManager->writableDSRStreams().empty());
+
+  handleStreamBufMetaWritten(
+      *conn,
+      *stream,
+      bufMetaStartingOffset + 600,
+      400,
+      true,
+      3 /* PacketNum */,
+      PacketNumberSpace::AppData);
+  ASSERT_EQ(0, stream->writeBufMeta.length);
+  ASSERT_TRUE(stream->writeBufMeta.eof);
+  ASSERT_EQ(bufMetaStartingOffset + 1000 + 1, stream->writeBufMeta.offset);
+  retxBufMetaIter =
+      stream->retransmissionBufMetas.find(bufMetaStartingOffset + 600);
+  ASSERT_NE(stream->retransmissionBufMetas.end(), retxBufMetaIter);
+  ASSERT_EQ(bufMetaStartingOffset + 600, retxBufMetaIter->second.offset);
+  ASSERT_EQ(400, retxBufMetaIter->second.length);
+  ASSERT_TRUE(retxBufMetaIter->second.eof);
+  conn->streamManager->updateWritableStreams(*stream);
+  conn->streamManager->updateLossStreams(*stream);
+  EXPECT_FALSE(conn->streamManager->hasLoss());
+  EXPECT_TRUE(conn->streamManager->writableDSRStreams().empty());
+
+  // Lose the 1st dsr packet:
+  RegularQuicWritePacket packet1(PacketHeader(ShortHeader(
+      ProtectionType::KeyPhaseZero, conn->serverConnectionId.value(), 1)));
+  WriteStreamFrame frame1(stream->id, bufMetaStartingOffset, 200, false);
+  frame1.fromBufMeta = true;
+  packet1.frames.push_back(frame1);
+  markPacketLoss(*conn, packet1, false /* processed */);
+  EXPECT_EQ(1, stream->lossBufMetas.size());
+  const auto& lostBufMeta1 = stream->lossBufMetas.front();
+  EXPECT_EQ(bufMetaStartingOffset, lostBufMeta1.offset);
+  EXPECT_EQ(200, lostBufMeta1.length);
+  EXPECT_FALSE(lostBufMeta1.eof);
+  EXPECT_EQ(2, stream->retransmissionBufMetas.size());
+  EXPECT_TRUE(conn->streamManager->hasLoss());
+  EXPECT_FALSE(conn->streamManager->writableDSRStreams().empty());
+
+  // Lose the 3rd dsr packet:
+  RegularQuicWritePacket packet3(PacketHeader(ShortHeader(
+      ProtectionType::KeyPhaseZero, conn->serverConnectionId.value(), 3)));
+  WriteStreamFrame frame3(stream->id, bufMetaStartingOffset + 600, 400, true);
+  frame3.fromBufMeta = true;
+  packet3.frames.push_back(frame3);
+  markPacketLoss(*conn, packet3, false /* processed */);
+  EXPECT_EQ(2, stream->lossBufMetas.size());
+  const auto& lostBufMeta2 = stream->lossBufMetas.back();
+  EXPECT_EQ(bufMetaStartingOffset + 600, lostBufMeta2.offset);
+  EXPECT_EQ(400, lostBufMeta2.length);
+  EXPECT_TRUE(lostBufMeta2.eof);
+  EXPECT_EQ(1, stream->retransmissionBufMetas.size());
+  EXPECT_TRUE(conn->streamManager->hasLoss());
+  EXPECT_FALSE(conn->streamManager->writableDSRStreams().empty());
+
+  // Lose the 3nd dsr packet, it should be merged together with the first
+  // element in the lossBufMetas:
+  RegularQuicWritePacket packet2(PacketHeader(ShortHeader(
+      ProtectionType::KeyPhaseZero, conn->serverConnectionId.value(), 2)));
+  WriteStreamFrame frame2(stream->id, bufMetaStartingOffset + 200, 400, false);
+  frame2.fromBufMeta = true;
+  packet2.frames.push_back(frame2);
+  markPacketLoss(*conn, packet2, false /* processed */);
+  EXPECT_EQ(2, stream->lossBufMetas.size());
+  const auto& lostBufMeta3 = stream->lossBufMetas.front();
+  EXPECT_EQ(bufMetaStartingOffset, lostBufMeta3.offset);
+  EXPECT_EQ(600, lostBufMeta3.length);
+  EXPECT_FALSE(lostBufMeta3.eof);
+  EXPECT_EQ(0, stream->retransmissionBufMetas.size());
+  EXPECT_TRUE(conn->streamManager->hasLoss());
+  EXPECT_FALSE(conn->streamManager->writableDSRStreams().empty());
 }
 
 INSTANTIATE_TEST_CASE_P(

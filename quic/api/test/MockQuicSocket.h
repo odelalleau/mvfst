@@ -95,10 +95,12 @@ class MockQuicSocket : public QuicSocket {
           uint64_t,
           SharedBuf));
   MOCK_CONST_METHOD0(isKnobSupported, bool());
-  MOCK_CONST_METHOD0(isPartiallyReliableTransport, bool());
   MOCK_METHOD3(
       setStreamPriority,
       folly::Expected<folly::Unit, LocalErrorCode>(StreamId, uint8_t, bool));
+  MOCK_METHOD1(
+      getStreamPriority,
+      folly::Expected<Priority, LocalErrorCode>(StreamId));
   MOCK_METHOD3(
       setReadCallback,
       folly::Expected<folly::Unit, LocalErrorCode>(
@@ -188,18 +190,27 @@ class MockQuicSocket : public QuicSocket {
   MOCK_CONST_METHOD2(
       getNumByteEventCallbacksForStream,
       size_t(const ByteEvent::Type, const StreamId));
-  folly::Expected<folly::Unit, LocalErrorCode> writeChain(
-      StreamId id,
-      Buf data,
-      bool eof,
-      bool cork,
-      DeliveryCallback* cb) override {
+  folly::Expected<folly::Unit, LocalErrorCode>
+  writeChain(StreamId id, Buf data, bool eof, ByteEventCallback* cb) override {
     SharedBuf sharedData(data.release());
-    return writeChain(id, sharedData, eof, cork, cb);
+    return writeChain(id, sharedData, eof, cb);
   }
-  MOCK_METHOD5(
+  MOCK_METHOD4(
       writeChain,
-      WriteResult(StreamId, SharedBuf, bool, bool, DeliveryCallback*));
+      WriteResult(StreamId, SharedBuf, bool, ByteEventCallback*));
+  MOCK_METHOD4(
+      writeBufMeta,
+      WriteResult(StreamId, const BufferMeta&, bool, ByteEventCallback*));
+  MOCK_METHOD2(
+      setDSRPacketizationRequestSenderRef,
+      WriteResult(
+          StreamId,
+          const std::unique_ptr<DSRPacketizationRequestSender>&));
+  WriteResult setDSRPacketizationRequestSender(
+      StreamId streamId,
+      std::unique_ptr<DSRPacketizationRequestSender> sender) override {
+    return setDSRPacketizationRequestSenderRef(streamId, sender);
+  }
   MOCK_METHOD3(
       registerDeliveryCallback,
       folly::Expected<folly::Unit, LocalErrorCode>(
@@ -253,30 +264,6 @@ class MockQuicSocket : public QuicSocket {
       consume,
       folly::Expected<folly::Unit, LocalErrorCode>(StreamId, size_t));
 
-  MOCK_METHOD2(
-      setDataExpiredCallback,
-      folly::Expected<folly::Unit, LocalErrorCode>(
-          StreamId,
-          DataExpiredCallback*));
-
-  MOCK_METHOD2(
-      sendDataExpired,
-      folly::Expected<folly::Optional<uint64_t>, LocalErrorCode>(
-          StreamId,
-          uint64_t offset));
-
-  MOCK_METHOD2(
-      setDataRejectedCallback,
-      folly::Expected<folly::Unit, LocalErrorCode>(
-          StreamId,
-          DataRejectedCallback*));
-
-  MOCK_METHOD2(
-      sendDataRejected,
-      folly::Expected<folly::Optional<uint64_t>, LocalErrorCode>(
-          StreamId,
-          uint64_t offset));
-
   MOCK_METHOD1(setCongestionControl, void(CongestionControlType));
 
   ConnectionCallback* cb_;
@@ -285,14 +272,25 @@ class MockQuicSocket : public QuicSocket {
       earlyDataAppParamsValidator_;
   folly::Function<Buf()> earlyDataAppParamsGetter_;
 
-  MOCK_METHOD1(addLifecycleObserver, void(LifecycleObserver*));
-  MOCK_METHOD1(removeLifecycleObserver, bool(LifecycleObserver*));
-  MOCK_CONST_METHOD0(getLifecycleObservers, const LifecycleObserverVec&());
-
-  MOCK_METHOD1(addInstrumentationObserver, void(InstrumentationObserver*));
-  MOCK_METHOD1(removeInstrumentationObserver, bool(InstrumentationObserver*));
-  MOCK_CONST_METHOD0(
-      getInstrumentationObservers,
-      const InstrumentationObserverVec&());
+  MOCK_METHOD1(addObserver, void(Observer*));
+  MOCK_METHOD1(removeObserver, bool(Observer*));
+  MOCK_CONST_METHOD0(getObservers, const ObserverVec&());
+  MOCK_METHOD2(
+      resetNonControlStreams,
+      void(ApplicationErrorCode, folly::StringPiece));
+  MOCK_CONST_METHOD0(getConnectionsStats, QuicConnectionStats());
+  MOCK_METHOD1(
+      setDatagramCallback,
+      folly::Expected<folly::Unit, LocalErrorCode>(DatagramCallback*));
+  MOCK_CONST_METHOD0(getDatagramSizeLimit, uint16_t());
+  folly::Expected<folly::Unit, LocalErrorCode> writeDatagram(
+      Buf data) override {
+    SharedBuf sharedData(data.release());
+    return writeDatagram(sharedData);
+  }
+  MOCK_METHOD1(writeDatagram, WriteResult(SharedBuf));
+  MOCK_METHOD1(
+      readDatagrams,
+      folly::Expected<std::vector<Buf>, LocalErrorCode>(size_t));
 };
 } // namespace quic

@@ -41,6 +41,8 @@ QuicServerWorker::QuicServerWorker(
       takeoverPktHandler_(this),
       observerList_(this) {
   ccpReader_ = std::make_unique<CCPReader>();
+  pending0RttData_.setPruneHook(
+      [&](auto, auto) { QUIC_STATS(statsCallback_, onZeroRttBufferedPruned); });
 }
 
 folly::EventBase* QuicServerWorker::getEventBase() const {
@@ -118,8 +120,8 @@ void QuicServerWorker::setTransportStatsCallback(
   statsCallback_ = std::move(statsCallback);
 }
 
-QuicTransportStatsCallback* QuicServerWorker::getTransportStatsCallback() const
-    noexcept {
+QuicTransportStatsCallback* QuicServerWorker::getTransportStatsCallback()
+    const noexcept {
   return statsCallback_.get();
 }
 
@@ -361,8 +363,9 @@ void QuicServerWorker::handleNetworkData(
       }
       RoutingData routingData(
           headerForm,
-          false,
-          false,
+          false, /* isInitial */
+          false, /* is0Rtt */
+          false, /* isUsingClientConnId */
           std::move(parsedShortHeader->destinationConnId),
           folly::none);
       return forwardNetworkData(
@@ -386,8 +389,8 @@ void QuicServerWorker::handleNetworkData(
     // TODO: check version before looking at type
     LongHeader::Types longHeaderType = parseLongHeaderType(initialByte);
     bool isInitial = longHeaderType == LongHeader::Types::Initial;
-    bool isUsingClientConnId =
-        isInitial || longHeaderType == LongHeader::Types::ZeroRtt;
+    bool is0Rtt = longHeaderType == LongHeader::Types::ZeroRtt;
+    bool isUsingClientConnId = isInitial || is0Rtt;
 
     if (isInitial) {
       // This stats gets updated even if the client initial will be dropped.
@@ -417,6 +420,7 @@ void QuicServerWorker::handleNetworkData(
     RoutingData routingData(
         headerForm,
         isInitial,
+        is0Rtt,
         isUsingClientConnId,
         std::move(parsedLongHeader->invariant.dstConnId),
         std::move(parsedLongHeader->invariant.srcConnId));
@@ -556,10 +560,21 @@ void QuicServerWorker::dispatchPacketData(
     auto source = std::make_pair(client, routingData.destinationConnId);
     auto sit = sourceAddressMap_.find(source);
     if (sit == sourceAddressMap_.end()) {
-      // TODO for O-RTT types we need to create new connections to handle
-      // the case, where the new server gets packets sent to the old one due
-      // to network reordering
-      if (!routingData.isInitial) {
+      // If it's a 0RTT packet and we have no CID, we probably lost the initial
+      // and want to buffer it for a while.
+      if (routingData.is0Rtt) {
+        auto itr = pending0RttData_.find(routingData.destinationConnId);
+        if (itr == pending0RttData_.end()) {
+          itr =
+              pending0RttData_.insert(routingData.destinationConnId, {}).first;
+        }
+        auto& vec = itr->second;
+        if (vec.size() != vec.max_size()) {
+          vec.emplace_back(std::move(networkData));
+          QUIC_STATS(statsCallback_, onZeroRttBuffered);
+        }
+        return;
+      } else if (!routingData.isInitial) {
         VLOG(3) << folly::format(
             "Dropping packet from client={}, routingInfo={}",
             client.describe(),
@@ -603,14 +618,18 @@ void QuicServerWorker::dispatchPacketData(
         // send a retry packet back to the client
         if (!maybeEncryptedRetryToken && newConnRateLimiter_ &&
             newConnRateLimiter_->check(networkData.receiveTimePoint)) {
-          sendRetryPacket(
-              client,
-              routingData.destinationConnId,
-              routingData.sourceConnId.value_or(
-                  ConnectionId(std::vector<uint8_t>())));
-
-          QUIC_STATS(statsCallback_, onConnectionRateLimited);
-          return;
+          if (transportSettings_.retryTokenSecret.hasValue()) {
+            sendRetryPacket(
+                client,
+                routingData.destinationConnId,
+                routingData.sourceConnId.value_or(
+                    ConnectionId(std::vector<uint8_t>())));
+            QUIC_STATS(statsCallback_, onConnectionRateLimited);
+            return;
+          } else {
+            VLOG(4)
+                << "Not sending retry packet since retry token secret is not set";
+          }
         }
 
         // create 'accepting' transport
@@ -635,6 +654,9 @@ void QuicServerWorker::dispatchPacketData(
           trans->setCcpDatapath(getCcpReader()->getDatapath());
 #endif
           trans->setCongestionControllerFactory(ccFactory_);
+          if (statsCallback_) {
+            trans->setTransportStatsCallback(statsCallback_.get());
+          }
           if (transportSettingsOverrideFn_) {
             folly::Optional<TransportSettings> overridenTransportSettings =
                 transportSettingsOverrideFn_(
@@ -670,9 +692,6 @@ void QuicServerWorker::dispatchPacketData(
               static_cast<uint8_t>(processId_),
               workerId_);
           trans->setServerConnectionIdParams(std::move(serverConnIdParams));
-          if (statsCallback_) {
-            trans->setTransportStatsCallback(statsCallback_.get());
-          }
           trans->accept();
           auto result = sourceAddressMap_.emplace(std::make_pair(
               std::make_pair(client, routingData.destinationConnId), trans));
@@ -699,6 +718,16 @@ void QuicServerWorker::dispatchPacketData(
   if (!dropPacket) {
     DCHECK(transport->getEventBase()->isInEventBaseThread());
     transport->onNetworkData(client, std::move(networkData));
+    // If we had pending 0RTT data for this DCID, process it.
+    if (routingData.isInitial && !pending0RttData_.empty()) {
+      auto itr = pending0RttData_.find(routingData.destinationConnId);
+      if (itr != pending0RttData_.end()) {
+        for (auto& data : itr->second) {
+          transport->onNetworkData(client, std::move(data));
+        }
+        pending0RttData_.erase(itr);
+      }
+    }
     return;
   }
   if (cannotMakeTransport) {
@@ -841,8 +870,14 @@ bool QuicServerWorker::validateRetryToken(
     std::string& encryptedToken,
     const ConnectionId& dstConnId,
     const folly::IPAddress& clientIp) {
+  // If for some reason there is a retry token, but no retry token
+  // secret, then just allow the packet
+  if (!transportSettings_.retryTokenSecret.hasValue()) {
+    LOG(ERROR) << "Received a retry token, but there is no retry token secret!";
+    return true;
+  }
+
   // Try to decode the token
-  CHECK(transportSettings_.retryTokenSecret.has_value());
   RetryTokenGenerator generator(transportSettings_.retryTokenSecret.value());
   auto buf = folly::IOBuf::copyBuffer(encryptedToken);
 
@@ -888,7 +923,6 @@ void QuicServerWorker::sendRetryPacket(
     const ConnectionId& dstConnId,
     const ConnectionId& srcConnId) {
   // Create the encrypted retry token
-  CHECK(transportSettings_.retryTokenSecret.has_value());
   RetryTokenGenerator generator(transportSettings_.retryTokenSecret.value());
   auto encryptedToken = generator.encryptToken(
       dstConnId, client.getIPAddress(), client.getPort());
@@ -982,8 +1016,8 @@ int QuicServerWorker::getTakeoverHandlerSocketFD() {
   return takeoverCB_->getSocketFD();
 }
 
-TakeoverProtocolVersion QuicServerWorker::getTakeoverProtocolVersion() const
-    noexcept {
+TakeoverProtocolVersion QuicServerWorker::getTakeoverProtocolVersion()
+    const noexcept {
   return takeoverPktHandler_.getTakeoverProtocolVersion();
 }
 
@@ -1058,10 +1092,6 @@ void QuicServerWorker::setTransportSettings(
 
 void QuicServerWorker::rejectNewConnections(bool rejectNewConnections) {
   rejectNewConnections_ = rejectNewConnections;
-}
-
-void QuicServerWorker::enablePartialReliability(bool enabled) {
-  transportSettings_.partialReliabilityEnabled = enabled;
 }
 
 void QuicServerWorker::setHealthCheckToken(
@@ -1219,14 +1249,15 @@ void QuicServerWorker::shutdownAllConnections(LocalErrorCode error) {
   }
   socket_.reset();
   takeoverCB_.reset();
+  pacingTimer_.reset();
 }
 
 QuicServerWorker::~QuicServerWorker() {
   shutdownAllConnections(LocalErrorCode::SHUTTING_DOWN);
 }
 
-bool QuicServerWorker::rejectConnectionId(const ConnectionId& candidate) const
-    noexcept {
+bool QuicServerWorker::rejectConnectionId(
+    const ConnectionId& candidate) const noexcept {
   return connectionIdMap_.find(candidate) != connectionIdMap_.end();
 }
 
@@ -1284,27 +1315,28 @@ QuicServerWorker::AcceptObserverList::~AcceptObserverList() {
 }
 
 void QuicServerWorker::AcceptObserverList::add(AcceptObserver* observer) {
+  // adding the same observer multiple times is not allowed
+  CHECK(
+      std::find(observers_.begin(), observers_.end(), observer) ==
+      observers_.end());
+
   observers_.emplace_back(CHECK_NOTNULL(observer));
   observer->observerAttach(worker_);
 }
 
 bool QuicServerWorker::AcceptObserverList::remove(AcceptObserver* observer) {
-  const auto eraseIt =
-      std::remove(observers_.begin(), observers_.end(), observer);
-  if (eraseIt == observers_.end()) {
+  auto it = std::find(observers_.begin(), observers_.end(), observer);
+  if (it == observers_.end()) {
     return false;
   }
-
-  for (auto it = eraseIt; it != observers_.end(); it++) {
-    (*it)->observerDetach(worker_);
-  }
-  observers_.erase(eraseIt, observers_.end());
+  observer->observerDetach(worker_);
+  observers_.erase(it);
   return true;
 }
 
 void QuicServerWorker::getAllConnectionsStats(
     std::vector<QuicConnectionStats>& stats) {
-  folly::F14FastMap<const QuicServerConnectionState*, uint32_t> uniqueConns;
+  folly::F14FastMap<QuicServerTransport::Ptr, uint32_t> uniqueConns;
   for (const auto& conn : connectionIdMap_) {
     if (!conn.second) {
       continue;
@@ -1314,53 +1346,13 @@ void QuicServerWorker::getAllConnectionsStats(
     if (!connState) {
       continue;
     }
-    uniqueConns[connState]++;
+    uniqueConns[conn.second]++;
   }
-  auto now = Clock::now();
   stats.reserve(stats.size() + uniqueConns.size());
   for (const auto& connEntry : uniqueConns) {
-    QuicConnectionStats connStats;
-    auto conn = connEntry.first;
+    QuicConnectionStats connStats = connEntry.first->getConnectionsStats();
     connStats.workerID = workerId_;
     connStats.numConnIDs = connEntry.second;
-    connStats.localAddress = conn->serverAddr.describe();
-    connStats.peerAddress = conn->peerAddress.describe();
-    connStats.duration = now - conn->connectionTime;
-    if (conn->congestionController) {
-      connStats.cwnd_bytes = conn->congestionController->getCongestionWindow();
-      connStats.congestionController =
-          congestionControlTypeToString(conn->congestionController->type())
-              .str();
-      conn->congestionController->getStats(connStats.congestionControllerStats);
-    }
-    connStats.ptoCount = conn->lossState.ptoCount;
-    connStats.srtt = std::chrono::duration_cast<std::chrono::milliseconds>(
-        conn->lossState.srtt);
-    connStats.rttvar = std::chrono::duration_cast<std::chrono::milliseconds>(
-        conn->lossState.rttvar);
-    connStats.peerAckDelayExponent = conn->peerAckDelayExponent;
-    connStats.udpSendPacketLen = conn->udpSendPacketLen;
-    if (conn->streamManager) {
-      connStats.numStreams = conn->streamManager->streams().size();
-    }
-
-    if (conn->clientChosenDestConnectionId.hasValue()) {
-      connStats.clientChosenDestConnectionId =
-          conn->clientChosenDestConnectionId->hex();
-    }
-    if (conn->clientConnectionId.hasValue()) {
-      connStats.clientConnectionId = conn->clientConnectionId->hex();
-    }
-    if (conn->serverConnectionId.hasValue()) {
-      connStats.serverConnectionId = conn->serverConnectionId->hex();
-    }
-
-    connStats.totalBytesSent = conn->lossState.totalBytesSent;
-    connStats.totalBytesReceived = conn->lossState.totalBytesRecvd;
-    connStats.totalBytesRetransmitted = conn->lossState.totalBytesRetransmitted;
-    if (conn->version.hasValue()) {
-      connStats.version = static_cast<uint32_t>(*conn->version);
-    }
     stats.emplace_back(connStats);
   }
 }

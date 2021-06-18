@@ -71,7 +71,9 @@ void QuicTransportBase::setPacingTimer(
 void QuicTransportBase::setCongestionControllerFactory(
     std::shared_ptr<CongestionControllerFactory> ccFactory) {
   CHECK(ccFactory);
-  ccFactory_ = ccFactory;
+  CHECK(conn_);
+  conn_->congestionControllerFactory = ccFactory;
+  conn_->congestionController.reset();
 }
 
 folly::EventBase* QuicTransportBase::getEventBase() const {
@@ -140,13 +142,7 @@ const folly::SocketAddress& QuicTransportBase::getLocalAddress() const {
 
 QuicTransportBase::~QuicTransportBase() {
   connCallback_ = nullptr;
-  QUIC_TRACE(
-      conn_close,
-      *conn_,
-      (uint64_t) false,
-      (uint64_t) true,
-      "destructor",
-      "no_error");
+
   closeImpl(
       std::make_pair(
           QuicErrorCode(LocalErrorCode::SHUTTING_DOWN),
@@ -161,7 +157,7 @@ QuicTransportBase::~QuicTransportBase() {
     sock->pauseRead();
     sock->close();
   }
-  for (const auto& cb : lifecycleObservers_) {
+  for (const auto& cb : *observers_) {
     cb->destroy(this);
   }
 }
@@ -231,13 +227,6 @@ void QuicTransportBase::closeGracefully() {
   if (conn_->qLogger) {
     conn_->qLogger->addConnectionClose(kNoError, kGracefulExit, true, false);
   }
-  QUIC_TRACE(
-      conn_close,
-      *conn_,
-      (uint64_t) true,
-      (uint64_t) false,
-      "graceful",
-      "no_error");
 
   // Stop reads and cancel all the app callbacks.
   VLOG(10) << "Stopping read and peek loopers due to graceful close " << *this;
@@ -257,13 +246,9 @@ void QuicTransportBase::closeImpl(
     folly::Optional<std::pair<QuicErrorCode, std::string>> errorCode,
     bool drainConnection,
     bool sendCloseImmediately) {
-  for (const auto& cb : lifecycleObservers_) {
+  for (const auto& cb : *observers_) {
     cb->close(this, errorCode);
   }
-  for (const auto& cb : conn_->instrumentationObservers_) {
-    cb->observerDetach(this);
-  }
-  conn_->instrumentationObservers_.clear();
 
   if (closeState_ == CloseState::CLOSED) {
     return;
@@ -288,32 +273,24 @@ void QuicTransportBase::closeImpl(
     totalCryptoDataRecvd += conn_->cryptoState->oneRttStream.maxOffsetObserved;
   }
 
-  QUIC_TRACE(
-      transport_data,
-      *conn_,
-      conn_->lossState.totalBytesSent,
-      conn_->lossState.totalBytesRecvd,
-      conn_->flowControlState.sumCurWriteOffset,
-      conn_->flowControlState.sumMaxObservedOffset,
-      conn_->flowControlState.sumCurStreamBufferLen,
-      conn_->lossState.totalBytesRetransmitted,
-      conn_->lossState.totalStreamBytesCloned,
-      conn_->lossState.totalBytesCloned,
-      totalCryptoDataWritten,
-      totalCryptoDataRecvd);
-
   if (conn_->qLogger) {
     conn_->qLogger->addTransportSummary(
-        conn_->lossState.totalBytesSent,
-        conn_->lossState.totalBytesRecvd,
-        conn_->flowControlState.sumCurWriteOffset,
-        conn_->flowControlState.sumMaxObservedOffset,
-        conn_->flowControlState.sumCurStreamBufferLen,
-        conn_->lossState.totalBytesRetransmitted,
-        conn_->lossState.totalStreamBytesCloned,
-        conn_->lossState.totalBytesCloned,
-        totalCryptoDataWritten,
-        totalCryptoDataRecvd);
+        {conn_->lossState.totalBytesSent,
+         conn_->lossState.totalBytesRecvd,
+         conn_->flowControlState.sumCurWriteOffset,
+         conn_->flowControlState.sumMaxObservedOffset,
+         conn_->flowControlState.sumCurStreamBufferLen,
+         conn_->lossState.totalBytesRetransmitted,
+         conn_->lossState.totalStreamBytesCloned,
+         conn_->lossState.totalBytesCloned,
+         totalCryptoDataWritten,
+         totalCryptoDataRecvd,
+         conn_->congestionController
+             ? conn_->congestionController->getWritableBytes()
+             : std::numeric_limits<uint64_t>::max(),
+         getSendConnFlowControlBytesWire(*conn_),
+         conn_->usedZeroRtt,
+         conn_->version.value_or(QuicVersion::MVFST_INVALID)});
   }
 
   // TODO: truncate the error code string to be 1MSS only.
@@ -356,13 +333,6 @@ void QuicTransportBase::closeImpl(
       conn_->qLogger->addConnectionClose(
           errorStr, errorCodeStr, drainConnection, sendCloseImmediately);
     }
-    QUIC_TRACE(
-        conn_close,
-        *conn_,
-        (uint64_t)drainConnection,
-        (uint64_t)sendCloseImmediately,
-        errorStr,
-        errorCode->second.c_str());
   } else {
     auto reason = folly::to<std::string>(
         "Server: ",
@@ -375,13 +345,6 @@ void QuicTransportBase::closeImpl(
       conn_->qLogger->addConnectionClose(
           kNoError, reason, drainConnection, sendCloseImmediately);
     }
-    QUIC_TRACE(
-        conn_close,
-        *conn_,
-        (uint64_t)drainConnection,
-        (uint64_t)sendCloseImmediately,
-        "no_error",
-        "no_error");
   }
   cancelLossTimeout();
   if (ackTimeout_.isScheduled()) {
@@ -416,6 +379,10 @@ void QuicTransportBase::closeImpl(
       conn_->statsCallback,
       onQuicStreamClosed);
   conn_->streamManager->clearOpenStreams();
+
+  // Clear out all the buffered datagrams
+  conn_->datagramState.readBuffer.clear();
+  conn_->datagramState.writeBuffer.clear();
 
   // Clear out all the pending events.
   conn_->pendingEvents = QuicConnectionStateBase::PendingEvents();
@@ -459,9 +426,8 @@ void QuicTransportBase::closeImpl(
 
   // Don't need outstanding packets.
   conn_->outstandings.packets.clear();
-  conn_->outstandings.initialPacketsCount = 0;
-  conn_->outstandings.handshakePacketsCount = 0;
-  conn_->outstandings.clonedPacketsCount = 0;
+  conn_->outstandings.packetCount = {};
+  conn_->outstandings.clonedPacketCount = {};
 
   // We don't need no congestion control.
   conn_->congestionController = nullptr;
@@ -586,12 +552,16 @@ QuicSocket::TransportInfo QuicTransportBase::getTransportInfo() const {
   transportInfo.pacingInterval = pacingInterval;
   transportInfo.packetsRetransmitted = conn_->lossState.rtxCount;
   transportInfo.totalPacketsSent = conn_->lossState.totalPacketsSent;
+  transportInfo.totalAckElicitingPacketsSent =
+      conn_->lossState.totalAckElicitingPacketsSent;
   transportInfo.totalPacketsMarkedLost =
       conn_->lossState.totalPacketsMarkedLost;
   transportInfo.totalPacketsMarkedLostByPto =
       conn_->lossState.totalPacketsMarkedLostByPto;
   transportInfo.totalPacketsMarkedLostByReorderingThreshold =
       conn_->lossState.totalPacketsMarkedLostByReorderingThreshold;
+  transportInfo.totalPacketsSpuriouslyMarkedLost =
+      conn_->lossState.totalPacketsSpuriouslyMarkedLost;
   transportInfo.timeoutBasedLoss = conn_->lossState.timeoutBasedRtxCount;
   transportInfo.totalBytesRetransmitted =
       conn_->lossState.totalBytesRetransmitted;
@@ -599,6 +569,12 @@ QuicSocket::TransportInfo QuicTransportBase::getTransportInfo() const {
   transportInfo.bytesSent = conn_->lossState.totalBytesSent;
   transportInfo.bytesAcked = conn_->lossState.totalBytesAcked;
   transportInfo.bytesRecvd = conn_->lossState.totalBytesRecvd;
+  transportInfo.bytesInFlight = conn_->lossState.inflightBytes;
+  transportInfo.bodyBytesSent = conn_->lossState.totalBodyBytesSent;
+  transportInfo.bodyBytesAcked = conn_->lossState.totalBodyBytesAcked;
+  transportInfo.totalStreamBytesSent = conn_->lossState.totalStreamBytesSent;
+  transportInfo.totalNewStreamBytesSent =
+      conn_->lossState.totalNewStreamBytesSent;
   transportInfo.ptoCount = conn_->lossState.ptoCount;
   transportInfo.totalPTOCount = conn_->lossState.totalPTOCount;
   transportInfo.largestPacketAckedByPeer =
@@ -852,6 +828,9 @@ void QuicTransportBase::invokeReadDataAndCallbacks() {
       readCb->readAvailable(streamId);
     }
   }
+  if (self->datagramCallback_ && !conn_->datagramState.readBuffer.empty()) {
+    self->datagramCallback_->onDatagramsAvailable();
+  }
 }
 
 void QuicTransportBase::updateReadLooper() {
@@ -863,7 +842,7 @@ void QuicTransportBase::updateReadLooper() {
   auto iter = std::find_if(
       conn_->streamManager->readableStreams().begin(),
       conn_->streamManager->readableStreams().end(),
-      [& readCallbacks = readCallbacks_](StreamId s) {
+      [&readCallbacks = readCallbacks_](StreamId s) {
         auto readCb = readCallbacks.find(s);
         if (readCb == readCallbacks.end()) {
           return false;
@@ -872,7 +851,8 @@ void QuicTransportBase::updateReadLooper() {
         // still return an error
         return readCb->second.readCb && readCb->second.resumed;
       });
-  if (iter != conn_->streamManager->readableStreams().end()) {
+  if (iter != conn_->streamManager->readableStreams().end() ||
+      !conn_->datagramState.readBuffer.empty()) {
     VLOG(10) << "Scheduling read looper " << *this;
     readLooper_->run();
   } else {
@@ -983,7 +963,13 @@ void QuicTransportBase::invokePeekDataAndCallbacks() {
     }
     auto peekCb = callback->second.peekCb;
     auto stream = conn_->streamManager->getStream(streamId);
-    if (peekCb && !stream->streamReadError && stream->hasPeekableData()) {
+    if (peekCb && stream->streamReadError) {
+      VLOG(10) << "invoking peek error callbacks on stream=" << streamId << " "
+               << *this;
+      peekCb->peekError(
+          streamId, std::make_pair(*stream->streamReadError, folly::none));
+    } else if (
+        peekCb && !stream->streamReadError && stream->hasPeekableData()) {
       VLOG(10) << "invoking peek callbacks on stream=" << streamId << " "
                << *this;
 
@@ -996,170 +982,6 @@ void QuicTransportBase::invokePeekDataAndCallbacks() {
       VLOG(10) << "Not invoking peek callbacks on stream=" << streamId;
     }
   }
-}
-
-folly::Expected<folly::Unit, LocalErrorCode>
-QuicTransportBase::setDataExpiredCallback(
-    StreamId id,
-    DataExpiredCallback* cb) {
-  if (!conn_->partialReliabilityEnabled) {
-    return folly::makeUnexpected(LocalErrorCode::APP_ERROR);
-  }
-  if (closeState_ != CloseState::OPEN) {
-    return folly::makeUnexpected(LocalErrorCode::CONNECTION_CLOSED);
-  }
-  if (!conn_->streamManager->streamExists(id)) {
-    return folly::makeUnexpected(LocalErrorCode::STREAM_NOT_EXISTS);
-  }
-
-  VLOG(4) << "Setting DataExpiredCallback for stream=" << id << " cb=" << cb
-          << " " << *this;
-
-  auto dataExpiredCbIt = dataExpiredCallbacks_.find(id);
-  if (dataExpiredCbIt == dataExpiredCallbacks_.end()) {
-    if (!cb) {
-      return folly::unit;
-    }
-    dataExpiredCbIt =
-        dataExpiredCallbacks_.emplace(id, DataExpiredCallbackData(cb)).first;
-  }
-
-  if (!cb) {
-    dataExpiredCallbacks_.erase(dataExpiredCbIt);
-  } else {
-    dataExpiredCbIt->second.dataExpiredCb = cb;
-  }
-
-  runOnEvbAsync([](auto self) { self->invokeDataExpiredCallbacks(); });
-
-  return folly::unit;
-}
-
-void QuicTransportBase::invokeDataExpiredCallbacks() {
-  if (!conn_->partialReliabilityEnabled || closeState_ != CloseState::OPEN) {
-    return;
-  }
-
-  auto self = sharedGuard();
-  for (auto streamId : self->conn_->streamManager->dataExpiredStreams()) {
-    auto callbackData = self->dataExpiredCallbacks_.find(streamId);
-    // Data expired is edge-triggered (nag only once on arrival), unlike read
-    // which is level-triggered (nag until application calls read() and
-    // clears the buffer).
-    if (callbackData == self->dataExpiredCallbacks_.end()) {
-      continue;
-    }
-
-    auto dataExpiredCb = callbackData->second.dataExpiredCb;
-    auto stream = conn_->streamManager->getStream(streamId);
-
-    if (dataExpiredCb && !stream->streamReadError) {
-      // If new offset is before current read offset, skip.
-      if (stream->currentReceiveOffset < stream->currentReadOffset) {
-        continue;
-      }
-      VLOG(10) << "invoking data expired callback on stream=" << streamId << " "
-               << *this;
-      dataExpiredCb->onDataExpired(streamId, stream->currentReceiveOffset);
-    }
-  }
-  self->conn_->streamManager->clearDataExpired();
-}
-
-folly::Expected<folly::Optional<uint64_t>, LocalErrorCode>
-QuicTransportBase::sendDataExpired(StreamId id, uint64_t offset) {
-  if (!conn_->partialReliabilityEnabled) {
-    return folly::makeUnexpected(LocalErrorCode::APP_ERROR);
-  }
-  if (closeState_ != CloseState::OPEN) {
-    return folly::makeUnexpected(LocalErrorCode::CONNECTION_CLOSED);
-  }
-  if (!conn_->streamManager->streamExists(id)) {
-    return folly::makeUnexpected(LocalErrorCode::STREAM_NOT_EXISTS);
-  }
-  auto stream = conn_->streamManager->getStream(id);
-  auto newOffset = advanceMinimumRetransmittableOffset(stream, offset);
-
-  // Cancel byte event callbacks that are set for any offset below newOffset.
-  if (newOffset) {
-    cancelByteEventCallbacksForStream(id, *newOffset);
-  }
-
-  updateWriteLooper(true);
-  return folly::makeExpected<LocalErrorCode>(newOffset);
-}
-
-folly::Expected<folly::Unit, LocalErrorCode>
-QuicTransportBase::setDataRejectedCallback(
-    StreamId id,
-    DataRejectedCallback* cb) {
-  if (!conn_->partialReliabilityEnabled) {
-    return folly::makeUnexpected(LocalErrorCode::APP_ERROR);
-  }
-  if (closeState_ != CloseState::OPEN) {
-    return folly::makeUnexpected(LocalErrorCode::CONNECTION_CLOSED);
-  }
-  if (!conn_->streamManager->streamExists(id)) {
-    return folly::makeUnexpected(LocalErrorCode::STREAM_NOT_EXISTS);
-  }
-
-  VLOG(4) << "Setting DataRejectedCallback for stream=" << id << " cb=" << cb
-          << " " << *this;
-
-  auto dataRejectedCbIt = dataRejectedCallbacks_.find(id);
-  if (dataRejectedCbIt == dataRejectedCallbacks_.end()) {
-    if (!cb) {
-      return folly::unit;
-    }
-    dataRejectedCbIt =
-        dataRejectedCallbacks_.emplace(id, DataRejectedCallbackData(cb)).first;
-  }
-
-  if (!cb) {
-    dataRejectedCallbacks_.erase(dataRejectedCbIt);
-  } else {
-    dataRejectedCbIt->second.dataRejectedCb = cb;
-  }
-
-  runOnEvbAsync([](auto self) { self->invokeDataRejectedCallbacks(); });
-
-  return folly::unit;
-}
-
-void QuicTransportBase::invokeDataRejectedCallbacks() {
-  if (!conn_->partialReliabilityEnabled || closeState_ != CloseState::OPEN) {
-    return;
-  }
-
-  auto self = sharedGuard();
-  for (auto streamId : self->conn_->streamManager->dataRejectedStreams()) {
-    auto callbackData = self->dataRejectedCallbacks_.find(streamId);
-    // Data rejected is edge-triggered (nag only once on arrival), unlike read
-    // which is level-triggered (nag until application calls read() and
-    // clears the buffer).
-
-    if (callbackData == self->dataRejectedCallbacks_.end()) {
-      continue;
-    }
-
-    auto dataRejectedCb = callbackData->second.dataRejectedCb;
-    auto stream = conn_->streamManager->getStream(streamId);
-
-    // Invoke any delivery callbacks that are set for any offset below newly set
-    // minimumRetransmittableOffset.
-    if (!stream->streamReadError) {
-      cancelByteEventCallbacksForStream(
-          streamId, stream->minimumRetransmittableOffset);
-    }
-
-    if (dataRejectedCb && !stream->streamReadError) {
-      VLOG(10) << "invoking data rejected callback on stream=" << streamId
-               << " " << *this;
-      dataRejectedCb->onDataRejected(
-          streamId, stream->minimumRetransmittableOffset);
-    }
-  }
-  self->conn_->streamManager->clearDataRejected();
 }
 
 void QuicTransportBase::invokeStreamsAvailableCallbacks() {
@@ -1181,23 +1003,6 @@ void QuicTransportBase::invokeStreamsAvailableCallbacks() {
   }
 }
 
-folly::Expected<folly::Optional<uint64_t>, LocalErrorCode>
-QuicTransportBase::sendDataRejected(StreamId id, uint64_t offset) {
-  if (!conn_->partialReliabilityEnabled) {
-    return folly::makeUnexpected(LocalErrorCode::APP_ERROR);
-  }
-  if (closeState_ != CloseState::OPEN) {
-    return folly::makeUnexpected(LocalErrorCode::CONNECTION_CLOSED);
-  }
-  if (!conn_->streamManager->streamExists(id)) {
-    return folly::makeUnexpected(LocalErrorCode::STREAM_NOT_EXISTS);
-  }
-  auto stream = conn_->streamManager->getStream(id);
-  auto newOffset = advanceCurrentReceiveOffset(stream, offset);
-  updateWriteLooper(true);
-  return folly::makeExpected<LocalErrorCode>(newOffset);
-}
-
 void QuicTransportBase::updatePeekLooper() {
   if (peekCallbacks_.empty() || closeState_ != CloseState::OPEN) {
     VLOG(10) << "Stopping peek looper " << *this;
@@ -1210,7 +1015,7 @@ void QuicTransportBase::updatePeekLooper() {
   auto iter = std::find_if(
       conn_->streamManager->peekableStreams().begin(),
       conn_->streamManager->peekableStreams().end(),
-      [& peekCallbacks = peekCallbacks_](StreamId s) {
+      [&peekCallbacks = peekCallbacks_](StreamId s) {
         VLOG(10) << "Checking stream=" << s;
         auto peekCb = peekCallbacks.find(s);
         if (peekCb == peekCallbacks.end()) {
@@ -1637,6 +1442,13 @@ void QuicTransportBase::processCallbacksAfterWriteData() {
 void QuicTransportBase::handleKnobCallbacks() {
   for (auto& knobFrame : conn_->pendingEvents.knobs) {
     if (knobFrame.knobSpace != kDefaultQuicTransportKnobSpace) {
+      for (const auto& cb : *observers_) {
+        if (cb->getConfig().knobFrameEvents) {
+          cb->knobFrameReceived(
+              this, quic::Observer::KnobFrameEvent(Clock::now(), knobFrame));
+        }
+      }
+
       connCallback_->onKnob(
           knobFrame.knobSpace, knobFrame.id, std::move(knobFrame.blob));
     } else {
@@ -1730,15 +1542,6 @@ void QuicTransportBase::processCallbacksAfterNetworkData() {
       deliveryCallbacks_.erase(deliveryCallbacksForAckedStream);
     }
     deliverableStreamId = conn_->streamManager->popDeliverable();
-  }
-
-  invokeDataExpiredCallbacks();
-  if (closeState_ != CloseState::OPEN) {
-    return;
-  }
-  invokeDataRejectedCallbacks();
-  if (closeState_ != CloseState::OPEN) {
-    return;
   }
 
   // Iterate over streams that changed their flow control window and give
@@ -2083,8 +1886,7 @@ QuicSocket::WriteResult QuicTransportBase::writeChain(
     StreamId id,
     Buf data,
     bool eof,
-    bool /*cork*/,
-    DeliveryCallback* cb) {
+    ByteEventCallback* cb) {
   if (isReceivingStream(conn_->nodeType, id)) {
     return folly::makeUnexpected(LocalErrorCode::INVALID_OPERATION);
   }
@@ -2118,6 +1920,82 @@ QuicSocket::WriteResult QuicTransportBase::writeChain(
       wasAppLimitedOrIdle |= conn_->streamManager->isAppIdle();
     }
     writeDataToQuicStream(*stream, std::move(data), eof);
+    // If we were previously app limited restart pacing with the current rate.
+    if (wasAppLimitedOrIdle && conn_->pacer) {
+      conn_->pacer->reset();
+    }
+    updateWriteLooper(true);
+  } catch (const QuicTransportException& ex) {
+    VLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
+            << *this;
+    exceptionCloseWhat_ = ex.what();
+    closeImpl(std::make_pair(
+        QuicErrorCode(ex.errorCode()), std::string("writeChain() error")));
+    return folly::makeUnexpected(LocalErrorCode::TRANSPORT_ERROR);
+  } catch (const QuicInternalException& ex) {
+    VLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
+            << *this;
+    exceptionCloseWhat_ = ex.what();
+    closeImpl(std::make_pair(
+        QuicErrorCode(ex.errorCode()), std::string("writeChain() error")));
+    return folly::makeUnexpected(ex.errorCode());
+  } catch (const std::exception& ex) {
+    VLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
+            << *this;
+    exceptionCloseWhat_ = ex.what();
+    closeImpl(std::make_pair(
+        QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
+        std::string("writeChain() error")));
+    return folly::makeUnexpected(LocalErrorCode::INTERNAL_ERROR);
+  }
+  return folly::unit;
+}
+
+QuicSocket::WriteResult QuicTransportBase::writeBufMeta(
+    StreamId id,
+    const BufferMeta& data,
+    bool eof,
+    ByteEventCallback* cb) {
+  if (isReceivingStream(conn_->nodeType, id)) {
+    return folly::makeUnexpected(LocalErrorCode::INVALID_OPERATION);
+  }
+  if (closeState_ != CloseState::OPEN) {
+    return folly::makeUnexpected(LocalErrorCode::CONNECTION_CLOSED);
+  }
+  FOLLY_MAYBE_UNUSED auto self = sharedGuard();
+  try {
+    // Check whether stream exists before calling getStream to avoid
+    // creating a peer stream if it does not exist yet.
+    if (!conn_->streamManager->streamExists(id)) {
+      return folly::makeUnexpected(LocalErrorCode::STREAM_NOT_EXISTS);
+    }
+    auto stream = conn_->streamManager->getStream(id);
+    if (!stream->writable()) {
+      return folly::makeUnexpected(LocalErrorCode::STREAM_CLOSED);
+    }
+    if (!stream->dsrSender) {
+      return folly::makeUnexpected(LocalErrorCode::INVALID_OPERATION);
+    }
+    if (stream->currentWriteOffset == 0 && stream->writeBuffer.empty()) {
+      // If nothing has been written to writeBuffer ever, meta writing isn't
+      // allowed.
+      return folly::makeUnexpected(LocalErrorCode::INVALID_OPERATION);
+    }
+    // Register DeliveryCallback for the data + eof offset.
+    if (cb) {
+      auto dataLength = data.length + (eof ? 1 : 0);
+      if (dataLength) {
+        auto currentLargestWriteOffset = getLargestWriteOffsetSeen(*stream);
+        registerDeliveryCallback(
+            id, currentLargestWriteOffset + dataLength - 1, cb);
+      }
+    }
+    bool wasAppLimitedOrIdle = false;
+    if (conn_->congestionController) {
+      wasAppLimitedOrIdle = conn_->congestionController->isAppLimited();
+      wasAppLimitedOrIdle |= conn_->streamManager->isAppIdle();
+    }
+    writeBufMetaToQuicStream(*stream, data, eof);
     // If we were previously app limited restart pacing with the current rate.
     if (wasAppLimitedOrIdle && conn_->pacer) {
       conn_->pacer->reset();
@@ -2190,8 +2068,9 @@ QuicTransportBase::registerByteEventCallback(
   if (byteEventMapIt == byteEventMap.end()) {
     byteEventMap.emplace(
         id,
-        std::initializer_list<std::remove_reference<decltype(
-            byteEventMap)>::type::mapped_type::value_type>({{offset, cb}}));
+        std::initializer_list<std::remove_reference<
+            decltype(byteEventMap)>::type::mapped_type::value_type>(
+            {{offset, cb}}));
   } else {
     // Keep ByteEvents for the same stream sorted by offsets:
     auto pos = std::upper_bound(
@@ -2199,9 +2078,30 @@ QuicTransportBase::registerByteEventCallback(
         byteEventMapIt->second.end(),
         offset,
         [&](uint64_t o, const ByteEventDetail& p) { return o < p.offset; });
+    if (pos != byteEventMapIt->second.begin()) {
+      auto matchingEvent = std::find_if(
+          byteEventMapIt->second.begin(),
+          pos,
+          [offset, cb](const ByteEventDetail& p) {
+            return ((p.offset == offset) && (p.callback == cb));
+          });
+      if (matchingEvent != pos) {
+        // ByteEvent has been already registered for the same type, id,
+        // offset and for the same recipient, return an INVALID_OPERATION error
+        // to prevent duplicate registrations.
+        return folly::makeUnexpected(LocalErrorCode::INVALID_OPERATION);
+      }
+    }
     byteEventMapIt->second.emplace(pos, offset, cb);
   }
   auto stream = conn_->streamManager->getStream(id);
+
+  // Notify recipients that the registration was successful.
+  ByteEvent byteEvent = {};
+  byteEvent.id = id;
+  byteEvent.offset = offset;
+  byteEvent.type = type;
+  cb->onByteEventRegistered(byteEvent);
 
   // if the callback is already ready, we still insert, but schedule to process
   folly::Optional<uint64_t> maxOffsetReady;
@@ -2225,11 +2125,23 @@ QuicTransportBase::registerByteEventCallback(
       if (streamByteEventCbIt == byteEventMapL.end()) {
         return;
       }
-      auto pos = std::lower_bound(
+
+      // This is scheduled to run in the future (during the next iteration of
+      // the event loop). It is possible that the ByteEventDetail list gets
+      // mutated between the time it was scheduled to now when we are ready to
+      // run it. Look at the current outstanding ByteEvents for this stream ID
+      // and confirm that our ByteEvent's offset and recipient callback are
+      // still present.
+      auto pos = std::find_if(
           streamByteEventCbIt->second.begin(),
           streamByteEventCbIt->second.end(),
-          offset,
-          [&](const ByteEventDetail& p, uint64_t o) { return p.offset < o; });
+          [offset, cb](const ByteEventDetail& p) {
+            return ((p.offset == offset) && (p.callback == cb));
+          });
+      // if our byteEvent is not present, it must have been delivered already.
+      if (pos == streamByteEventCbIt->second.end()) {
+        return;
+      }
       streamByteEventCbIt->second.erase(pos);
 
       ByteEvent byteEvent = {};
@@ -2389,7 +2301,6 @@ void QuicTransportBase::lossTimeoutExpired() noexcept {
   try {
     onLossDetectionAlarm(*conn_, markPacketLoss);
     // TODO: remove this trace when Pacing is ready to land
-    QUIC_TRACE(fst_trace, *conn_, "LossTimeoutExpired");
     if (conn_->qLogger) {
       conn_->qLogger->addTransportStateUpdate(kLossTimeoutExpired);
     }
@@ -2458,10 +2369,14 @@ void QuicTransportBase::idleTimeoutExpired(bool drain) noexcept {
   // idle timeout is expired, just close the connection and drain or
   // send connection close immediately depending on 'drain'
   DCHECK_NE(closeState_, CloseState::CLOSED);
+  uint64_t numOpenStreans = conn_->streamManager->streamCount();
   closeImpl(
       std::make_pair(
           QuicErrorCode(LocalErrorCode::IDLE_TIMEOUT),
-          toString(LocalErrorCode::IDLE_TIMEOUT).str()),
+          folly::to<std::string>(
+              toString(LocalErrorCode::IDLE_TIMEOUT),
+              ", num non control streams: ",
+              numOpenStreans - conn_->streamManager->numControlStreams())),
       drain /* drainConnection */,
       !drain /* sendCloseImmediately */);
 }
@@ -2507,7 +2422,7 @@ void QuicTransportBase::scheduleAckTimeout() {
       auto timeout = timeMax(
           std::chrono::duration_cast<std::chrono::microseconds>(
               wheelTimer.getTickInterval()),
-          timeMin(kMaxAckTimeout, factoredRtt));
+          timeMin(conn_->ackStates.maxAckDelay, factoredRtt));
       auto timeoutMs = folly::chrono::ceil<std::chrono::milliseconds>(timeout);
       VLOG(10) << __func__ << " timeout=" << timeoutMs.count() << "ms"
                << " factoredRtt=" << factoredRtt.count() << "us"
@@ -2655,10 +2570,18 @@ void QuicTransportBase::cancelAllAppCallbacks(
       cb.second.readCb->readError(cb.first, err);
     }
   }
+
+  VLOG(4) << "Clearing datagram callback";
+  datagramCallback_ = nullptr;
+
   VLOG(4) << "Clearing " << peekCallbacks_.size() << " peek callbacks";
-  peekCallbacks_.clear();
-  dataExpiredCallbacks_.clear();
-  dataRejectedCallbacks_.clear();
+  auto peekCallbacksCopy = peekCallbacks_;
+  for (auto& cb : peekCallbacksCopy) {
+    peekCallbacks_.erase(cb.first);
+    if (cb.second.peekCb) {
+      cb.second.peekCb->peekError(cb.first, err);
+    }
+  }
 
   if (connWriteCallback_) {
     auto connWriteCallback = connWriteCallback_;
@@ -2673,61 +2596,169 @@ void QuicTransportBase::cancelAllAppCallbacks(
   }
 }
 
-void QuicTransportBase::addLifecycleObserver(LifecycleObserver* observer) {
-  lifecycleObservers_.push_back(CHECK_NOTNULL(observer));
+void QuicTransportBase::resetNonControlStreams(
+    ApplicationErrorCode error,
+    folly::StringPiece errorMsg) {
+  std::vector<StreamId> nonControlStreamIds;
+  nonControlStreamIds.reserve(conn_->streamManager->streamCount());
+  conn_->streamManager->streamStateForEach(
+      [&nonControlStreamIds](const auto& stream) {
+        if (!stream.isControl) {
+          nonControlStreamIds.push_back(stream.id);
+        }
+      });
+  for (auto id : nonControlStreamIds) {
+    if (isSendingStream(conn_->nodeType, id) || isBidirectionalStream(id)) {
+      auto writeCallbackIt = pendingWriteCallbacks_.find(id);
+      if (writeCallbackIt != pendingWriteCallbacks_.end()) {
+        writeCallbackIt->second->onStreamWriteError(id, {error, errorMsg});
+      }
+      resetStream(id, error);
+    }
+    if (isReceivingStream(conn_->nodeType, id) || isBidirectionalStream(id)) {
+      auto readCallbackIt = readCallbacks_.find(id);
+      if (readCallbackIt != readCallbacks_.end() &&
+          readCallbackIt->second.readCb) {
+        readCallbackIt->second.readCb->readError(id, {error, errorMsg});
+      }
+      peekCallbacks_.erase(id);
+      stopSending(id, error);
+    }
+  }
+}
+
+void QuicTransportBase::addObserver(Observer* observer) {
+  // adding the same observer multiple times is not allowed
+  CHECK(
+      std::find(observers_->begin(), observers_->end(), observer) ==
+      observers_->end());
+
+  observers_->push_back(CHECK_NOTNULL(observer));
   observer->observerAttach(this);
 }
 
-bool QuicTransportBase::removeLifecycleObserver(LifecycleObserver* observer) {
-  const auto eraseIt = std::remove(
-      lifecycleObservers_.begin(), lifecycleObservers_.end(), observer);
-  if (eraseIt == lifecycleObservers_.end()) {
+bool QuicTransportBase::removeObserver(Observer* observer) {
+  auto it = std::find(observers_->begin(), observers_->end(), observer);
+  if (it == observers_->end()) {
     return false;
   }
-
-  for (auto it = eraseIt; it != lifecycleObservers_.end(); it++) {
-    (*it)->observerDetach(this);
-  }
-  lifecycleObservers_.erase(eraseIt, lifecycleObservers_.end());
+  observer->observerDetach(this);
+  observers_->erase(it);
   return true;
 }
 
-const QuicTransportBase::LifecycleObserverVec&
-QuicTransportBase::getLifecycleObservers() const {
-  return lifecycleObservers_;
+const ObserverVec& QuicTransportBase::getObservers() const {
+  return *observers_;
 }
 
-void QuicTransportBase::addInstrumentationObserver(
-    InstrumentationObserver* observer) {
-  conn_->instrumentationObservers_.push_back(CHECK_NOTNULL(observer));
-}
-
-bool QuicTransportBase::removeInstrumentationObserver(
-    InstrumentationObserver* observer) {
-  const auto eraseIt = std::remove(
-      conn_->instrumentationObservers_.begin(),
-      conn_->instrumentationObservers_.end(),
-      observer);
-  if (eraseIt == conn_->instrumentationObservers_.end()) {
-    return false;
+QuicConnectionStats QuicTransportBase::getConnectionsStats() const {
+  QuicConnectionStats connStats;
+  if (!conn_) {
+    return connStats;
+  }
+  connStats.peerAddress = conn_->peerAddress;
+  connStats.duration = Clock::now() - conn_->connectionTime;
+  if (conn_->congestionController) {
+    connStats.cwnd_bytes = conn_->congestionController->getCongestionWindow();
+    connStats.congestionController = conn_->congestionController->type();
+    conn_->congestionController->getStats(connStats.congestionControllerStats);
+  }
+  connStats.ptoCount = conn_->lossState.ptoCount;
+  connStats.srtt = conn_->lossState.srtt;
+  connStats.rttvar = conn_->lossState.rttvar;
+  connStats.peerAckDelayExponent = conn_->peerAckDelayExponent;
+  connStats.udpSendPacketLen = conn_->udpSendPacketLen;
+  if (conn_->streamManager) {
+    connStats.numStreams = conn_->streamManager->streams().size();
   }
 
-  for (auto it = eraseIt; it != conn_->instrumentationObservers_.end(); it++) {
-    (*it)->observerDetach(this);
+  if (conn_->clientChosenDestConnectionId.hasValue()) {
+    connStats.clientChosenDestConnectionId =
+        conn_->clientChosenDestConnectionId->hex();
   }
-  conn_->instrumentationObservers_.erase(
-      eraseIt, conn_->instrumentationObservers_.end());
-  return true;
+  if (conn_->clientConnectionId.hasValue()) {
+    connStats.clientConnectionId = conn_->clientConnectionId->hex();
+  }
+  if (conn_->serverConnectionId.hasValue()) {
+    connStats.serverConnectionId = conn_->serverConnectionId->hex();
+  }
+
+  connStats.totalBytesSent = conn_->lossState.totalBytesSent;
+  connStats.totalBytesReceived = conn_->lossState.totalBytesRecvd;
+  connStats.totalBytesRetransmitted = conn_->lossState.totalBytesRetransmitted;
+  if (conn_->version.hasValue()) {
+    connStats.version = static_cast<uint32_t>(*conn_->version);
+  }
+  return connStats;
 }
 
-const InstrumentationObserverVec&
-QuicTransportBase::getInstrumentationObservers() const {
-  return conn_->instrumentationObservers_;
+folly::Expected<folly::Unit, LocalErrorCode>
+QuicTransportBase::setDatagramCallback(DatagramCallback* cb) {
+  if (closeState_ != CloseState::OPEN) {
+    return folly::makeUnexpected(LocalErrorCode::CONNECTION_CLOSED);
+  }
+  VLOG(4) << "Setting datagram callback "
+          << " cb=" << cb << " " << *this;
+
+  datagramCallback_ = cb;
+  updateReadLooper();
+  return folly::unit;
+}
+
+uint16_t QuicTransportBase::getDatagramSizeLimit() const {
+  CHECK(conn_);
+  return conn_->datagramState.maxWriteFrameSize;
+}
+
+folly::Expected<folly::Unit, LocalErrorCode> QuicTransportBase::writeDatagram(
+    Buf buf) {
+  if (conn_->datagramState.writeBuffer.size() >=
+          conn_->datagramState.maxWriteBufferSize ||
+      // TODO(lniccolini) update max datagram frame size
+      // https://github.com/quicwg/datagram/issues/3
+      // For now, max_datagram_size > 0 means the peer supports datagram frames
+      conn_->datagramState.maxWriteFrameSize == 0) {
+    // TODO(lniccolini) use different return codes to signal the application
+    // exactly why the datagram got dropped
+    return folly::makeUnexpected(LocalErrorCode::INVALID_WRITE_DATA);
+  }
+  conn_->datagramState.writeBuffer.emplace_back(std::move(buf));
+  return folly::unit;
+}
+
+folly::Expected<std::vector<Buf>, LocalErrorCode>
+QuicTransportBase::readDatagrams(size_t atMost) {
+  CHECK(conn_);
+  auto datagrams = &conn_->datagramState.readBuffer;
+  if (closeState_ != CloseState::OPEN) {
+    return folly::makeUnexpected(LocalErrorCode::CONNECTION_CLOSED);
+  }
+  if (atMost == 0) {
+    atMost = datagrams->size();
+  } else {
+    atMost = std::min(atMost, datagrams->size());
+  }
+  std::vector<Buf> retDatagrams;
+  retDatagrams.reserve(atMost);
+  std::transform(
+      datagrams->begin(),
+      datagrams->begin() + atMost,
+      std::back_inserter(retDatagrams),
+      [](BufQueue& bq) { return bq.move(); });
+  datagrams->erase(datagrams->begin(), datagrams->begin() + atMost);
+  return retDatagrams;
 }
 
 void QuicTransportBase::writeSocketData() {
   if (socket_) {
+    // record this invocation of a new write to the socket
+    ++(conn_->writeCount);
     auto packetsBefore = conn_->outstandings.numOutstanding();
+    // Signal Observers the POTENTIAL start of a Write Block.
+    if (conn_->waitingForAppData && conn_->congestionController) {
+      notifyStartWritingFromAppRateLimited();
+      conn_->waitingForAppData = false;
+    }
     writeData();
     if (closeState_ != CloseState::CLOSED) {
       if (conn_->pendingEvents.closeTransport == true) {
@@ -2738,6 +2769,12 @@ void QuicTransportBase::writeSocketData() {
       setLossDetectionAlarm(*conn_, *this);
       auto packetsAfter = conn_->outstandings.numOutstanding();
       bool packetWritten = (packetsAfter > packetsBefore);
+      // Signal the Observers that *some* packets were written
+      // These may/may not be app data packets, it it up to the Observers
+      // to deal with these packets.
+      if (packetWritten && conn_->congestionController) {
+        notifyPacketsWritten();
+      }
       if (conn_->loopDetectorCallback && packetWritten) {
         conn_->writeDebugState.currentEmptyLoopCount = 0;
       } else if (
@@ -2771,11 +2808,10 @@ void QuicTransportBase::writeSocketData() {
           currentSendBufLen < conn_->udpSendPacketLen && lossBufferEmpty &&
           conn_->congestionController->getWritableBytes()) {
         conn_->congestionController->setAppLimited();
-        // notify via connection call and any instrumentation callbacks
+        // notify via connection call and any observer callbacks
         connCallback_->onAppRateLimited();
-        for (const auto& cb : conn_->instrumentationObservers_) {
-          cb->appRateLimited(this);
-        }
+        notifyAppRateLimited();
+        conn_->waitingForAppData = true;
       }
     }
   }
@@ -2848,11 +2884,14 @@ void QuicTransportBase::setTransportSettings(
         conn_->transportSettings.minCwndInMss,
         conn_->transportSettings.initCwndInMss);
   }
-  setCongestionControl(transportSettings.defaultCongestionController);
+
+  validateCongestionAndPacing(
+      conn_->transportSettings.defaultCongestionController);
   if (conn_->transportSettings.pacingEnabled) {
     if (writeLooper_->hasPacingTimer()) {
-      bool usingBbr = conn_->congestionController &&
-          (conn_->congestionController->type() == CongestionControlType::BBR);
+      bool usingBbr =
+          (conn_->transportSettings.defaultCongestionController ==
+           CongestionControlType::BBR);
       auto minCwnd = usingBbr ? kMinCwndInMssForBbr
                               : conn_->transportSettings.minCwndInMss;
       conn_->pacer = std::make_unique<TokenlessPacer>(*conn_, minCwnd);
@@ -2860,6 +2899,10 @@ void QuicTransportBase::setTransportSettings(
       LOG(ERROR) << "Pacing cannot be enabled without a timer";
       conn_->transportSettings.pacingEnabled = false;
     }
+  }
+  setCongestionControl(conn_->transportSettings.defaultCongestionController);
+  if (conn_->transportSettings.datagramConfig.enabled) {
+    conn_->datagramState.maxReadFrameSize = kMaxDatagramFrameSize;
   }
 }
 
@@ -2906,10 +2949,6 @@ const TransportSettings& QuicTransportBase::getTransportSettings() const {
   return conn_->transportSettings;
 }
 
-bool QuicTransportBase::isPartiallyReliableTransport() const {
-  return conn_->partialReliabilityEnabled;
-}
-
 folly::Expected<folly::Unit, LocalErrorCode>
 QuicTransportBase::setStreamPriority(
     StreamId id,
@@ -2935,22 +2974,38 @@ QuicTransportBase::setStreamPriority(
   return folly::unit;
 }
 
+folly::Expected<Priority, LocalErrorCode> QuicTransportBase::getStreamPriority(
+    StreamId id) {
+  if (closeState_ != CloseState::OPEN) {
+    return folly::makeUnexpected(LocalErrorCode::CONNECTION_CLOSED);
+  }
+  auto stream = conn_->streamManager->findStream(id);
+  if (!stream) {
+    return folly::makeUnexpected(LocalErrorCode::STREAM_NOT_EXISTS);
+  }
+  return stream->priority;
+}
+
+void QuicTransportBase::validateCongestionAndPacing(
+    CongestionControlType& type) {
+  // Fallback to Cubic if Pacing isn't enabled with BBR together
+  if (type == CongestionControlType::BBR &&
+      (!conn_->transportSettings.pacingEnabled ||
+       !writeLooper_->hasPacingTimer())) {
+    LOG(ERROR) << "Unpaced BBR isn't supported";
+    type = CongestionControlType::Cubic;
+  }
+}
+
 void QuicTransportBase::setCongestionControl(CongestionControlType type) {
   DCHECK(conn_);
   if (!conn_->congestionController ||
       type != conn_->congestionController->type()) {
-    CHECK(ccFactory_);
-
-    // Fallback to Cubic if Pacing isn't enabled with BBR together
-    if (type == CongestionControlType::BBR &&
-        (!conn_->transportSettings.pacingEnabled ||
-         !writeLooper_->hasPacingTimer())) {
-      LOG(ERROR) << "Unpaced BBR isn't supported";
-      type = CongestionControlType::Cubic;
-    }
-
+    CHECK(conn_->congestionControllerFactory);
+    validateCongestionAndPacing(type);
     conn_->congestionController =
-        ccFactory_->makeCongestionController(*conn_, type);
+        conn_->congestionControllerFactory->makeCongestionController(
+            *conn_, type);
   }
 }
 
@@ -2979,8 +3034,10 @@ void QuicTransportBase::attachEventBase(folly::EventBase* evb) {
   updatePeekLooper();
   updateWriteLooper(false);
 
-  for (const auto& cb : lifecycleObservers_) {
-    cb->evbAttach(this, evb_);
+  for (const auto& cb : *observers_) {
+    if (cb->getConfig().evbEvents) {
+      cb->evbAttach(this, evb_);
+    }
   }
 }
 
@@ -3001,8 +3058,10 @@ void QuicTransportBase::detachEventBase() {
   peekLooper_->detachEventBase();
   writeLooper_->detachEventBase();
 
-  for (const auto& cb : lifecycleObservers_) {
-    cb->evbDetach(this, evb_);
+  for (const auto& cb : *observers_) {
+    if (cb->getConfig().evbEvents) {
+      cb->evbDetach(this, evb_);
+    }
   }
   evb_ = nullptr;
 }
@@ -3064,10 +3123,11 @@ QuicTransportBase::getStreamTransportInfo(StreamId id) const {
   }
   auto stream = conn_->streamManager->getStream(id);
   auto packets = getNumPacketsTxWithNewData(*stream);
-  return StreamTransportInfo{stream->totalHolbTime,
-                             stream->holbCount,
-                             bool(stream->lastHolbTime),
-                             packets};
+  return StreamTransportInfo{
+      stream->totalHolbTime,
+      stream->holbCount,
+      bool(stream->lastHolbTime),
+      packets};
 }
 
 void QuicTransportBase::describe(std::ostream& os) const {
@@ -3138,6 +3198,88 @@ void QuicTransportBase::onTransportKnobs(Buf knobBlob) {
           << std::string(
                  reinterpret_cast<const char*>(knobBlob->data()),
                  knobBlob->length());
+}
+
+QuicSocket::WriteResult QuicTransportBase::setDSRPacketizationRequestSender(
+    StreamId id,
+    std::unique_ptr<DSRPacketizationRequestSender> sender) {
+  if (closeState_ != CloseState::OPEN) {
+    return folly::makeUnexpected(LocalErrorCode::CONNECTION_CLOSED);
+  }
+  if (isReceivingStream(conn_->nodeType, id)) {
+    return folly::makeUnexpected(LocalErrorCode::INVALID_OPERATION);
+  }
+  FOLLY_MAYBE_UNUSED auto self = sharedGuard();
+  try {
+    // Check whether stream exists before calling getStream to avoid
+    // creating a peer stream if it does not exist yet.
+    if (!conn_->streamManager->streamExists(id)) {
+      return folly::makeUnexpected(LocalErrorCode::STREAM_NOT_EXISTS);
+    }
+    auto stream = conn_->streamManager->getStream(id);
+    if (!stream->writable()) {
+      return folly::makeUnexpected(LocalErrorCode::STREAM_CLOSED);
+    }
+    if (stream->dsrSender != nullptr) {
+      return folly::makeUnexpected(LocalErrorCode::INVALID_OPERATION);
+    }
+    stream->dsrSender = std::move(sender);
+    // Fow now, no appLimited or appIdle update here since we are not writing
+    // either BufferMetas yet. The first BufferMeta write will update it.
+  } catch (const QuicTransportException& ex) {
+    VLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
+            << *this;
+    exceptionCloseWhat_ = ex.what();
+    closeImpl(std::make_pair(
+        QuicErrorCode(ex.errorCode()), std::string("writeChain() error")));
+    return folly::makeUnexpected(LocalErrorCode::TRANSPORT_ERROR);
+  } catch (const QuicInternalException& ex) {
+    VLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
+            << *this;
+    exceptionCloseWhat_ = ex.what();
+    closeImpl(std::make_pair(
+        QuicErrorCode(ex.errorCode()), std::string("writeChain() error")));
+    return folly::makeUnexpected(ex.errorCode());
+  } catch (const std::exception& ex) {
+    VLOG(4) << __func__ << " streamId=" << id << " " << ex.what() << " "
+            << *this;
+    exceptionCloseWhat_ = ex.what();
+    closeImpl(std::make_pair(
+        QuicErrorCode(TransportErrorCode::INTERNAL_ERROR),
+        std::string("writeChain() error")));
+    return folly::makeUnexpected(LocalErrorCode::INTERNAL_ERROR);
+  }
+  return folly::unit;
+}
+
+void QuicTransportBase::notifyStartWritingFromAppRateLimited() {
+  Observer::AppLimitedEvent startWritingFromAppLimitedEvent(
+      conn_->outstandings.packets, conn_->writeCount);
+  for (const auto& cb : *observers_) {
+    if (cb->getConfig().appRateLimitedEvents) {
+      cb->startWritingFromAppLimited(this, startWritingFromAppLimitedEvent);
+    }
+  }
+}
+
+void QuicTransportBase::notifyPacketsWritten() {
+  Observer::AppLimitedEvent packetsWrittenEvent(
+      conn_->outstandings.packets, conn_->writeCount);
+  for (const auto& cb : *observers_) {
+    if (cb->getConfig().packetsWrittenEvents) {
+      cb->packetsWritten(this, packetsWrittenEvent);
+    }
+  }
+}
+
+void QuicTransportBase::notifyAppRateLimited() {
+  Observer::AppLimitedEvent appRateLimitedEvent(
+      conn_->outstandings.packets, conn_->writeCount);
+  for (const auto& cb : *observers_) {
+    if (cb->getConfig().appRateLimitedEvents) {
+      cb->appRateLimited(this, appRateLimitedEvent);
+    }
+  }
 }
 
 } // namespace quic

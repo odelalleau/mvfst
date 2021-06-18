@@ -13,20 +13,6 @@ void addQuicSimpleFrameToEvent(
           frame.streamId, frame.errorCode));
       break;
     }
-    case quic::QuicSimpleFrame::Type::MinStreamDataFrame: {
-      const quic::MinStreamDataFrame& frame =
-          *simpleFrame.asMinStreamDataFrame();
-      event->frames.push_back(std::make_unique<quic::MinStreamDataFrameLog>(
-          frame.streamId, frame.maximumData, frame.minimumStreamOffset));
-      break;
-    }
-    case quic::QuicSimpleFrame::Type::ExpiredStreamDataFrame: {
-      const quic::ExpiredStreamDataFrame& frame =
-          *simpleFrame.asExpiredStreamDataFrame();
-      event->frames.push_back(std::make_unique<quic::ExpiredStreamDataFrameLog>(
-          frame.streamId, frame.minimumStreamOffset));
-      break;
-    }
     case quic::QuicSimpleFrame::Type::PathChallengeFrame: {
       const quic::PathChallengeFrame& frame =
           *simpleFrame.asPathChallengeFrame();
@@ -69,6 +55,15 @@ void addQuicSimpleFrameToEvent(
       const quic::KnobFrame& frame = *simpleFrame.asKnobFrame();
       event->frames.push_back(std::make_unique<quic::KnobFrameLog>(
           frame.knobSpace, frame.id, frame.blob->length()));
+      break;
+    }
+    case quic::QuicSimpleFrame::Type::AckFrequencyFrame: {
+      const quic::AckFrequencyFrame& frame = *simpleFrame.asAckFrequencyFrame();
+      event->frames.push_back(std::make_unique<quic::AckFrequencyFrameLog>(
+          frame.sequenceNumber,
+          frame.packetTolerance,
+          frame.updateMaxAckDelay,
+          frame.ignoreOrder));
       break;
     }
   }
@@ -169,15 +164,20 @@ std::unique_ptr<QLogPacketEvent> BaseQLogger::createPacketEvent(
         event->frames.push_back(std::make_unique<ReadNewTokenFrameLog>());
         break;
       }
-      case QuicFrame::Type::PingFrame:
+      case QuicFrame::Type::PingFrame: {
         event->frames.push_back(std::make_unique<quic::PingFrameLog>());
         break;
+      }
       case QuicFrame::Type::QuicSimpleFrame: {
         const auto& simpleFrame = *quicFrame.asQuicSimpleFrame();
         addQuicSimpleFrameToEvent(event.get(), simpleFrame);
         break;
       }
       case QuicFrame::Type::NoopFrame: {
+        break;
+      }
+      case QuicFrame::Type::DatagramFrame: {
+        // TODO
         break;
       }
     }
@@ -279,8 +279,16 @@ std::unique_ptr<QLogPacketEvent> BaseQLogger::createPacketEvent(
         addQuicSimpleFrameToEvent(event.get(), simpleFrame);
         break;
       }
-      default:
+      case QuicWriteFrame::Type::NoopFrame: {
         break;
+      }
+      case QuicWriteFrame::Type::DatagramFrame: {
+        // TODO
+        break;
+      }
+      default: {
+        break;
+      }
     }
   }
   if (numPaddingFrames > 0) {

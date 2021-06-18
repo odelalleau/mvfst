@@ -7,6 +7,7 @@
  */
 
 #include <quic/server/CCPReader.h>
+
 #include <quic/QuicConstants.h>
 #include <quic/common/Timers.h>
 #include <quic/congestion_control/QuicCCP.h>
@@ -114,9 +115,15 @@ uint64_t _ccp_after_usecs(uint64_t usecs) {
 
 CCPReader::CCPReader() = default;
 
-void CCPReader::try_initialize(folly::EventBase* evb, uint8_t id) {
+void CCPReader::try_initialize(
+    folly::EventBase* evb,
+    uint64_t ccpId,
+    uint64_t parentServerId,
+    uint8_t parentWorkerId) {
   evb_ = evb;
-  parentWorkerId_ = id;
+  ccpId_ = ccpId;
+  serverId_ = parentServerId;
+  workerId_ = parentWorkerId;
 
   // Even though it is technically called an Async*UDP*Socket by folly,
   // this is really a unix socket!
@@ -130,6 +137,10 @@ void CCPReader::try_initialize(folly::EventBase* evb, uint8_t id) {
   // connections that are currently active. The index is the connection id.
   struct ccp_connection* active_connections = (struct ccp_connection*)calloc(
       MAX_CONCURRENT_CONNECTIONS_LIBCCP, sizeof(struct ccp_connection));
+  if (active_connections == nullptr) {
+    LOG(ERROR) << "[ccp] failed to allocate per-connection data structure";
+    return;
+  }
 
   // Giving libccp a reference to all of the callbacks
   ccpDatapath_.set_cwnd = &_ccp_set_cwnd;
@@ -155,33 +166,31 @@ void CCPReader::try_initialize(folly::EventBase* evb, uint8_t id) {
     LOG(ERROR) << "[ccp] ccp_init failed ret=" << ret;
     throw std::runtime_error("internal bug: unable to interface with libccp");
   }
+}
 
+int CCPReader::connect() {
   // This message registers us with CCP. CCP ignores messages from
   // datapaths that have not yet registered with it. It identifies a datapath
   // by the sending address (/ccp/mvfst{id}).
   char ready_buf[READY_MSG_SIZE];
-  int wrote = write_ready_msg(ready_buf, READY_MSG_SIZE, parentWorkerId_);
+  int wrote = write_ready_msg(ready_buf, READY_MSG_SIZE, workerId_);
   std::unique_ptr<folly::IOBuf> ready_msg =
       folly::IOBuf::wrapBuffer(ready_buf, wrote);
-  ret = writeOwnedBuffer(std::move(ready_msg));
+  int ret = writeOwnedBuffer(std::move(ready_msg));
   // Since we start ccp within a separate thread from QuicServer, its possible
   // that it hasn't been scheduled yet when we send this message, in which case
   // we will get an unable to connet to socket error (111). If this happens,
-  // sleep a bit and then retry. If after a few tries we still can't connect,
-  // then something is probably wrong with CCP and we should exit.
-  int tries = 1;
-  while (ret == -1 && errno == 111 && tries < MAX_CCP_CONNECT_RETRIES) {
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(CCP_CONNECT_RETRY_WAIT_US));
-    ready_msg = folly::IOBuf::wrapBuffer(ready_buf, wrote);
-    ret = writeOwnedBuffer(std::move(ready_msg));
-    tries += 1;
-  }
+  // we return a failure and expected the caller to wait and retry later.
+  // If we can't connect after a few tries then something is probably wrong
+  // with CCP and we should give up.
   if (ret < 0) {
-    LOG(ERROR) << "[ccp] write_ready_msg failed after " << tries
-               << " tries ret=" << ret << " errno=" << errno;
-    throw std::runtime_error("unable to connect to ccp");
+    LOG(ERROR) << "[ccp] write_ready_msg failed ret=" << ret
+               << " errno=" << errno;
+  } else {
+    LOG(INFO) << "[ccp] write_ready_msg success";
+    initialized_ = true;
   }
+  return ret;
 }
 
 folly::EventBase* CCPReader::getEventBase() const {
@@ -204,8 +213,10 @@ void CCPReader::bind() {
   // names appear with an @ as the first character to denote the null byte.
   std::string recvPath(1, 0);
   recvPath.append(CCP_UNIX_BASE);
+  recvPath.append(
+      std::to_string(ccpId_) + "/" + std::to_string(serverId_) + "/");
   recvPath.append(FROM_CCP);
-  recvPath.append(std::to_string(parentWorkerId_));
+  recvPath.append(std::to_string(workerId_));
   recvAddr_.setFromPath(recvPath);
   ccpSocket_->bind(recvAddr_);
 
@@ -214,6 +225,7 @@ void CCPReader::bind() {
   // address.
   std::string sendPath(1, 0);
   sendPath.append(CCP_UNIX_BASE);
+  sendPath.append(std::to_string(ccpId_) + "/");
   sendPath.append(TO_CCP);
   sendAddr_.setFromPath(sendPath);
 }
@@ -274,11 +286,11 @@ ssize_t CCPReader::writeOwnedBuffer(std::unique_ptr<folly::IOBuf> buf) {
 }
 
 uint8_t CCPReader::getWorkerId() const noexcept {
-  return parentWorkerId_;
+  return workerId_;
 }
 
 struct ccp_datapath* CCPReader::getDatapath() noexcept {
-  return &ccpDatapath_;
+  return initialized_ ? &ccpDatapath_ : nullptr;
 }
 
 void CCPReader::shutdown() {
@@ -290,26 +302,31 @@ void CCPReader::shutdown() {
     }
     ccpSocket_ = nullptr;
   }
+  if (ccpDatapath_.ccp_active_connections) {
+    free(ccpDatapath_.ccp_active_connections);
+  }
+  ccp_free(&ccpDatapath_);
 }
 
 CCPReader::~CCPReader() {
   // We allocated the list of active connections and ccp_datapath struct,
   // so we are responsible for freeing them
-  if (ccpDatapath_.ccp_active_connections) {
-    free(ccpDatapath_.ccp_active_connections);
-  }
-  ccp_free(&ccpDatapath_);
   shutdown();
 }
 
 #else // Empty method placeholders for when ccp is not enabled:
 
 CCPReader::CCPReader() = default;
-void CCPReader::try_initialize(folly::EventBase* evb, uint8_t id) {
+void CCPReader::try_initialize(
+    folly::EventBase* evb,
+    uint64_t,
+    uint64_t,
+    uint8_t) {
   evb_ = evb;
-  parentWorkerId_ = id;
 }
-
+int CCPReader::connect() {
+  return 0;
+}
 folly::EventBase* CCPReader::getEventBase() const {
   return evb_;
 }
@@ -328,7 +345,7 @@ ssize_t CCPReader::writeOwnedBuffer(std::unique_ptr<folly::IOBuf>) {
   return 0;
 }
 uint8_t CCPReader::getWorkerId() const noexcept {
-  return parentWorkerId_;
+  return workerId_;
 }
 void CCPReader::shutdown() {}
 CCPReader::~CCPReader() = default;

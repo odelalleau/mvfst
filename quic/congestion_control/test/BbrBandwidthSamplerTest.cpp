@@ -9,6 +9,7 @@
 // Copyright 2004-present Facebook.  All rights reserved.
 
 #include <quic/congestion_control/BbrBandwidthSampler.h>
+
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
 #include <quic/common/test/TestUtils.h>
@@ -49,7 +50,7 @@ TEST_F(BbrBandwidthSamplerTest, NoPreviousAckedPacketFallback) {
       makeTestingWritePacket(0, 1000, 1000, sentTime)));
   ackEvent.ackTime = sentTime + 50ms;
   sampler.onPacketAcked(ackEvent, 0);
-  EXPECT_EQ(1000, sampler.getBandwidth().units);
+  EXPECT_EQ(5000, sampler.getBandwidth().units);
   EXPECT_EQ(50ms, sampler.getBandwidth().interval);
 }
 

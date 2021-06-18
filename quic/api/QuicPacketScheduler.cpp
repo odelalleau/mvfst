@@ -145,11 +145,6 @@ FrameScheduler::Builder::Builder(
       packetNumberSpace_(packetNumberSpace),
       name_(std::move(name)) {}
 
-FrameScheduler::Builder& FrameScheduler::Builder::streamRetransmissions() {
-  retransmissionScheduler_ = true;
-  return *this;
-}
-
 FrameScheduler::Builder& FrameScheduler::Builder::streamFrames() {
   streamFrameScheduler_ = true;
   return *this;
@@ -190,11 +185,13 @@ FrameScheduler::Builder& FrameScheduler::Builder::pingFrames() {
   return *this;
 }
 
+FrameScheduler::Builder& FrameScheduler::Builder::datagramFrames() {
+  datagramFrameScheduler_ = true;
+  return *this;
+}
+
 FrameScheduler FrameScheduler::Builder::build() && {
   FrameScheduler scheduler(std::move(name_));
-  if (retransmissionScheduler_) {
-    scheduler.retransmissionScheduler_.emplace(RetransmissionScheduler(conn_));
-  }
   if (streamFrameScheduler_) {
     scheduler.streamFrameScheduler_.emplace(StreamFrameScheduler(conn_));
   }
@@ -221,6 +218,9 @@ FrameScheduler FrameScheduler::Builder::build() && {
   if (pingFrameScheduler_) {
     scheduler.pingFrameScheduler_.emplace(PingFrameScheduler(conn_));
   }
+  if (datagramFrameScheduler_) {
+    scheduler.datagramFrameScheduler_.emplace(DatagramFrameScheduler(conn_));
+  }
   return scheduler;
 }
 
@@ -234,7 +234,7 @@ SchedulingResult FrameScheduler::scheduleFramesForPacket(
   writableBytes = writableBytes > builder.getHeaderBytes()
       ? writableBytes - builder.getHeaderBytes()
       : 0;
-  // We cannot return early if the writablyBytes dropps to 0 here, since pure
+  // We cannot return early if the writablyBytes drops to 0 here, since pure
   // acks can skip writableBytes entirely.
   PacketBuilderWrapper wrapper(builder, writableBytes);
   bool cryptoDataWritten = false;
@@ -279,11 +279,12 @@ SchedulingResult FrameScheduler::scheduleFramesForPacket(
   if (pingFrameScheduler_ && pingFrameScheduler_->hasPingFrame()) {
     pingFrameScheduler_->writePing(wrapper);
   }
-  if (retransmissionScheduler_ && retransmissionScheduler_->hasPendingData()) {
-    retransmissionScheduler_->writeRetransmissionStreams(wrapper);
-  }
   if (streamFrameScheduler_ && streamFrameScheduler_->hasPendingData()) {
     streamFrameScheduler_->writeStreams(wrapper);
+  }
+  if (datagramFrameScheduler_ &&
+      datagramFrameScheduler_->hasPendingDatagramFrames()) {
+    datagramFrameScheduler_->writeDatagramFrames(wrapper);
   }
 
   if (builder.hasFramesPending()) {
@@ -308,8 +309,6 @@ bool FrameScheduler::hasData() const {
 
 bool FrameScheduler::hasImmediateData() const {
   return (cryptoStreamScheduler_ && cryptoStreamScheduler_->hasData()) ||
-      (retransmissionScheduler_ &&
-       retransmissionScheduler_->hasPendingData()) ||
       (streamFrameScheduler_ && streamFrameScheduler_->hasPendingData()) ||
       (rstScheduler_ && rstScheduler_->hasPendingRsts()) ||
       (windowUpdateScheduler_ &&
@@ -317,31 +316,26 @@ bool FrameScheduler::hasImmediateData() const {
       (blockedScheduler_ && blockedScheduler_->hasPendingBlockedFrames()) ||
       (simpleFrameScheduler_ &&
        simpleFrameScheduler_->hasPendingSimpleFrames()) ||
-      (pingFrameScheduler_ && pingFrameScheduler_->hasPingFrame());
+      (pingFrameScheduler_ && pingFrameScheduler_->hasPingFrame()) ||
+      (datagramFrameScheduler_ &&
+       datagramFrameScheduler_->hasPendingDatagramFrames());
 }
 
 folly::StringPiece FrameScheduler::name() const {
   return name_;
 }
 
-RetransmissionScheduler::RetransmissionScheduler(
-    const QuicConnectionStateBase& conn)
-    : conn_(conn) {}
-
-// Return true if this stream wrote some data
-bool RetransmissionScheduler::writeStreamLossBuffers(
+bool StreamFrameScheduler::writeStreamLossBuffers(
     PacketBuilderInterface& builder,
-    StreamId id) {
-  auto stream = conn_.streamManager->findStream(id);
-  CHECK(stream);
+    QuicStreamState& stream) {
   bool wroteStreamFrame = false;
-  for (auto buffer = stream->lossBuffer.cbegin();
-       buffer != stream->lossBuffer.cend();
+  for (auto buffer = stream.lossBuffer.cbegin();
+       buffer != stream.lossBuffer.cend();
        ++buffer) {
     auto bufferLen = buffer->data.chainLength();
     auto dataLen = writeStreamFrameHeader(
         builder,
-        stream->id,
+        stream.id,
         buffer->offset,
         bufferLen, // writeBufferLen -- only the len of the single buffer.
         bufferLen, // flowControlLen -- not relevant, already flow controlled.
@@ -350,7 +344,7 @@ bool RetransmissionScheduler::writeStreamLossBuffers(
     if (dataLen) {
       wroteStreamFrame = true;
       writeStreamFrameData(builder, buffer->data, *dataLen);
-      VLOG(4) << "Wrote retransmitted stream=" << stream->id
+      VLOG(4) << "Wrote loss data for stream=" << stream.id
               << " offset=" << buffer->offset << " bytes=" << *dataLen
               << " fin=" << (buffer->eof && *dataLen == bufferLen) << " "
               << conn_;
@@ -362,47 +356,25 @@ bool RetransmissionScheduler::writeStreamLossBuffers(
   return wroteStreamFrame;
 }
 
-void RetransmissionScheduler::writeRetransmissionStreams(
-    PacketBuilderInterface& builder) {
-  auto& lossStreams = conn_.streamManager->lossStreams();
-  for (size_t index = 0;
-       index < lossStreams.levels.size() && builder.remainingSpaceInPkt() > 0;
-       index++) {
-    auto& level = lossStreams.levels[index];
-    if (level.streams.empty()) {
-      // No data here, keep going
-      continue;
-    }
-    if (level.incremental) {
-      // Round robin the streams at this level
-      MiddleStartingIterationWrapper wrapper(level.streams, level.next);
-      auto writableStreamItr = wrapper.cbegin();
-      while (writableStreamItr != wrapper.cend()) {
-        if (writeStreamLossBuffers(builder, *writableStreamItr)) {
-          writableStreamItr++;
-        } else {
-          // We didn't write anything
-          break;
-        }
-      }
-      level.next = writableStreamItr.rawIterator();
-    } else {
-      // walk the sequential streams in order until we run out of space
-      for (auto stream : level.streams) {
-        if (!writeStreamLossBuffers(builder, stream)) {
-          break;
-        }
-      }
-    }
-  }
-}
-
-bool RetransmissionScheduler::hasPendingData() const {
-  return !conn_.streamManager->lossStreams().empty();
-}
-
 StreamFrameScheduler::StreamFrameScheduler(QuicConnectionStateBase& conn)
     : conn_(conn) {}
+
+bool StreamFrameScheduler::writeSingleStream(
+    PacketBuilderInterface& builder,
+    QuicStreamState& stream,
+    uint64_t& connWritableBytes) {
+  if (!stream.lossBuffer.empty()) {
+    if (!writeStreamLossBuffers(builder, stream)) {
+      return false;
+    }
+  }
+  if (stream.hasWritableData() && connWritableBytes > 0) {
+    if (!writeStreamFrame(builder, stream, connWritableBytes)) {
+      return false;
+    }
+  }
+  return true;
+}
 
 StreamId StreamFrameScheduler::writeStreamsHelper(
     PacketBuilderInterface& builder,
@@ -416,14 +388,14 @@ StreamId StreamFrameScheduler::writeStreamsHelper(
   // stream id. The iterator will wrap around the collection at the end, and we
   // keep track of the value at the next iteration. This allows us to start
   // writing at the next stream when building the next packet.
-  // TODO experiment with writing streams with an actual prioritization scheme.
-  while (writableStreamItr != wrapper.cend() && connWritableBytes > 0) {
-    if (writeNextStreamFrame(builder, *writableStreamItr, connWritableBytes)) {
-      writableStreamItr++;
-      if (streamPerPacket) {
-        break;
-      }
-    } else {
+  while (writableStreamItr != wrapper.cend()) {
+    auto stream = conn_.streamManager->findStream(*writableStreamItr);
+    CHECK(stream);
+    if (!writeSingleStream(builder, *stream, connWritableBytes)) {
+      break;
+    }
+    writableStreamItr++;
+    if (streamPerPacket) {
       break;
     }
   }
@@ -437,7 +409,7 @@ void StreamFrameScheduler::writeStreamsHelper(
     bool streamPerPacket) {
   // Fill a packet with non-control stream data, in priority order
   for (size_t index = 0; index < writableStreams.levels.size() &&
-       builder.remainingSpaceInPkt() > 0 && connWritableBytes > 0;
+       builder.remainingSpaceInPkt() > 0;
        index++) {
     PriorityQueue::Level& level = writableStreams.levels[index];
     if (level.streams.empty()) {
@@ -448,18 +420,16 @@ void StreamFrameScheduler::writeStreamsHelper(
       // Round robin the streams at this level
       MiddleStartingIterationWrapper wrapper(level.streams, level.next);
       auto writableStreamItr = wrapper.cbegin();
-      while (writableStreamItr != wrapper.cend() && connWritableBytes > 0) {
-        if (writeNextStreamFrame(
-                builder, *writableStreamItr, connWritableBytes)) {
-          writableStreamItr++;
-          if (streamPerPacket) {
-            level.next = writableStreamItr.rawIterator();
-            return;
-          }
-        } else {
-          // Either we filled the packet, ran out of flow control,
-          // or ran out of data at this level
+      while (writableStreamItr != wrapper.cend()) {
+        auto stream = conn_.streamManager->findStream(*writableStreamItr);
+        CHECK(stream);
+        if (!writeSingleStream(builder, *stream, connWritableBytes)) {
           break;
+        }
+        writableStreamItr++;
+        if (streamPerPacket) {
+          level.next = writableStreamItr.rawIterator();
+          return;
         }
       }
       level.next = writableStreamItr.rawIterator();
@@ -468,9 +438,12 @@ void StreamFrameScheduler::writeStreamsHelper(
       for (auto streamIt = level.streams.begin();
            streamIt != level.streams.end() && connWritableBytes > 0;
            ++streamIt) {
-        if (!writeNextStreamFrame(builder, *streamIt, connWritableBytes)) {
+        auto stream = conn_.streamManager->findStream(*streamIt);
+        CHECK(stream);
+        if (!writeSingleStream(builder, *stream, connWritableBytes)) {
           break;
-        } else if (streamPerPacket) {
+        }
+        if (streamPerPacket) {
           return;
         }
       }
@@ -481,9 +454,6 @@ void StreamFrameScheduler::writeStreamsHelper(
 void StreamFrameScheduler::writeStreams(PacketBuilderInterface& builder) {
   DCHECK(conn_.streamManager->hasWritable());
   uint64_t connWritableBytes = getSendConnFlowControlBytesWire(conn_);
-  if (connWritableBytes == 0) {
-    return;
-  }
   // Write the control streams first as a naive binary priority mechanism.
   const auto& writableControlStreams =
       conn_.streamManager->writableControlStreams();
@@ -494,9 +464,6 @@ void StreamFrameScheduler::writeStreams(PacketBuilderInterface& builder) {
         conn_.schedulingState.nextScheduledControlStream,
         connWritableBytes,
         conn_.transportSettings.streamFramePerPacket);
-  }
-  if (connWritableBytes == 0) {
-    return;
   }
   auto& writableStreams = conn_.streamManager->writableStreams();
   if (!writableStreams.empty()) {
@@ -509,33 +476,39 @@ void StreamFrameScheduler::writeStreams(PacketBuilderInterface& builder) {
 } // namespace quic
 
 bool StreamFrameScheduler::hasPendingData() const {
-  return conn_.streamManager->hasWritable() &&
+  return conn_.streamManager->hasNonDSRWritable() &&
       getSendConnFlowControlBytesWire(conn_) > 0;
 }
 
-bool StreamFrameScheduler::writeNextStreamFrame(
+bool StreamFrameScheduler::writeStreamFrame(
     PacketBuilderInterface& builder,
-    StreamId streamId,
+    QuicStreamState& stream,
     uint64_t& connWritableBytes) {
   if (builder.remainingSpaceInPkt() == 0) {
     return false;
   }
-  auto stream = conn_.streamManager->findStream(streamId);
-  CHECK(stream);
 
   // hasWritableData is the condition which has to be satisfied for the
   // stream to be in writableList
-  DCHECK(stream->hasWritableData());
+  CHECK(stream.hasWritableData());
 
   uint64_t flowControlLen =
-      std::min(getSendStreamFlowControlBytesWire(*stream), connWritableBytes);
-  uint64_t bufferLen = stream->writeBuffer.chainLength();
-  bool canWriteFin =
-      stream->finalWriteOffset.has_value() && bufferLen <= flowControlLen;
+      std::min(getSendStreamFlowControlBytesWire(stream), connWritableBytes);
+  uint64_t bufferLen = stream.writeBuffer.chainLength();
+  // We can't write FIN directly from here if writeBufMeta has pending bytes to
+  // send.
+  bool canWriteFin = stream.finalWriteOffset.has_value() &&
+      bufferLen <= flowControlLen && stream.writeBufMeta.length == 0;
+  auto writeOffset = stream.currentWriteOffset;
+  if (canWriteFin && stream.writeBuffer.empty()) {
+    // If we are writing FIN only from here, do not use currentWriteOffset in
+    // case some bufMeta has been sent before.
+    writeOffset = stream.finalWriteOffset.value();
+  }
   auto dataLen = writeStreamFrameHeader(
       builder,
-      stream->id,
-      stream->currentWriteOffset,
+      stream.id,
+      writeOffset,
       bufferLen,
       flowControlLen,
       canWriteFin,
@@ -543,9 +516,9 @@ bool StreamFrameScheduler::writeNextStreamFrame(
   if (!dataLen) {
     return false;
   }
-  writeStreamFrameData(builder, stream->writeBuffer, *dataLen);
-  VLOG(4) << "Wrote stream frame stream=" << stream->id
-          << " offset=" << stream->currentWriteOffset
+  writeStreamFrameData(builder, stream.writeBuffer, *dataLen);
+  VLOG(4) << "Wrote stream frame stream=" << stream.id
+          << " offset=" << stream.currentWriteOffset
           << " bytesWritten=" << *dataLen
           << " finWritten=" << (canWriteFin && *dataLen == bufferLen) << " "
           << conn_;
@@ -557,6 +530,34 @@ AckScheduler::AckScheduler(
     const QuicConnectionStateBase& conn,
     const AckState& ackState)
     : conn_(conn), ackState_(ackState) {}
+
+folly::Optional<PacketNum> AckScheduler::writeNextAcks(
+    PacketBuilderInterface& builder) {
+  // Use default ack delay for long headers. Usually long headers are sent
+  // before crypto negotiation, so the peer might not know about the ack delay
+  // exponent yet, so we use the default.
+  uint8_t ackDelayExponentToUse =
+      builder.getPacketHeader().getHeaderForm() == HeaderForm::Long
+      ? kDefaultAckDelayExponent
+      : conn_.transportSettings.ackDelayExponent;
+  auto largestAckedPacketNum = *largestAckToSend(ackState_);
+  auto ackingTime = Clock::now();
+  DCHECK(ackState_.largestRecvdPacketTime.hasValue())
+      << "Missing received time for the largest acked packet";
+  // assuming that we're going to ack the largest received with hightest pri
+  auto receivedTime = *ackState_.largestRecvdPacketTime;
+  std::chrono::microseconds ackDelay =
+      (ackingTime > receivedTime
+           ? std::chrono::duration_cast<std::chrono::microseconds>(
+                 ackingTime - receivedTime)
+           : 0us);
+  AckFrameMetaData meta(ackState_.acks, ackDelay, ackDelayExponentToUse);
+  auto ackWriteResult = writeAckFrame(meta, builder);
+  if (!ackWriteResult) {
+    return folly::none;
+  }
+  return largestAckedPacketNum;
+}
 
 bool AckScheduler::hasPendingAcks() const {
   return hasAcksToSchedule(ackState_);
@@ -617,6 +618,30 @@ bool PingFrameScheduler::hasPingFrame() const {
 
 bool PingFrameScheduler::writePing(PacketBuilderInterface& builder) {
   return 0 != writeFrame(PingFrame(), builder);
+}
+
+DatagramFrameScheduler::DatagramFrameScheduler(QuicConnectionStateBase& conn)
+    : conn_(conn) {}
+
+bool DatagramFrameScheduler::hasPendingDatagramFrames() const {
+  return !conn_.datagramState.writeBuffer.empty();
+}
+
+bool DatagramFrameScheduler::writeDatagramFrames(
+    PacketBuilderInterface& builder) {
+  bool sent = false;
+  for (size_t i = 0; i <= conn_.datagramState.writeBuffer.size(); ++i) {
+    auto& payload = conn_.datagramState.writeBuffer.front();
+    auto datagramFrame = DatagramFrame(payload.chainLength(), payload.move());
+    if (writeFrame(datagramFrame, builder) > 0) {
+      conn_.datagramState.writeBuffer.pop_front();
+      sent = true;
+    } else {
+      payload = datagramFrame.data.move();
+      break;
+    }
+  }
+  return sent;
 }
 
 WindowUpdateScheduler::WindowUpdateScheduler(
@@ -735,7 +760,11 @@ CloningScheduler::CloningScheduler(
       cipherOverhead_(cipherOverhead) {}
 
 bool CloningScheduler::hasData() const {
-  return frameScheduler_.hasData() || conn_.outstandings.numOutstanding() > 0;
+  // TODO: I'm not completely convinced d6d.outstandingProbes has been updated
+  // correctly.
+  return frameScheduler_.hasData() ||
+      conn_.outstandings.numOutstanding() >
+      conn_.d6d.outstandingProbes + conn_.outstandings.dsrCount;
 }
 
 SchedulingResult CloningScheduler::scheduleFramesForPacket(
@@ -758,7 +787,8 @@ SchedulingResult CloningScheduler::scheduleFramesForPacket(
   // Look for an outstanding packet that's no larger than the writableBytes
   for (auto& outstandingPacket : conn_.outstandings.packets) {
     if (outstandingPacket.declaredLost ||
-        outstandingPacket.metadata.isD6DProbe) {
+        outstandingPacket.metadata.isD6DProbe ||
+        outstandingPacket.isDSRPacket) {
       continue;
     }
     auto opPnSpace = outstandingPacket.packet.header.getPacketNumberSpace();

@@ -9,6 +9,7 @@
 #include <quic/codec/QuicPacketRebuilder.h>
 #include <quic/codec/QuicWriteCodec.h>
 #include <quic/flowcontrol/QuicFlowController.h>
+#include <quic/state/QuicStateFunctions.h>
 #include <quic/state/QuicStreamFunctions.h>
 #include <quic/state/SimpleFrameFunctions.h>
 
@@ -36,7 +37,8 @@ PacketEvent PacketRebuilder::cloneOutstandingPacket(OutstandingPacket& packet) {
     DCHECK(!conn_.outstandings.packetEvents.count(event));
     packet.associatedEvent = event;
     conn_.outstandings.packetEvents.insert(event);
-    ++conn_.outstandings.clonedPacketsCount;
+    ++conn_.outstandings
+          .clonedPacketCount[packet.packet.header.getPacketNumberSpace()];
   }
   return *packet.associatedEvent;
 }
@@ -50,6 +52,7 @@ folly::Optional<PacketEvent> PacketRebuilder::rebuildFromPacket(
   bool windowUpdateWritten = false;
   bool shouldWriteWindowUpdate = false;
   bool notPureAck = false;
+  bool shouldRebuildWriteAckFrame = false;
   auto encryptionLevel =
       protectionTypeToEncryptionLevel(packet.packet.header.getProtectionType());
   for (auto iter = packet.packet.frames.cbegin();
@@ -59,19 +62,10 @@ folly::Optional<PacketEvent> PacketRebuilder::rebuildFromPacket(
     const QuicWriteFrame& frame = *iter;
     switch (frame.type()) {
       case QuicWriteFrame::Type::WriteAckFrame: {
-        const WriteAckFrame& ackFrame = *frame.asWriteAckFrame();
-        auto& packetHeader = builder_.getPacketHeader();
-        uint64_t ackDelayExponent =
-            (packetHeader.getHeaderForm() == HeaderForm::Long)
-            ? kDefaultAckDelayExponent
-            : conn_.transportSettings.ackDelayExponent;
-        AckBlocks ackBlocks;
-        for (auto& block : ackFrame.ackBlocks) {
-          ackBlocks.insert(block.start, block.end);
-        }
-        AckFrameMetaData meta(ackBlocks, ackFrame.ackDelay, ackDelayExponent);
-        auto ackWriteResult = writeAckFrame(meta, builder_);
-        writeSuccess = ackWriteResult.has_value();
+        // We need to rebuild this WriteAckFrame with fresh AckStats
+        // which may make the packet larger. We keep track of this
+        // for now and rebuild the frame after the loop.
+        shouldRebuildWriteAckFrame = true;
         break;
       }
       case QuicWriteFrame::Type::WriteStreamFrame: {
@@ -178,6 +172,12 @@ folly::Optional<PacketEvent> PacketRebuilder::rebuildFromPacket(
         writeSuccess = ret;
         break;
       }
+      case QuicWriteFrame::Type::DatagramFrame:
+        // Do not clone Datagram frames. If datagram frame is the only frame in
+        // the packet, notPureAck will be false, and the function will return
+        // folly::none correctly.
+        writeSuccess = true;
+        break;
       default: {
         bool ret = writeFrame(QuicWriteFrame(frame), builder_) != 0;
         notPureAck |= ret;
@@ -188,6 +188,32 @@ folly::Optional<PacketEvent> PacketRebuilder::rebuildFromPacket(
     if (!writeSuccess) {
       return folly::none;
     }
+  }
+  // If this packet had a WriteAckFrame, build a new one it with
+  // fresh AckState on best-effort basis. If writing
+  // that ACK fails, just ignore it and use the rest of the
+  // cloned packet.
+  if (shouldRebuildWriteAckFrame) {
+    auto& packetHeader = builder_.getPacketHeader();
+    uint64_t ackDelayExponent =
+        (packetHeader.getHeaderForm() == HeaderForm::Long)
+        ? kDefaultAckDelayExponent
+        : conn_.transportSettings.ackDelayExponent;
+    const AckState& ackState_ = getAckState(
+        conn_,
+        protectionTypeToPacketNumberSpace(packetHeader.getProtectionType()));
+    auto ackingTime = Clock::now();
+    DCHECK(ackState_.largestRecvdPacketTime.hasValue())
+        << "Missing received time for the largest acked packet";
+    auto receivedTime = *ackState_.largestRecvdPacketTime;
+    std::chrono::microseconds ackDelay =
+        (ackingTime > receivedTime
+             ? std::chrono::duration_cast<std::chrono::microseconds>(
+                   ackingTime - receivedTime)
+             : 0us);
+    AckFrameMetaData meta(ackState_.acks, ackDelay, ackDelayExponent);
+    // Write the AckFrame ignoring the result. This is best-effort.
+    writeAckFrame(meta, builder_);
   }
   // We shouldn't clone if:
   // (1) we only end up cloning only acks, ping, or paddings.
@@ -227,12 +253,10 @@ const BufQueue* PacketRebuilder::cloneRetransmissionBuffer(
     const WriteStreamFrame& frame,
     const QuicStreamState* stream) {
   /**
-   * StreamBuffer is removed from retransmissionBuffer in 4 cases.
+   * StreamBuffer is removed from retransmissionBuffer in 3 cases.
    * 1: After send or receive RST.
    * 2: Packet containing the buffer gets acked.
    * 3: Packet containing the buffer is marked loss.
-   * 4: Skip (MIN_DATA or EXPIRED_DATA) frame is received with offset larger
-   *    than what's in the retransmission buffer.
    *
    * Checking retransmittable() should cover first case. The latter three cases
    * have to be covered by making sure we do not clone an already acked, lost or
@@ -242,12 +266,10 @@ const BufQueue* PacketRebuilder::cloneRetransmissionBuffer(
   DCHECK(retransmittable(*stream));
   auto iter = stream->retransmissionBuffer.find(frame.offset);
   if (iter != stream->retransmissionBuffer.end()) {
-    if (streamFrameMatchesRetransmitBuffer(*stream, frame, *iter->second)) {
-      DCHECK(!frame.len || !iter->second->data.empty())
-          << "WriteStreamFrame cloning: frame is not empty but StreamBuffer has"
-          << " empty data. " << conn_;
-      return frame.len ? &(iter->second->data) : nullptr;
-    }
+    DCHECK(!frame.len || !iter->second->data.empty())
+        << "WriteStreamFrame cloning: frame is not empty but StreamBuffer has"
+        << " empty data. " << conn_;
+    return frame.len ? &(iter->second->data) : nullptr;
   }
   return nullptr;
 }

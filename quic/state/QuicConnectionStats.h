@@ -11,40 +11,43 @@
 #include <chrono>
 #include <string>
 
-using namespace std::chrono_literals;
+#include <folly/SocketAddress.h>
+#include <quic/QuicConstants.h>
 
 namespace quic {
 
 struct BbrStats {
-  ~BbrStats() = default;
   uint8_t state;
 };
 
 struct CopaStats {
-  ~CopaStats() = default;
   double deltaParam;
   bool useRttStanding;
+};
+
+struct CubicStats {
+  uint8_t state;
+  uint64_t ssthresh;
 };
 
 union CongestionControllerStats {
   struct BbrStats bbrStats;
   struct CopaStats copaStats;
+  struct CubicStats cubicStats;
 };
 
 struct QuicConnectionStats {
- public:
-  ~QuicConnectionStats() = default;
-  uint8_t workerID;
-  uint32_t numConnIDs;
-  std::string localAddress;
-  std::string peerAddress;
-  std::chrono::duration<float> duration;
-  uint64_t cwnd_bytes;
-  std::string congestionController;
+  uint8_t workerID{0};
+  uint32_t numConnIDs{0};
+  folly::SocketAddress localAddress;
+  folly::SocketAddress peerAddress;
+  std::chrono::duration<float> duration{0};
+  uint64_t cwnd_bytes{0};
+  CongestionControlType congestionController;
   CongestionControllerStats congestionControllerStats;
   uint32_t ptoCount{0};
-  std::chrono::duration<float> srtt{0ms};
-  std::chrono::duration<float> rttvar{0ms};
+  std::chrono::microseconds srtt{0};
+  std::chrono::microseconds rttvar{0};
   uint64_t peerAckDelayExponent{0};
   uint64_t udpSendPacketLen{0};
   uint64_t numStreams{0};
@@ -54,7 +57,7 @@ struct QuicConnectionStats {
   uint64_t totalBytesSent{0};
   uint64_t totalBytesReceived{0};
   uint64_t totalBytesRetransmitted{0};
-  uint32_t version;
+  uint32_t version{0};
 };
 
 } // namespace quic

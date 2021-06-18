@@ -20,14 +20,94 @@ namespace quic {
 class QuicSocket;
 
 /**
- * ===== Instrumentation Observer API =====
+ * ===== Observer API =====
  */
 
 /**
- * Observer of socket instrumentation events.
+ * Observer of socket events.
  */
-class InstrumentationObserver {
+class Observer {
  public:
+  /**
+   * Observer configuration.
+   *
+   * Specifies events observer wants to receive.
+   */
+  struct Config {
+    virtual ~Config() = default;
+
+    // following flags enable support for various callbacks.
+    // observer and socket lifecycle callbacks are always enabled.
+    bool evbEvents{false};
+    bool packetsWrittenEvents{false};
+    bool appRateLimitedEvents{false};
+    bool lossEvents{false};
+    bool spuriousLossEvents{false};
+    bool pmtuEvents{false};
+    bool rttSamples{false};
+    bool knobFrameEvents{false};
+
+    virtual void enableAllEvents() {
+      evbEvents = true;
+      packetsWrittenEvents = true;
+      appRateLimitedEvents = true;
+      rttSamples = true;
+      lossEvents = true;
+      spuriousLossEvents = true;
+      pmtuEvents = true;
+      knobFrameEvents = true;
+    }
+
+    /**
+     * Returns a config where all events are enabled.
+     */
+    static Config getConfigAllEventsEnabled() {
+      Config config = {};
+      config.enableAllEvents();
+      return config;
+    }
+  };
+
+  /**
+   * Constructor for observer, uses default config (all callbacks disabled).
+   */
+  Observer() : Observer(Config()) {}
+
+  /**
+   * Constructor for observer.
+   *
+   * @param config      Config, defaults to auxilary instrumentaton disabled.
+   */
+  explicit Observer(const Config& observerConfig)
+      : observerConfig_(observerConfig) {}
+
+  virtual ~Observer() = default;
+
+  /**
+   * Returns observers configuration.
+   */
+  const Config& getConfig() {
+    return observerConfig_;
+  }
+
+  struct AppLimitedEvent {
+    AppLimitedEvent(
+        const std::deque<OutstandingPacket>& outstandingPackets,
+        const uint64_t writeCount)
+        : outstandingPackets(outstandingPackets), writeCount(writeCount) {}
+
+    // Cannot support copy ctors safely
+    AppLimitedEvent(const AppLimitedEvent&) = delete;
+    AppLimitedEvent(AppLimitedEvent&&) = delete;
+
+    // Reference to the current list of outstanding packets
+    const std::deque<OutstandingPacket>& outstandingPackets;
+    // The current write number for the write() call that
+    // caused this appLimitedEvent. Used by Observers to identify specific
+    // packets from the outstandingPacket list (above).
+    const uint64_t writeCount;
+  };
+
   struct LostPacket {
     explicit LostPacket(
         bool lostbytimeout,
@@ -41,9 +121,8 @@ class InstrumentationObserver {
     const quic::OutstandingPacket packet;
   };
 
-  struct ObserverLossEvent {
-    explicit ObserverLossEvent(TimePoint time = Clock::now())
-        : lossTime(time) {}
+  struct LossEvent {
+    explicit LossEvent(TimePoint time = Clock::now()) : lossTime(time) {}
 
     bool hasPackets() {
       return lostPackets.size() > 0;
@@ -134,23 +213,138 @@ class InstrumentationObserver {
     ProbeSizeRaiserType probeSizeRaiserType;
   };
 
-  virtual ~InstrumentationObserver() = default;
+  struct SpuriousLossEvent {
+    explicit SpuriousLossEvent(const TimePoint rcvTimeIn = Clock::now())
+        : rcvTime(rcvTimeIn) {}
+
+    bool hasPackets() {
+      return spuriousPackets.size() > 0;
+    }
+
+    void addSpuriousPacket(const quic::OutstandingPacket& pkt) {
+      spuriousPackets.emplace_back(pkt.lostByTimeout, pkt.lostByReorder, pkt);
+    }
+    const TimePoint rcvTime;
+    std::vector<LostPacket> spuriousPackets;
+  };
+
+  struct KnobFrameEvent {
+    explicit KnobFrameEvent(TimePoint rcvTimeIn, quic::KnobFrame knobFrame)
+        : rcvTime(rcvTimeIn), knobFrame(std::move(knobFrame)) {}
+    const TimePoint rcvTime;
+    const quic::KnobFrame knobFrame;
+  };
 
   /**
-   * observerDetach() will be invoked when the observer is uninstalled.
+   * observerAttach() will be invoked when an observer is added.
+   *
+   * @param socket      Socket where observer was installed.
+   */
+  virtual void observerAttach(QuicSocket* /* socket */) noexcept {}
+
+  /**
+   * observerDetach() will be invoked if the observer is uninstalled prior
+   * to socket destruction.
    *
    * No further callbacks will be invoked after observerDetach().
    *
    * @param socket      Socket where observer was uninstalled.
    */
-  virtual void observerDetach(QuicSocket* /* socket */) noexcept = 0;
+  virtual void observerDetach(QuicSocket* /* socket */) noexcept {}
+
+  /**
+   * destroy() will be invoked when the QuicSocket's destructor is invoked.
+   *
+   * No further callbacks will be invoked after destroy().
+   *
+   * @param socket      Socket being destroyed.
+   */
+  virtual void destroy(QuicSocket* /* socket */) noexcept {}
+
+  /**
+   * close() will be invoked when the socket is being closed.
+   *
+   * If the callback handler does not unsubscribe itself upon being called,
+   * then it may be called multiple times (e.g., by a call to close() by
+   * the application, and then again when closeNow() is called on
+   * destruction).
+   *
+   * @param socket      Socket being closed.
+   * @param errorOpt    Error information, if connection closed due to error.
+   */
+  virtual void close(
+      QuicSocket* /* socket */,
+      const folly::Optional<
+          std::pair<QuicErrorCode, std::string>>& /* errorOpt */) noexcept {}
+
+  /**
+   * evbAttach() will be invoked when a new event base is attached to this
+   * socket. This will be called from the new event base's thread.
+   *
+   * @param socket    Socket on which the new event base was attached.
+   * @param evb       The new event base that is getting attached.
+   */
+  virtual void evbAttach(
+      QuicSocket* /* socket */,
+      folly::EventBase* /* evb */) noexcept {}
+
+  /**
+   * evbDetach() will be invoked when an existing event base is detached
+   * from the socket. This will be called from the existing event base's thread.
+   *
+   * @param socket    Socket on which the existing EVB is getting detached.
+   * @param evb       The existing event base that is getting detached.
+   */
+  virtual void evbDetach(
+      QuicSocket* /* socket */,
+      folly::EventBase* /* evb */) noexcept {}
+
+  /**
+   * startWritingFromAppLimited() is invoked when the socket is currenty
+   * app rate limited and is being asked to write a new set of Bytes.
+   . This callback is invoked BEFORE we write the
+   * new bytes to the socket, this is done so that Observers can collect
+   * metadata about the connection BEFORE the start of a potential Write Block.
+   *
+   * @param socket   Socket that has potentially sent application data.
+                             reference to the number of outstanding packets
+                             BEFORE the call to write() socket data.
+
+   */
+  virtual void startWritingFromAppLimited(
+      QuicSocket* /* socket */,
+      const AppLimitedEvent& /* appLimitedEvent */) {}
+
+  /**
+   * packetsWritten() is invoked when the socket writes retransmittable packets
+   * to the wire, those packets will be present in the outstanding packets list.
+   * Observers can use this callback (which will always be invoked AFTER
+   * startWritingFromAppLimited) to *update* the transport's metadata within the
+   * currently tracked WriteBlock.
+   *
+   * If an Observer receives startWritingFromAppLimited but doesn't receive
+   * packetsWritten (and instead directly receives appRateLimited), it means the
+   * socket witnessed non-app data writes - this scenario is irrelevant and
+   * should not be used to construct Write Blocks.
+   *
+   * @param socket   Socket that has sent application data.
+   * @param appLimitedEvent  The AppLimitedEvent details which contains a const
+                             reference to the number of outstanding packets
+   */
+  virtual void packetsWritten(
+      QuicSocket* /* socket */,
+      const AppLimitedEvent& /* appLimitedEvent */) {}
 
   /**
    * appRateLimited() is invoked when the socket is app rate limited.
    *
    * @param socket      Socket that has become application rate limited.
+   * @param appLimitedEvent  The AppLimitedEvent details which contains a const
+                             reference to the number of outstanding packets
    */
-  virtual void appRateLimited(QuicSocket* /* socket */) {}
+  virtual void appRateLimited(
+      QuicSocket* /* socket */,
+      const AppLimitedEvent& /* appLimitedEvent */) {}
 
   /**
    * packetLossDetected() is invoked when a packet loss is detected.
@@ -161,7 +355,7 @@ class InstrumentationObserver {
    */
   virtual void packetLossDetected(
       QuicSocket*, /* socket */
-      const struct ObserverLossEvent& /* lossEvent */) {}
+      const struct LossEvent& /* lossEvent */) {}
 
   /**
    * rttSampleGenerated() is invoked when a RTT sample is made.
@@ -197,90 +391,35 @@ class InstrumentationObserver {
   virtual void pmtuUpperBoundDetected(
       QuicSocket*, /* socket */
       const PMTUUpperBoundEvent& /* pmtuUpperBoundEvent */) {}
+
+  /**
+   * spuriousLossDetected() is invoked when an ACK arrives for a packet that is
+   * declared lost
+   *
+   * @param socket   Socket when the callback is processed.
+   * @param packet   const reference to the lost packet.
+   */
+  virtual void spuriousLossDetected(
+      QuicSocket*, /* socket */
+      const SpuriousLossEvent& /* lost packet */) {}
+
+  /**
+   * knobFrameReceived() is invoked when a knob frame is received.
+   *
+   * @param socket   Socket when the callback is processed.
+   * @param event    const reference to the KnobFrameEvent.
+   */
+  virtual void knobFrameReceived(
+      QuicSocket*, /* socket */
+      const KnobFrameEvent& /* event */) {}
+
+ protected:
+  // observer configuration; cannot be changed post instantiation
+  const Config observerConfig_;
 };
 
 // Container for instrumentation observers.
 // Avoids heap allocation for up to 2 observers being installed.
-using InstrumentationObserverVec = SmallVec<InstrumentationObserver*, 2>;
-
-/**
- * ===== Lifecycle Observer API =====
- */
-
-/**
- * Observer of socket lifecycle events.
- */
-class LifecycleObserver {
- public:
-  virtual ~LifecycleObserver() = default;
-
-  /**
-   * observerAttach() will be invoked when an observer is added.
-   *
-   * @param socket      Socket where observer was installed.
-   */
-  virtual void observerAttach(QuicSocket* /* socket */) noexcept = 0;
-
-  /**
-   * observerDetach() will be invoked if the observer is uninstalled prior
-   * to socket destruction.
-   *
-   * No further callbacks will be invoked after observerDetach().
-   *
-   * @param socket      Socket where observer was uninstalled.
-   */
-  virtual void observerDetach(QuicSocket* /* socket */) noexcept = 0;
-
-  /**
-   * destroy() will be invoked when the QuicSocket's destructor is invoked.
-   *
-   * No further callbacks will be invoked after destroy().
-   *
-   * @param socket      Socket being destroyed.
-   */
-  virtual void destroy(QuicSocket* /* socket */) noexcept = 0;
-
-  /**
-   * close() will be invoked when the socket is being closed.
-   *
-   * If the callback handler does not unsubscribe itself upon being called,
-   * then it may be called multiple times (e.g., by a call to close() by
-   * the application, and then again when closeNow() is called on
-   * destruction).
-   *
-   * @param socket      Socket being closed.
-   * @param errorOpt    Error information, if connection closed due to error.
-   */
-  virtual void close(
-      QuicSocket* /* socket */,
-      const folly::Optional<
-          std::pair<QuicErrorCode, std::string>>& /* errorOpt */) noexcept = 0;
-
-  /**
-   * evbAttach() will be invoked when a new event base is attached to this
-   * socket. This will be called from the new event base's thread.
-   *
-   * @param socket    Socket on which the new event base was attached.
-   * @param evb       The new event base that is getting attached.
-   */
-  virtual void evbAttach(
-      QuicSocket* /* socket */,
-      folly::EventBase* /* evb */) noexcept {
-    // do nothing
-  }
-
-  /**
-   * evbDetach() will be invoked when an existing event base is detached
-   * from the socket. This will be called from the existing event base's thread.
-   *
-   * @param socket    Socket on which the existing EVB is getting detached.
-   * @param evb       The existing event base that is getting detached.
-   */
-  virtual void evbDetach(
-      QuicSocket* /* socket */,
-      folly::EventBase* /* evb */) noexcept {
-    // do nothing
-  }
-};
+using ObserverVec = SmallVec<Observer*, 2>;
 
 } // namespace quic

@@ -121,6 +121,14 @@ enum class TransportKnobParamId : uint64_t {
   // Force udp payload size to be equal to max
   // udp payload size
   FORCIBLY_SET_UDP_PAYLOAD_SIZE = 0xba92,
+  // Set congestion control algorithm
+  CC_ALGORITHM_KNOB = 0xccaa,
+  // Set pacing rtt factor used only during startup phase
+  STARTUP_RTT_FACTOR_KNOB = 0x1111,
+  // Set pacing rtt factor used when not in startup
+  DEFAULT_RTT_FACTOR_KNOB = 0x2222,
+  // Set total buffer size (in bytes) for not yet sent packets
+  NOTSENT_BUFFER_SIZE_KNOB = 0x3333,
 };
 
 enum class FrameType : uint64_t {
@@ -158,9 +166,10 @@ enum class FrameType : uint64_t {
   // CONNECTION_CLOSE_APP_ERR frametype is use to indicate application errors
   CONNECTION_CLOSE_APP_ERR = 0x1D,
   HANDSHAKE_DONE = 0x1E,
-  MIN_STREAM_DATA = 0xFE, // subject to change
-  EXPIRED_STREAM_DATA = 0xFF, // subject to change
+  DATAGRAM = 0x30,
+  DATAGRAM_LEN = 0x31,
   KNOB = 0x1550,
+  ACK_FREQUENCY = 0xAF,
 };
 
 inline constexpr uint16_t toFrameError(FrameType frame) {
@@ -260,13 +269,9 @@ enum class QuicVersion : uint32_t {
 
 using QuicVersionType = std::underlying_type<QuicVersion>::type;
 
-using TransportPartialReliabilitySetting = bool;
-
 /**
  * Parameter ids for private transport parameter
  */
-
-constexpr uint16_t kPartialReliabilityParameterId = 0xFF00; // subject to change
 
 constexpr uint16_t kD6DBasePMTUParameterId = 0xFF77;
 
@@ -330,6 +335,7 @@ constexpr DurationRep kDefaultWriteLimitRttFraction = 25;
 constexpr folly::StringPiece kCongestionControlCubicStr = "cubic";
 constexpr folly::StringPiece kCongestionControlBbrStr = "bbr";
 constexpr folly::StringPiece kCongestionControlCopaStr = "copa";
+constexpr folly::StringPiece kCongestionControlCopa2Str = "copa2";
 constexpr folly::StringPiece kCongestionControlNewRenoStr = "newreno";
 constexpr folly::StringPiece kCongestionControlNoneStr = "none";
 constexpr folly::StringPiece kCongestionControlCcpStr = "ccp";
@@ -340,10 +346,13 @@ enum class CongestionControlType : uint8_t {
   Cubic,
   NewReno,
   Copa,
+  Copa2,
   BBR,
   CCP,
   RL,
-  None
+  None,
+  // NOTE: MAX should always be at the end
+  MAX
 };
 folly::StringPiece congestionControlTypeToString(CongestionControlType type);
 folly::Optional<CongestionControlType> congestionControlStrToType(
@@ -434,6 +443,8 @@ constexpr uint16_t kDefaultRxPacketsBeforeAckAfterInit = 10;
 constexpr double kAckTimerFactor = 0.25;
 // max ack timeout: 25ms
 constexpr std::chrono::microseconds kMaxAckTimeout = 25000us;
+// max_ack_delay cannot be equal or greater that 2^14
+constexpr uint64_t kMaxAckDelay = 1ULL << 14;
 
 constexpr uint64_t kAckPurgingThresh = 10;
 
@@ -499,13 +510,18 @@ constexpr uint64_t kMaxRetryTokenValidMs = 1000 * 60 * 5;
 
 constexpr uint64_t kDefaultActiveConnectionIdLimit = 2;
 
-// default capability of QUIC partial reliability
-constexpr TransportPartialReliabilitySetting kDefaultPartialReliability = false;
-
 constexpr uint64_t kMaxPacketNumber = (1ull << 62) - 1;
 
 // Use up to 3 bytes for the initial packet number.
 constexpr uint32_t kMaxInitialPacketNum = 0xffffff;
+
+// The maximum size of a DATAGRAM frame (including the frame type,
+// length, and payload) the endpoint is willing to receive, in bytes.
+// Disabled by default
+constexpr uint16_t kDefaultMaxDatagramFrameSize = 0;
+constexpr uint16_t kMaxDatagramFrameSize = 65535;
+// The Maximum number of datagrams (in/out) to buffer
+constexpr uint32_t kDefaultMaxDatagramsBuffered = 75;
 
 enum class ZeroRttSourceTokenMatchingPolicy : uint8_t {
   REJECT_IF_NO_EXACT_MATCH = 0,
@@ -545,7 +561,6 @@ enum class WriteDataReason {
   ACK,
   CRYPTO_STREAM,
   STREAM,
-  LOSS,
   BLOCKED,
   STREAM_WINDOW_UPDATE,
   CONN_WINDOW_UPDATE,
@@ -590,6 +605,7 @@ enum class EncryptionLevel : uint8_t {
   Handshake,
   EarlyData,
   AppData,
+  MAX,
 };
 
 /**

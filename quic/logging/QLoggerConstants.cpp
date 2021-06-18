@@ -71,14 +71,15 @@ folly::StringPiece toQlogString(FrameType frame) {
     case FrameType::CONNECTION_CLOSE:
     case FrameType::CONNECTION_CLOSE_APP_ERR:
       return "connection_close";
-    case FrameType::MIN_STREAM_DATA:
-      return "min_stream_data";
-    case FrameType::EXPIRED_STREAM_DATA:
-      return "expired_stream_data";
     case FrameType::HANDSHAKE_DONE:
       return "handshake_done";
+    case FrameType::DATAGRAM:
+    case FrameType::DATAGRAM_LEN:
+      return "datagram";
     case FrameType::KNOB:
       return "knob";
+    case FrameType::ACK_FREQUENCY:
+      return "ack_frequency";
   }
   folly::assume_unreachable();
 }

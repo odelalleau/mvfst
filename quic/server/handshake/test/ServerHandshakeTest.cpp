@@ -112,10 +112,10 @@ class ServerHandshakeTest : public Test {
             kDefaultUDPSendPacketLen,
             kDefaultActiveConnectionIdLimit,
             ConnectionId(std::vector<uint8_t>()));
-    fizzClient.reset(
-        new fizz::client::
-            FizzClient<ServerHandshakeTest, fizz::client::ClientStateMachine>(
-                clientState, clientReadBuffer, *this, dg.get()));
+    fizzClient.reset(new fizz::client::FizzClient<
+                     ServerHandshakeTest,
+                     fizz::client::ClientStateMachine>(
+        clientState, clientReadBuffer, readAeadOptions, *this, dg.get()));
     std::vector<QuicVersion> supportedVersions = {getVersion()};
     auto params = std::make_shared<ServerTransportParametersExtension>(
         getVersion(),
@@ -128,7 +128,6 @@ class ServerHandshakeTest : public Test {
         kDefaultIdleTimeout,
         kDefaultAckDelayExponent,
         kDefaultUDPSendPacketLen,
-        kDefaultPartialReliability,
         generateStatelessResetToken(),
         ConnectionId(std::vector<uint8_t>{0xff, 0xfe, 0xfd, 0xfc}),
         ConnectionId(std::vector<uint8_t>()));
@@ -351,6 +350,7 @@ class ServerHandshakeTest : public Test {
   bool handshakeSuccess{false};
   bool earlyWriteFailed{false};
   bool error{false};
+  fizz::Aead::AeadOptions readAeadOptions;
 
   std::vector<fizz::WriteToSocket> clientWrites;
   MockServerHandshakeCallback serverCallback;

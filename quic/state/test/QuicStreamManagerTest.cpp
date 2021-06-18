@@ -305,23 +305,37 @@ TEST_F(QuicStreamManagerTest, TestClearActionable) {
   stream->readBuffer.emplace_back(folly::IOBuf::copyBuffer("blah blah"), 0);
   manager.queueFlowControlUpdated(id);
   manager.addDeliverable(id);
-  manager.addDataRejected(id);
-  manager.addDataExpired(id);
   manager.updateReadableStreams(*stream);
   manager.updatePeekableStreams(*stream);
   EXPECT_TRUE(manager.flowControlUpdatedContains(id));
   EXPECT_TRUE(manager.deliverableContains(id));
-  EXPECT_FALSE(manager.dataRejectedStreams().empty());
-  EXPECT_FALSE(manager.dataExpiredStreams().empty());
   EXPECT_FALSE(manager.readableStreams().empty());
   EXPECT_FALSE(manager.peekableStreams().empty());
   manager.clearActionable();
   EXPECT_FALSE(manager.flowControlUpdatedContains(id));
   EXPECT_FALSE(manager.deliverableContains(id));
-  EXPECT_TRUE(manager.dataRejectedStreams().empty());
-  EXPECT_TRUE(manager.dataExpiredStreams().empty());
   EXPECT_TRUE(manager.readableStreams().empty());
   EXPECT_TRUE(manager.peekableStreams().empty());
+}
+
+TEST_F(QuicStreamManagerTest, WriteBufferMeta) {
+  auto& manager = *conn.streamManager;
+  auto stream = manager.createNextUnidirectionalStream().value();
+  // Add some real data into write buffer
+  writeDataToQuicStream(*stream, folly::IOBuf::copyBuffer("prefix"), false);
+  // Artificially remove the stream from writable queue, so that any further
+  // writable query is about the DSR state.
+  manager.removeWritable(*stream);
+
+  BufferMeta bufferMeta(200);
+  writeBufMetaToQuicStream(*stream, bufferMeta, true);
+  EXPECT_TRUE(stream->hasWritableBufMeta());
+  EXPECT_TRUE(manager.hasWritable());
+
+  stream->sendState = StreamSendState::Closed;
+  stream->recvState = StreamRecvState::Closed;
+  manager.removeClosedStream(stream->id);
+  EXPECT_TRUE(manager.writableDSRStreams().empty());
 }
 
 } // namespace test

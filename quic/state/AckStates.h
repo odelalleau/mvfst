@@ -33,6 +33,9 @@ struct AckState {
   // Next PacketNum we will send for packet in this packet number space
   PacketNum nextPacketNum{0};
   AckBlocks acks;
+  bool ignoreReorder{false};
+  folly::Optional<uint64_t> tolerance;
+  folly::Optional<uint64_t> ackFrequencySequenceNumber;
   // Flag indicating that if we need to send ack immediately. This will be set
   // to true if we got packets with retransmittable data and haven't sent the
   // ack for the first time.
@@ -44,19 +47,21 @@ struct AckState {
 };
 
 struct AckStates {
-  AckStates() {
-    PacketNum randomizedPacketNum =
-        folly::Random::secureRand32(kMaxInitialPacketNum);
-    initialAckState.nextPacketNum = randomizedPacketNum;
-    handshakeAckState.nextPacketNum = randomizedPacketNum;
-    appDataAckState.nextPacketNum = randomizedPacketNum;
+  explicit AckStates(PacketNum startingNum) {
+    initialAckState.nextPacketNum = startingNum;
+    handshakeAckState.nextPacketNum = startingNum;
+    appDataAckState.nextPacketNum = startingNum;
   }
+
+  AckStates() : AckStates(folly::Random::secureRand32(kMaxInitialPacketNum)) {}
+
   // AckState for acks to peer packets in Initial packet number space.
   AckState initialAckState;
   // AckState for acks to peer packets in Handshake packet number space.
   AckState handshakeAckState;
   // AckState for acks to peer packets in AppData packet number space.
   AckState appDataAckState;
+  std::chrono::microseconds maxAckDelay{kMaxAckTimeout};
 };
 
 } // namespace quic

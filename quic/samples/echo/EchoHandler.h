@@ -21,8 +21,7 @@ class EchoHandler : public quic::QuicSocket::ConnectionCallback,
  public:
   using StreamData = std::pair<BufQueue, bool>;
 
-  explicit EchoHandler(folly::EventBase* evbIn, bool prEnabled = false)
-      : evb(evbIn), prEnabled_(prEnabled) {}
+  explicit EchoHandler(folly::EventBase* evbIn) : evb(evbIn) {}
 
   void setQuicSocket(std::shared_ptr<quic::QuicSocket> socket) {
     sock = socket;
@@ -75,11 +74,7 @@ class EchoHandler : public quic::QuicSocket::ConnectionCallback,
     input_[id].first.append(std::move(data));
     input_[id].second = eof;
     if (eof) {
-      if (prEnabled_) {
-        skipSomeEchoSome(id, input_[id]);
-      } else {
-        echo(id, input_[id]);
-      }
+      echo(id, input_[id]);
     }
   }
 
@@ -101,8 +96,7 @@ class EchoHandler : public quic::QuicSocket::ConnectionCallback,
     }
     auto echoedData = folly::IOBuf::copyBuffer("echo ");
     echoedData->prependChain(data.first.move());
-    auto res =
-        sock->writeChain(id, std::move(echoedData), true, false, nullptr);
+    auto res = sock->writeChain(id, std::move(echoedData), true, nullptr);
     if (res.hasError()) {
       LOG(ERROR) << "write error=" << toString(res.error());
     } else {
@@ -111,48 +105,8 @@ class EchoHandler : public quic::QuicSocket::ConnectionCallback,
     }
   }
 
-  /**
-   * Skips first part, echoes the second part.
-   * E.g. "batman" -> "???man"
-   */
-  void skipSomeEchoSome(quic::StreamId id, StreamData& data) {
-    if (!data.second) {
-      // only echo when eof is present
-      return;
-    }
-    auto& originalData = data.first;
-    auto dataLen = originalData.chainLength();
-
-    auto toSplit = dataLen / 2;
-
-    if (toSplit > 0) {
-      auto skipRes = sock->sendDataExpired(id, toSplit);
-      if (skipRes.hasError()) {
-        LOG(ERROR) << "skip error=" << toString(skipRes.error());
-      } else {
-        auto v = skipRes.value();
-        if (v.has_value()) {
-          LOG(INFO) << "new offset = " << v.value();
-        } else {
-          LOG(INFO) << "new offset doesn't have value";
-        }
-      }
-    }
-
-    originalData.splitAtMost(toSplit);
-
-    auto res = sock->writeChain(id, originalData.move(), true, false, nullptr);
-    if (res.hasError()) {
-      LOG(ERROR) << "write error=" << toString(res.error());
-    } else {
-      // echo is done, clear EOF
-      data.second = false;
-    }
-  }
-
-  void onStreamWriteReady(
-      quic::StreamId id,
-      uint64_t maxToSend) noexcept override {
+  void onStreamWriteReady(quic::StreamId id, uint64_t maxToSend) noexcept
+      override {
     LOG(INFO) << "socket is write ready with maxToSend=" << maxToSend;
     echo(id, input_[id]);
   }
@@ -174,7 +128,6 @@ class EchoHandler : public quic::QuicSocket::ConnectionCallback,
 
  private:
   std::map<quic::StreamId, StreamData> input_;
-  bool prEnabled_;
 };
 } // namespace samples
 } // namespace quic

@@ -141,6 +141,9 @@ class BuildOptions(object):
     def is_windows(self):
         return self.host_type.is_windows()
 
+    def is_arm(self):
+        return self.host_type.is_arm()
+
     def get_vcvars_path(self):
         return self.vcvars_path
 
@@ -148,7 +151,7 @@ class BuildOptions(object):
         return self.host_type.is_linux()
 
     def get_context_generator(self, host_tuple=None, facebook_internal=None):
-        """ Create a manifest ContextGenerator for the specified target platform. """
+        """Create a manifest ContextGenerator for the specified target platform."""
         if host_tuple is None:
             host_type = self.host_type
         elif isinstance(host_tuple, HostType):
@@ -364,7 +367,7 @@ def _check_host_type(args, host_type):
 
 
 def setup_build_options(args, host_type=None):
-    """ Create a BuildOptions object based on the arguments """
+    """Create a BuildOptions object based on the arguments"""
 
     fbcode_builder_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     scratch_dir = args.scratch_path
@@ -435,6 +438,10 @@ def setup_build_options(args, host_type=None):
     # drive substitutions on Windows, so avoid that!
     if not is_windows():
         scratch_dir = os.path.realpath(scratch_dir)
+
+    # Save any extra cmake defines passed by the user in an env variable, so it
+    # can be used while hashing this build.
+    os.environ["GETDEPS_CMAKE_DEFINES"] = getattr(args, "extra_cmake_defines", "") or ""
 
     host_type = _check_host_type(args, host_type)
 

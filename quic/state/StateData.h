@@ -15,12 +15,12 @@
 #include <quic/codec/QuicWriteCodec.h>
 #include <quic/codec/Types.h>
 #include <quic/common/BufAccessor.h>
-#include <quic/common/EnumArray.h>
 #include <quic/common/WindowedCounter.h>
 #include <quic/d6d/ProbeSizeRaiser.h>
 #include <quic/handshake/HandshakeLayer.h>
 #include <quic/logging/QLogger.h>
 #include <quic/state/AckStates.h>
+#include <quic/state/LossState.h>
 #include <quic/state/OutstandingPacket.h>
 #include <quic/state/PacketEvent.h>
 #include <quic/state/PendingPathRateLimiter.h>
@@ -118,23 +118,29 @@ struct OutstandingsInfo {
   // TODO: Enforce only AppTraffic packets to be clonable
   folly::F14FastSet<PacketEvent, PacketEventHash> packetEvents;
 
-  // Number of outstanding packets in Initial space, not including cloned
-  // Initial packets.
-  uint64_t initialPacketsCount{0};
-
-  // Number of outstanding packets in Handshake space, not including cloned
-  // Handshake packets.
-  uint64_t handshakePacketsCount{0};
+  // Number of outstanding packets not including cloned
+  EnumArray<PacketNumberSpace, uint64_t> packetCount{};
 
   // Number of packets are clones or cloned.
-  uint64_t clonedPacketsCount{0};
+  EnumArray<PacketNumberSpace, uint64_t> clonedPacketCount{};
 
   // Number of packets currently declared lost.
   uint64_t declaredLostCount{0};
 
+  // Number of outstanding inflight DSR packet. That is, when a DSR packet is
+  // declared lost, this counter will be decreased.
+  uint64_t dsrCount{0};
+
   // Number of packets outstanding and not declared lost.
   uint64_t numOutstanding() {
     return packets.size() - declaredLostCount;
+  }
+
+  // Total number of cloned packets.
+  uint64_t numClonedPackets() {
+    return clonedPacketCount[PacketNumberSpace::Initial] +
+        clonedPacketCount[PacketNumberSpace::Handshake] +
+        clonedPacketCount[PacketNumberSpace::AppData];
   }
 };
 
@@ -407,88 +413,6 @@ using Resets = folly::F14FastMap<StreamId, RstStreamFrame>;
 
 using FrameList = std::vector<QuicSimpleFrame>;
 
-struct LossState {
-  enum class AlarmMethod { EarlyRetransmitOrReordering, PTO };
-  // Latest packet number sent
-  // TODO: this also needs to be 3 numbers now...
-  folly::Optional<PacketNum> largestSent;
-  // Timer for time reordering detection or early retransmit alarm.
-  EnumArray<PacketNumberSpace, folly::Optional<TimePoint>> lossTimes;
-  // Max ack delay received from peer
-  std::chrono::microseconds maxAckDelay{0us};
-  // Latest ack delay received from peer
-  std::chrono::microseconds lastAckDelay{0us};
-  // minimum rtt. AckDelay isn't excluded from this.
-  std::chrono::microseconds mrtt{kDefaultMinRtt};
-  // Smooth rtt
-  std::chrono::microseconds srtt{0us};
-  // Latest rtt
-  std::chrono::microseconds lrtt{0us};
-  // Latest rtt *including* ack delay
-  // (it is not just equal to `lrtt + lastAckDelay` because `lrtt` does not
-  // always remove the ack delay)
-  std::chrono::microseconds ldrtt{0us};
-  // Rtt var
-  std::chrono::microseconds rttvar{0us};
-  // The sent time of the latest acked packet
-  folly::Optional<TimePoint> lastAckedPacketSentTime;
-  // The latest time a packet is acked
-  folly::Optional<TimePoint> lastAckedTime;
-  // The latest time a packet is acked, minus ack delay
-  folly::Optional<TimePoint> adjustedLastAckedTime;
-  // The time when last retranmittable packet is sent for every packet number
-  // space
-  TimePoint lastRetransmittablePacketSentTime;
-  // Total number of bytes sent on this connection. This is after encoding.
-  uint64_t totalBytesSent{0};
-  // Total number of bytes received on this connection. This is before decoding.
-  uint64_t totalBytesRecvd{0};
-  // Total number of stream bytes retransmitted, excluding cloning.
-  uint64_t totalBytesRetransmitted{0};
-  // Total number of stream bytes cloned.
-  uint64_t totalStreamBytesCloned{0};
-  // Total number of bytes cloned.
-  uint64_t totalBytesCloned{0};
-  // Total number of bytes acked on this connection. If a packet is acked twice,
-  // it won't be count twice. Pure acks packets are NOT included.
-  uint64_t totalBytesAcked{0};
-  // The total number of bytes sent on this connection when the last time a
-  // packet is acked.
-  uint64_t totalBytesSentAtLastAck{0};
-  // The total number of bytes acked on this connection when the last time a
-  // packet is acked.
-  uint64_t totalBytesAckedAtLastAck{0};
-  // Total number of packets sent on this connection, including retransmissions.
-  uint32_t totalPacketsSent{0};
-  // Total number of packets which were declared lost, including losses that
-  // we later detected were spurious (see spuriousLossCount below).
-  uint32_t totalPacketsMarkedLost{0};
-  // Total number of packets which were declared lost due to PTO; a packet can
-  // marked as lost by multiple detection mechanisms.
-  uint32_t totalPacketsMarkedLostByPto{0};
-  // Total number of packets which were declared lost based on the reordering
-  // threshold; a packet can marked as lost by multiple detection mechanisms.
-  uint32_t totalPacketsMarkedLostByReorderingThreshold{0};
-  // Inflight bytes
-  uint64_t inflightBytes{0};
-  // Reordering threshold used
-  uint32_t reorderingThreshold{kReorderingThreshold};
-  // Number of packet loss timer fired before receiving an ack
-  uint32_t ptoCount{0};
-  // Total number of packet retransmitted on this connection, including packet
-  // clones, retransmitted clones, handshake and rejected zero rtt packets.
-  uint32_t rtxCount{0};
-  // Total number of packets which were declared lost spuriously, i.e. we
-  // received an ACK for them later.
-  uint32_t spuriousLossCount{0};
-  // Total number of retransmission due to PTO
-  uint32_t timeoutBasedRtxCount{0};
-  // Total number of PTO count
-  uint32_t totalPTOCount{0};
-  // Current method by which the loss detection alarm is set.
-  AlarmMethod currentAlarmMethod{AlarmMethod::EarlyRetransmitOrReordering};
-};
-
 class Logger;
 class CongestionControllerFactory;
 class LoopDetectorCallback;
@@ -497,7 +421,9 @@ class PendingPathRateLimiter;
 struct QuicConnectionStateBase : public folly::DelayedDestruction {
   virtual ~QuicConnectionStateBase() = default;
 
-  explicit QuicConnectionStateBase(QuicNodeType type) : nodeType(type) {}
+  explicit QuicConnectionStateBase(QuicNodeType type) : nodeType(type) {
+    observers = std::make_shared<ObserverVec>();
+  }
 
   // Accessor to output buffer for continuous memory GSO writes
   BufAccessor* bufAccessor{nullptr};
@@ -646,7 +572,13 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
     std::vector<KnobFrame> knobs;
 
     // Number of probing packets to send after PTO
-    uint8_t numProbePackets{0};
+    EnumArray<PacketNumberSpace, uint8_t> numProbePackets{};
+
+    FOLLY_NODISCARD bool anyProbePackets() const {
+      return numProbePackets[PacketNumberSpace::Initial] +
+          numProbePackets[PacketNumberSpace::Handshake] +
+          numProbePackets[PacketNumberSpace::AppData];
+    }
 
     // true: schedule timeout if not scheduled
     // false: cancel scheduled timeout
@@ -724,6 +656,9 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
 
   // Value of the negotiated ack delay exponent.
   uint64_t peerAckDelayExponent{kDefaultAckDelayExponent};
+
+  // The value of the peer's min_ack_delay, for creating ACK_FREQUENCY frames.
+  folly::Optional<std::chrono::microseconds> peerMinAckDelay;
 
   // Idle timeout advertised by the peer. Initially sets it to the maximum value
   // until the handshake sets the timeout.
@@ -880,11 +815,11 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
    */
   bool retireAndSwitchPeerConnectionIds();
 
-  // instrumentation observers
-  InstrumentationObserverVec instrumentationObservers_;
-
   // queue of functions to be called in processCallbacksAfterNetworkData
   std::vector<std::function<void(QuicSocket*)>> pendingCallbacks;
+
+  // Vector of Observers that are attached to this socket.
+  std::shared_ptr<const ObserverVec> observers;
 
   // Type of node owning this connection (client or server).
   QuicNodeType nodeType;
@@ -899,8 +834,34 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
   // For example, we may not want to pace a connection that's still handshaking.
   bool canBePaced{false};
 
-  // Whether or not both ends agree to use partial reliability
-  bool partialReliabilityEnabled{false};
+  // Flag indicating whether the socket is currently waiting for the app to
+  // write data. All new sockets start off in this state where they wait for the
+  // application to pump data to the socket.
+  // TODO: Merge this flag with the existing appLimited flag that exists on each
+  // Congestion Controller.
+  bool waitingForAppData{true};
+
+  // Monotonically increasing counter that is incremented each time there is a
+  // write on this socket (writeSocketData() is called), This is used to
+  // identify specific outstanding packets (based on writeCount and packetNum)
+  // in the Observers, to construct Write Blocks
+  uint64_t writeCount{0};
+
+  // Whether we successfully used 0-RTT keys in this connection.
+  bool usedZeroRtt{false};
+
+  struct DatagramState {
+    uint16_t maxReadFrameSize{kDefaultMaxDatagramFrameSize};
+    uint16_t maxWriteFrameSize{kDefaultMaxDatagramFrameSize};
+    uint32_t maxReadBufferSize{kDefaultMaxDatagramsBuffered};
+    uint32_t maxWriteBufferSize{kDefaultMaxDatagramsBuffered};
+    // Buffers Incoming Datagrams
+    std::deque<BufQueue> readBuffer;
+    // Buffers Outgoing Datagrams
+    std::deque<BufQueue> writeBuffer;
+  };
+
+  DatagramState datagramState;
 };
 
 std::ostream& operator<<(std::ostream& os, const QuicConnectionStateBase& st);

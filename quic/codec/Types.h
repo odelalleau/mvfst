@@ -109,6 +109,20 @@ struct KnobFrame {
   Buf blob;
 };
 
+struct AckFrequencyFrame {
+  uint64_t sequenceNumber; // Used to identify newest.
+  uint64_t packetTolerance; // How many packets before ACKing.
+  uint64_t updateMaxAckDelay; // New max_ack_delay to use.
+  uint8_t ignoreOrder; // Whether to ignore reordering ACKs.
+
+  bool operator==(const AckFrequencyFrame& other) const {
+    return other.sequenceNumber == sequenceNumber &&
+        other.packetTolerance == packetTolerance &&
+        other.updateMaxAckDelay == updateMaxAckDelay &&
+        other.ignoreOrder == ignoreOrder;
+  }
+};
+
 /**
  * AckBlock represents a series of continuous packet sequences from
  * [startPacket, endPacket]
@@ -305,16 +319,25 @@ struct WriteStreamFrame {
   uint64_t len;
   bool fin;
 
+  // Whether this WriteStreamFrame is created from a BufMeta, instead of real
+  // write buffer data.
+  bool fromBufMeta{false};
+
   WriteStreamFrame(
       StreamId streamIdIn,
       uint64_t offsetIn,
       uint64_t lenIn,
-      bool finIn)
-      : streamId(streamIdIn), offset(offsetIn), len(lenIn), fin(finIn) {}
+      bool finIn,
+      bool fromBufMetaIn = false)
+      : streamId(streamIdIn),
+        offset(offsetIn),
+        len(lenIn),
+        fin(finIn),
+        fromBufMeta(fromBufMetaIn) {}
 
   bool operator==(const WriteStreamFrame& rhs) const {
     return streamId == rhs.streamId && offset == rhs.offset && len == rhs.len &&
-        fin == rhs.fin;
+        fin == rhs.fin && fromBufMeta == rhs.fromBufMeta;
   }
 };
 
@@ -406,42 +429,6 @@ struct MaxStreamDataFrame {
 
   bool operator==(const MaxStreamDataFrame& rhs) const {
     return streamId == rhs.streamId && maximumData == rhs.maximumData;
-  }
-};
-
-// The MinStreamDataFrame is used by a receiver to inform
-// a sender of the maximum amount of data that can be sent on a stream
-// (like MAX_STREAM_DATA frame) and to request an update to the minimum
-// retransmittable offset for this stream.
-struct MinStreamDataFrame {
-  StreamId streamId;
-  uint64_t maximumData;
-  uint64_t minimumStreamOffset;
-  MinStreamDataFrame(
-      StreamId streamIdIn,
-      uint64_t maximumDataIn,
-      uint64_t minimumStreamOffsetIn)
-      : streamId(streamIdIn),
-        maximumData(maximumDataIn),
-        minimumStreamOffset(minimumStreamOffsetIn) {}
-
-  bool operator==(const MinStreamDataFrame& rhs) const {
-    return streamId == rhs.streamId && maximumData == rhs.maximumData &&
-        minimumStreamOffset == rhs.minimumStreamOffset;
-  }
-};
-
-// The ExpiredStreamDataFrame is used by a sender to
-// inform a receiver of the minimum retransmittable offset for a stream.
-struct ExpiredStreamDataFrame {
-  StreamId streamId;
-  uint64_t minimumStreamOffset;
-  ExpiredStreamDataFrame(StreamId streamIdIn, uint64_t minimumStreamOffsetIn)
-      : streamId(streamIdIn), minimumStreamOffset(minimumStreamOffsetIn) {}
-
-  bool operator==(const ExpiredStreamDataFrame& rhs) const {
-    return streamId == rhs.streamId &&
-        minimumStreamOffset == rhs.minimumStreamOffset;
   }
 };
 
@@ -598,6 +585,35 @@ struct HandshakeDoneFrame {
   }
 };
 
+struct DatagramFrame {
+  size_t length;
+  BufQueue data;
+
+  explicit DatagramFrame(size_t len, Buf buf)
+      : length(len), data(std::move(buf)) {
+    CHECK_EQ(length, data.chainLength());
+  }
+
+  // Variant requirement:
+  DatagramFrame(const DatagramFrame& other)
+      : length(other.length),
+        data(other.data.front() ? other.data.front()->clone() : nullptr) {
+    CHECK_EQ(length, data.chainLength());
+  }
+
+  bool operator==(const DatagramFrame& other) const {
+    if (length != other.length) {
+      return false;
+    }
+    if (data.empty() && other.data.empty()) {
+      return true;
+    }
+    CHECK(data.front() && other.data.front());
+    folly::IOBufEqualTo eq;
+    return eq(*data.front(), *other.data.front());
+  }
+};
+
 // Frame to represent ones we skip
 struct NoopFrame {
   bool operator==(const NoopFrame&) const {
@@ -636,15 +652,14 @@ struct RetryToken {
 
 #define QUIC_SIMPLE_FRAME(F, ...)         \
   F(StopSendingFrame, __VA_ARGS__)        \
-  F(MinStreamDataFrame, __VA_ARGS__)      \
-  F(ExpiredStreamDataFrame, __VA_ARGS__)  \
   F(PathChallengeFrame, __VA_ARGS__)      \
   F(PathResponseFrame, __VA_ARGS__)       \
   F(NewConnectionIdFrame, __VA_ARGS__)    \
   F(MaxStreamsFrame, __VA_ARGS__)         \
   F(RetireConnectionIdFrame, __VA_ARGS__) \
   F(HandshakeDoneFrame, __VA_ARGS__)      \
-  F(KnobFrame, __VA_ARGS__)
+  F(KnobFrame, __VA_ARGS__)               \
+  F(AckFrequencyFrame, __VA_ARGS__)
 
 DECLARE_VARIANT_TYPE(QuicSimpleFrame, QUIC_SIMPLE_FRAME)
 
@@ -663,7 +678,8 @@ DECLARE_VARIANT_TYPE(QuicSimpleFrame, QUIC_SIMPLE_FRAME)
   F(ReadNewTokenFrame, __VA_ARGS__)      \
   F(QuicSimpleFrame, __VA_ARGS__)        \
   F(PingFrame, __VA_ARGS__)              \
-  F(NoopFrame, __VA_ARGS__)
+  F(NoopFrame, __VA_ARGS__)              \
+  F(DatagramFrame, __VA_ARGS__)
 
 DECLARE_VARIANT_TYPE(QuicFrame, QUIC_FRAME)
 
@@ -681,7 +697,8 @@ DECLARE_VARIANT_TYPE(QuicFrame, QUIC_FRAME)
   F(WriteCryptoFrame, __VA_ARGS__)       \
   F(QuicSimpleFrame, __VA_ARGS__)        \
   F(PingFrame, __VA_ARGS__)              \
-  F(NoopFrame, __VA_ARGS__)
+  F(NoopFrame, __VA_ARGS__)              \
+  F(DatagramFrame, __VA_ARGS__)
 
 // Types of frames which are written.
 DECLARE_VARIANT_TYPE(QuicWriteFrame, QUIC_WRITE_FRAME)
@@ -893,6 +910,7 @@ struct PacketHeader {
 };
 
 ProtectionType longHeaderTypeToProtectionType(LongHeader::Types type);
+PacketNumberSpace protectionTypeToPacketNumberSpace(ProtectionType type);
 
 struct StreamTypeField {
  public:

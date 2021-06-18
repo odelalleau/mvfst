@@ -28,18 +28,6 @@ folly::Optional<QuicSimpleFrame> updateSimpleFrameOnPacketClone(
         return folly::none;
       }
       return QuicSimpleFrame(frame);
-    case QuicSimpleFrame::Type::MinStreamDataFrame:
-      if (!conn.streamManager->streamExists(
-              frame.asMinStreamDataFrame()->streamId)) {
-        return folly::none;
-      }
-      return QuicSimpleFrame(frame);
-    case QuicSimpleFrame::Type::ExpiredStreamDataFrame:
-      if (!conn.streamManager->streamExists(
-              frame.asExpiredStreamDataFrame()->streamId)) {
-        return folly::none;
-      }
-      return QuicSimpleFrame(frame);
     case QuicSimpleFrame::Type::PathChallengeFrame:
       // Path validation timer expired, path validation failed;
       // or a different path validation was scheduled
@@ -55,6 +43,7 @@ folly::Optional<QuicSimpleFrame> updateSimpleFrameOnPacketClone(
     case QuicSimpleFrame::Type::MaxStreamsFrame:
     case QuicSimpleFrame::Type::HandshakeDoneFrame:
     case QuicSimpleFrame::Type::KnobFrame:
+    case QuicSimpleFrame::Type::AckFrequencyFrame:
     case QuicSimpleFrame::Type::RetireConnectionIdFrame:
       // TODO junqiw
       return QuicSimpleFrame(frame);
@@ -94,24 +83,6 @@ void updateSimpleFrameOnPacketLoss(
       }
       break;
     }
-    case QuicSimpleFrame::Type::MinStreamDataFrame: {
-      const MinStreamDataFrame& minStreamData = *frame.asMinStreamDataFrame();
-      auto stream = conn.streamManager->getStream(minStreamData.streamId);
-      if (stream && stream->conn.partialReliabilityEnabled) {
-        advanceCurrentReceiveOffset(stream, minStreamData.minimumStreamOffset);
-      }
-      break;
-    }
-    case QuicSimpleFrame::Type::ExpiredStreamDataFrame: {
-      const ExpiredStreamDataFrame& expiredFrame =
-          *frame.asExpiredStreamDataFrame();
-      auto stream = conn.streamManager->getStream(expiredFrame.streamId);
-      if (stream && stream->conn.partialReliabilityEnabled) {
-        advanceMinimumRetransmittableOffset(
-            stream, expiredFrame.minimumStreamOffset);
-      }
-      break;
-    }
     case QuicSimpleFrame::Type::PathChallengeFrame: {
       const PathChallengeFrame& pathChallenge = *frame.asPathChallengeFrame();
       if (conn.outstandingPathValidation &&
@@ -127,11 +98,13 @@ void updateSimpleFrameOnPacketLoss(
     case QuicSimpleFrame::Type::HandshakeDoneFrame: {
       const auto& handshakeDoneFrame = *frame.asHandshakeDoneFrame();
       conn.pendingEvents.frames.push_back(handshakeDoneFrame);
+      break;
     }
     case QuicSimpleFrame::Type::NewConnectionIdFrame:
     case QuicSimpleFrame::Type::MaxStreamsFrame:
     case QuicSimpleFrame::Type::RetireConnectionIdFrame:
     case QuicSimpleFrame::Type::KnobFrame:
+    case QuicSimpleFrame::Type::AckFrequencyFrame:
       conn.pendingEvents.frames.push_back(frame);
       break;
   }
@@ -140,7 +113,7 @@ void updateSimpleFrameOnPacketLoss(
 bool updateSimpleFrameOnPacketReceived(
     QuicConnectionStateBase& conn,
     const QuicSimpleFrame& frame,
-    PacketNum packetNum,
+    PacketNum /*packetNum*/,
     bool fromChangedPeerAddress) {
   switch (frame.type()) {
     case QuicSimpleFrame::Type::StopSendingFrame: {
@@ -148,23 +121,6 @@ bool updateSimpleFrameOnPacketReceived(
       auto stream = conn.streamManager->getStream(stopSending.streamId);
       if (stream) {
         sendStopSendingSMHandler(*stream, stopSending);
-      }
-      return true;
-    }
-    case QuicSimpleFrame::Type::MinStreamDataFrame: {
-      const MinStreamDataFrame& minStreamData = *frame.asMinStreamDataFrame();
-      auto stream = conn.streamManager->getStream(minStreamData.streamId);
-      if (stream && stream->conn.partialReliabilityEnabled) {
-        onRecvMinStreamDataFrame(stream, minStreamData, packetNum);
-      }
-      return true;
-    }
-    case QuicSimpleFrame::Type::ExpiredStreamDataFrame: {
-      const ExpiredStreamDataFrame& expiredStreamData =
-          *frame.asExpiredStreamDataFrame();
-      auto stream = conn.streamManager->getStream(expiredStreamData.streamId);
-      if (stream && stream->conn.partialReliabilityEnabled) {
-        onRecvExpiredStreamDataFrame(stream, expiredStreamData);
       }
       return true;
     }
@@ -291,6 +247,24 @@ bool updateSimpleFrameOnPacketReceived(
       const KnobFrame& knobFrame = *frame.asKnobFrame();
       conn.pendingEvents.knobs.emplace_back(
           knobFrame.knobSpace, knobFrame.id, knobFrame.blob->clone());
+      return true;
+    }
+    case QuicSimpleFrame::Type::AckFrequencyFrame: {
+      if (!conn.transportSettings.minAckDelay.hasValue()) {
+        return true;
+      }
+      const auto ackFrequencyFrame = frame.asAckFrequencyFrame();
+      auto& ackState = conn.ackStates.appDataAckState;
+      if (!ackState.ackFrequencySequenceNumber ||
+          ackFrequencyFrame->sequenceNumber >
+              ackState.ackFrequencySequenceNumber.value()) {
+        ackState.tolerance = ackFrequencyFrame->packetTolerance;
+        ackState.ignoreReorder = ackFrequencyFrame->ignoreOrder;
+        conn.ackStates.maxAckDelay =
+            std::chrono::microseconds(std::max<uint64_t>(
+                conn.transportSettings.minAckDelay->count(),
+                ackFrequencyFrame->updateMaxAckDelay));
+      }
       return true;
     }
   }

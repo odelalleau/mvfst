@@ -40,13 +40,6 @@
  */
 #define FALLBACK_TIMEOUT_US_LIBCCP 1000000
 
-/**
- * Defines the maximum number of times we will retry connecting to CCP, and
- * how long to wait in between each retry. See CCPReader::try_initialize().
- */
-#define MAX_CCP_CONNECT_RETRIES 3
-#define CCP_CONNECT_RETRY_WAIT_US 1000
-
 namespace quic {
 
 /**
@@ -69,11 +62,15 @@ class CCPReader : public folly::AsyncUDPSocket::ReadCallback {
   ~CCPReader() override;
 
   // Initialize state (with libccp) and send a ready message to CCP
-  void try_initialize(folly::EventBase* evb, uint8_t id);
-  // Bind to our unix socket address
-  void bind();
+  void try_initialize(
+      folly::EventBase* evb,
+      uint64_t ccpId,
+      uint64_t serverId,
+      uint8_t workerId);
   // Start listening on the socket
   void start();
+  // Send a ready message to CCP
+  int connect();
   // Pause listening on the socket
   void pauseRead();
 
@@ -106,7 +103,15 @@ class CCPReader : public folly::AsyncUDPSocket::ReadCallback {
   void shutdown();
 
  private:
-  uint8_t parentWorkerId_{0};
+  // Bind to our unix socket address
+  void bind();
+
+  // Unique id of the CCP process we connect to
+  uint64_t ccpId_;
+  // Each ccp reader is uniquely identified by its parent
+  // QuicServer/QuicServerWorker pair
+  uint64_t serverId_;
+  uint8_t workerId_;
   folly::SocketAddress sendAddr_;
   folly::SocketAddress recvAddr_;
   std::unique_ptr<folly::AsyncUDPSocket> ccpSocket_;
@@ -115,6 +120,7 @@ class CCPReader : public folly::AsyncUDPSocket::ReadCallback {
 #ifdef CCP_ENABLED
   struct ccp_datapath ccpDatapath_;
 #endif
+  bool initialized_{false};
 };
 
 } // namespace quic

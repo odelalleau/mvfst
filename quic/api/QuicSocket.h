@@ -16,6 +16,8 @@
 #include <quic/api/Observer.h>
 #include <quic/codec/Types.h>
 #include <quic/common/SmallVec.h>
+#include <quic/state/QuicConnectionStats.h>
+#include <quic/state/QuicPriorityQueue.h>
 #include <quic/state/StateData.h>
 
 #include <chrono>
@@ -26,6 +28,8 @@ class EventBase;
 }
 
 namespace quic {
+
+class DSRPacketizationRequestSender;
 
 class QuicSocket {
  public:
@@ -133,16 +137,33 @@ class QuicSocket {
     std::chrono::microseconds pacingInterval{0us};
     uint32_t packetsRetransmitted{0};
     uint32_t totalPacketsSent{0};
+    uint32_t totalAckElicitingPacketsSent{0};
     uint32_t totalPacketsMarkedLost{0};
     uint32_t totalPacketsMarkedLostByPto{0};
     uint32_t totalPacketsMarkedLostByReorderingThreshold{0};
-    uint32_t packetsSpuriouslyLost{0};
+    uint32_t totalPacketsSpuriouslyMarkedLost{0};
     uint32_t timeoutBasedLoss{0};
     std::chrono::microseconds pto{0us};
+    // Number of Bytes (packet header + body) that were sent
     uint64_t bytesSent{0};
+    // Number of Bytes (packet header + body) that were acked
     uint64_t bytesAcked{0};
+    // Number of Bytes (packet header + body) that were received
     uint64_t bytesRecvd{0};
+    // Number of Bytes (packet header + body) that are in-flight
+    uint64_t bytesInFlight{0};
+    // Number of Bytes (packet header + body) that were retxed
     uint64_t totalBytesRetransmitted{0};
+    // Number of Bytes (only the encoded packet's body) that were sent
+    uint64_t bodyBytesSent{0};
+    // Number of Bytes (only the encoded packet's body) that were acked
+    uint64_t bodyBytesAcked{0};
+    // Total number of stream bytes sent on this connection.
+    // Includes retransmissions of stream bytes.
+    uint64_t totalStreamBytesSent{0};
+    // Total number of 'new' stream bytes sent on this connection.
+    // Does not include retransmissions of stream bytes.
+    uint64_t totalNewStreamBytesSent{0};
     uint32_t ptoCount{0};
     uint32_t totalPTOCount{0};
     folly::Optional<PacketNum> largestPacketAckedByPeer;
@@ -445,16 +466,17 @@ class QuicSocket {
   FOLLY_NODISCARD virtual bool isKnobSupported() const = 0;
 
   /**
-   * Is partial reliability supported.
-   */
-  virtual bool isPartiallyReliableTransport() const = 0;
-
-  /**
    * Set stream priority.
    * level: can only be in [0, 7].
    */
   virtual folly::Expected<folly::Unit, LocalErrorCode>
   setStreamPriority(StreamId id, PriorityLevel level, bool incremental) = 0;
+
+  /**
+   * Get stream priority.
+   */
+  virtual folly::Expected<Priority, LocalErrorCode> getStreamPriority(
+      StreamId id) = 0;
 
   /**
    * ===== Read API ====
@@ -600,7 +622,17 @@ class QuicSocket {
     virtual void onDataAvailable(
         StreamId id,
         const folly::Range<PeekIterator>& peekData) noexcept = 0;
+
+    /**
+     * Called from the transport layer during peek time when there is an error
+     * on the stream.
+     */
+    virtual void peekError(
+        StreamId id,
+        std::pair<QuicErrorCode, folly::Optional<folly::StringPiece>>
+            error) noexcept = 0;
   };
+
   virtual folly::Expected<folly::Unit, LocalErrorCode> setPeekCallback(
       StreamId id,
       PeekCallback* cb) = 0;
@@ -657,68 +689,6 @@ class QuicSocket {
   virtual folly::Expected<folly::Unit, LocalErrorCode> consume(
       StreamId id,
       size_t amount) = 0;
-
-  /**
-   * ===== Expire/reject API =====
-   *
-   * Sender can "expire" stream data by advancing receiver's minimum
-   * retransmittable offset, effectively discarding some of the previously
-   * sent (or planned to be sent) data.
-   * Discarded data may or may not have already arrived on the receiver end.
-   *
-   * Received can "reject" stream data by advancing sender's minimum
-   * retransmittable offset, effectively discarding some of the previously
-   * sent (or planned to be sent) data.
-   * Rejected data may or may not have already arrived on the receiver end.
-   */
-
-  class DataExpiredCallback {
-   public:
-    virtual ~DataExpiredCallback() = default;
-
-    /**
-     * Called from the transport layer when sender informes us that data is
-     * expired on a given stream.
-     */
-    virtual void onDataExpired(StreamId id, uint64_t newOffset) noexcept = 0;
-  };
-
-  virtual folly::Expected<folly::Unit, LocalErrorCode> setDataExpiredCallback(
-      StreamId id,
-      DataExpiredCallback* cb) = 0;
-
-  /**
-   * Expire data.
-   *
-   * The return value is Expected.  If the value hasError(), then an error
-   * occured and it can be obtained with error().
-   */
-  virtual folly::Expected<folly::Optional<uint64_t>, LocalErrorCode>
-  sendDataExpired(StreamId id, uint64_t offset) = 0;
-
-  class DataRejectedCallback {
-   public:
-    virtual ~DataRejectedCallback() = default;
-
-    /**
-     * Called from the transport layer when receiver informes us that data is
-     * not needed anymore on a given stream.
-     */
-    virtual void onDataRejected(StreamId id, uint64_t newOffset) noexcept = 0;
-  };
-
-  virtual folly::Expected<folly::Unit, LocalErrorCode> setDataRejectedCallback(
-      StreamId id,
-      DataRejectedCallback* cb) = 0;
-
-  /**
-   * Reject data.
-   *
-   * The return value is Expected.  If the value hasError(), then an error
-   * occured and it can be obtained with error().
-   */
-  virtual folly::Expected<folly::Optional<uint64_t>, LocalErrorCode>
-  sendDataRejected(StreamId id, uint64_t offset) = 0;
 
   /**
    * ===== Write API =====
@@ -845,15 +815,17 @@ class QuicSocket {
    */
   struct ByteEvent {
     enum class Type { ACK = 1, TX = 2 };
-    static constexpr std::array<Type, 2> kByteEventTypes = {Type::ACK,
-                                                            Type::TX};
+    static constexpr std::array<Type, 2> kByteEventTypes = {
+        Type::ACK,
+        Type::TX};
 
     StreamId id{0};
     uint64_t offset{0};
     Type type;
 
     // sRTT at time of event
-    // TODO(bschlinker): Deprecate, caller can fetch transport state if desired.
+    // TODO(bschlinker): Deprecate, caller can fetch transport state if
+    // desired.
     std::chrono::microseconds srtt{0us};
   };
 
@@ -872,6 +844,13 @@ class QuicSocket {
   class ByteEventCallback {
    public:
     virtual ~ByteEventCallback() = default;
+
+    /**
+     * Invoked when a byte event has been successfully registered.
+     * Since this is a convenience notification and not a mandatory callback,
+     * not marking this as pure virtual.
+     */
+    virtual void onByteEventRegistered(ByteEvent /* byteEvent */) {}
 
     /**
      * Invoked when the byte event has occurred.
@@ -908,6 +887,9 @@ class QuicSocket {
 
    private:
     // Temporary shim during transition to ByteEvent
+    void onByteEventRegistered(ByteEvent /* byteEvent */) final {
+      // Not supported
+    }
     void onByteEvent(ByteEvent byteEvent) final {
       CHECK_EQ((int)ByteEvent::Type::ACK, (int)byteEvent.type); // sanity
       onDeliveryAck(byteEvent.id, byteEvent.offset, byteEvent.srtt);
@@ -927,6 +909,10 @@ class QuicSocket {
    * to the underlying UDP socket, indicating that it has passed through
    * congestion control and pacing. In the future, this callback may be
    * triggered by socket/NIC software or hardware timestamps.
+   *
+   * If the registration fails, the callback (ByteEventCallback* cb) will NEVER
+   * be invoked for anything. If the registration succeeds, the callback is
+   * guaranteed to receive an onByteEventRegistered() notification.
    */
   virtual folly::Expected<folly::Unit, LocalErrorCode> registerTxCallback(
       const StreamId id,
@@ -936,6 +922,10 @@ class QuicSocket {
   /**
    * Register a byte event to be triggered when specified event type occurs for
    * the specified stream and offset.
+   *
+   * If the registration fails, the callback (ByteEventCallback* cb) will NEVER
+   * be invoked for anything. If the registration succeeds, the callback is
+   * guaranteed to receive an onByteEventRegistered() notification.
    */
   virtual folly::Expected<folly::Unit, LocalErrorCode>
   registerByteEventCallback(
@@ -976,6 +966,15 @@ class QuicSocket {
   virtual void cancelByteEventCallbacks(const ByteEvent::Type type) = 0;
 
   /**
+   * Reset or send a stop sending on all non-control streams. Leaves the
+   * connection otherwise unmodified. Note this will also trigger the
+   * onStreamWriteError and readError callbacks immediately.
+   */
+  virtual void resetNonControlStreams(
+      ApplicationErrorCode error,
+      folly::StringPiece errorMsg) = 0;
+
+  /**
    * Get the number of pending byte events for the given stream.
    */
   FOLLY_NODISCARD virtual size_t getNumByteEventCallbacksForStream(
@@ -991,10 +990,8 @@ class QuicSocket {
   /**
    * Write data/eof to the given stream.
    *
-   * cork indicates to the transport that the application expects to write
-   * more data soon.  Passing a delivery callback registers a callback from the
-   * transport when the peer has acknowledged the receipt of all the data/eof
-   * passed to write.
+   * Passing a delivery callback registers a callback from the transport when
+   * the peer has acknowledged the receipt of all the data/eof passed to write.
    *
    * An error code is present if there was an error with the write.
    */
@@ -1003,8 +1000,23 @@ class QuicSocket {
       StreamId id,
       Buf data,
       bool eof,
-      bool cork,
-      DeliveryCallback* cb = nullptr) = 0;
+      ByteEventCallback* cb = nullptr) = 0;
+
+  /**
+   * Write a data representation in the form of BufferMeta to the given stream.
+   */
+  virtual WriteResult writeBufMeta(
+      StreamId id,
+      const BufferMeta& data,
+      bool eof,
+      ByteEventCallback* cb = nullptr) = 0;
+
+  /**
+   * Set the DSRPacketizationRequestSender for a stream.
+   */
+  virtual WriteResult setDSRPacketizationRequestSender(
+      StreamId id,
+      std::unique_ptr<DSRPacketizationRequestSender> sender) = 0;
 
   /**
    * Register a callback to be invoked when the peer has acknowledged the
@@ -1111,64 +1123,80 @@ class QuicSocket {
    */
   virtual void setCongestionControl(CongestionControlType type) = 0;
 
-  // Container for lifecycle observers.
-  // Avoids heap allocation for up to 2 observers being installed.
-  using LifecycleObserverVec = SmallVec<LifecycleObserver*, 2>;
-
   /**
-   * Adds a lifecycle observer.
+   * Adds an observer.
    *
-   * Observers can tie their lifetime to aspects of this socket's lifecycle /
+   * Observers can tie their lifetime to aspects of this socket's  /
    * lifetime and perform inspection at various states.
    *
    * This enables instrumentation to be added without changing / interfering
    * with how the application uses the socket.
    *
-   * @param observer     Observer to add (implements LifecycleObserver).
+   * @param observer     Observer to add (implements Observer).
    */
-  virtual void addLifecycleObserver(LifecycleObserver* observer) = 0;
+  virtual void addObserver(Observer* observer) = 0;
 
   /**
-   * Removes a lifecycle observer.
+   * Removes an observer.
    *
    * @param observer     Observer to remove.
    * @return             Whether observer found and removed from list.
    */
-  virtual bool removeLifecycleObserver(LifecycleObserver* observer) = 0;
+  virtual bool removeObserver(Observer* observer) = 0;
 
   /**
-   * Returns installed lifecycle observers.
+   * Returns installed observers.
    *
    * @return             Reference to const vector with installed observers.
    */
-  FOLLY_NODISCARD virtual const LifecycleObserverVec& getLifecycleObservers()
-      const = 0;
+  FOLLY_NODISCARD virtual const ObserverVec& getObservers() const = 0;
 
   /**
-   * Adds a instrumentation observer.
-   *
-   * Instrumentation observers get notified of various socket events.
-   *
-   * @param observer     Observer to add (implements InstrumentationObserver).
+   * Returns varios stats of the connection.
    */
-  virtual void addInstrumentationObserver(
-      InstrumentationObserver* observer) = 0;
+  FOLLY_NODISCARD virtual QuicConnectionStats getConnectionsStats() const = 0;
 
   /**
-   * Removes a instrumentation observer.
+   * ===== Datagram API =====
    *
-   * @param observer     Observer to remove.
-   * @return             Whether observer found and removed from list.
+   * Datagram support is experimental. Currently there isn't delivery callback
+   * or loss notification support for Datagram.
    */
-  virtual bool removeInstrumentationObserver(
-      InstrumentationObserver* observer) = 0;
+
+  class DatagramCallback {
+   public:
+    virtual ~DatagramCallback() = default;
+
+    /**
+     * Notifies the DatagramCallback that datagrams are available for read.
+     */
+    virtual void onDatagramsAvailable() noexcept = 0;
+  };
 
   /**
-   * Returns installed instrumentation observers.
-   *
-   * @return             Reference to const vector with installed observers.
+   * Set the read callback for Datagrams
    */
-  FOLLY_NODISCARD virtual const InstrumentationObserverVec&
-  getInstrumentationObservers() const = 0;
+  virtual folly::Expected<folly::Unit, LocalErrorCode> setDatagramCallback(
+      DatagramCallback* cb) = 0;
+
+  /**
+   * Returns the maximum allowed Datagram payload size.
+   * 0 means Datagram is not supported
+   */
+  FOLLY_NODISCARD virtual uint16_t getDatagramSizeLimit() const = 0;
+
+  /**
+   * Writes a Datagram frame. If buf is larger than the size limit returned by
+   * getDatagramSizeLimit(), or if the write buffer is full, buf will simply be
+   * dropped, and a LocalErrorCode will be returned to caller.
+   */
+  virtual WriteResult writeDatagram(Buf buf) = 0;
+
+  /**
+   * Returns the currently available received Datagrams.
+   * Returns all datagrams if atMost is 0.
+   */
+  virtual folly::Expected<std::vector<Buf>, LocalErrorCode> readDatagrams(
+      size_t atMost = 0) = 0;
 };
 } // namespace quic

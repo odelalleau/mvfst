@@ -18,6 +18,8 @@ folly::StringPiece congestionControlTypeToString(CongestionControlType type) {
       return kCongestionControlBbrStr;
     case CongestionControlType::Copa:
       return kCongestionControlCopaStr;
+    case CongestionControlType::Copa2:
+      return kCongestionControlCopa2Str;
     case CongestionControlType::NewReno:
       return kCongestionControlNewRenoStr;
     case CongestionControlType::None:
@@ -26,6 +28,8 @@ folly::StringPiece congestionControlTypeToString(CongestionControlType type) {
       return kCongestionControlCcpStr;
     case CongestionControlType::RL:
       return kCongestionControlRLStr;
+    case CongestionControlType::MAX:
+      return "MAX";
     default:
       return "unknown";
   }
@@ -39,6 +43,8 @@ folly::Optional<CongestionControlType> congestionControlStrToType(
     return quic::CongestionControlType::BBR;
   } else if (str == kCongestionControlCopaStr) {
     return quic::CongestionControlType::Copa;
+  } else if (str == kCongestionControlCopa2Str) {
+    return quic::CongestionControlType::Copa2;
   } else if (str == kCongestionControlNewRenoStr) {
     return quic::CongestionControlType::NewReno;
   } else if (str == kCongestionControlNoneStr) {
@@ -93,8 +99,6 @@ folly::StringPiece writeDataReasonString(WriteDataReason reason) {
       return "Crypto";
     case WriteDataReason::STREAM:
       return "Stream";
-    case WriteDataReason::LOSS:
-      return "Loss";
     case WriteDataReason::BLOCKED:
       return "Blocked";
     case WriteDataReason::STREAM_WINDOW_UPDATE:

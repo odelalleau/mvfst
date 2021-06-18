@@ -12,9 +12,75 @@
 #include <quic/QuicConstants.h>
 #include <quic/codec/Types.h>
 #include <quic/common/SmallVec.h>
+#include <quic/dsr/DSRPacketizationRequestSender.h>
 #include <quic/state/QuicPriorityQueue.h>
 
 namespace quic {
+
+/**
+ * A buffer representation without the actual data. This is part of the public
+ * facing interface.
+ *
+ * This is experimental.
+ */
+struct BufferMeta {
+  size_t length;
+
+  explicit BufferMeta(size_t lengthIn) : length(lengthIn) {}
+};
+
+/**
+ * A write buffer representation without the actual data. This is used for
+ * write buffer management in a stream.
+ *
+ * This is experimental.
+ */
+struct WriteBufferMeta {
+  size_t length{0};
+  size_t offset{0};
+  bool eof{false};
+
+  WriteBufferMeta() = default;
+
+  struct Builder {
+    Builder& setLength(size_t lengthIn) {
+      length_ = lengthIn;
+      return *this;
+    }
+
+    Builder& setOffset(size_t offsetIn) {
+      offset_ = offsetIn;
+      return *this;
+    }
+
+    Builder& setEOF(bool val) {
+      eof_ = val;
+      return *this;
+    }
+
+    WriteBufferMeta build() {
+      return WriteBufferMeta(length_, offset_, eof_);
+    }
+
+   private:
+    size_t length_{0};
+    size_t offset_{0};
+    bool eof_{false};
+  };
+
+  WriteBufferMeta split(size_t splitLen) {
+    CHECK_GE(length, splitLen);
+    auto splitEof = splitLen == length && eof;
+    WriteBufferMeta splitOf(splitLen, offset, splitEof);
+    offset += splitLen;
+    length -= splitLen;
+    return splitOf;
+  }
+
+ private:
+  explicit WriteBufferMeta(size_t lengthIn, size_t offsetIn, bool eofIn)
+      : length(lengthIn), offset(offsetIn), eof(eofIn) {}
+};
 
 struct StreamBuffer {
   BufQueue data;
@@ -68,8 +134,11 @@ struct QuicStreamLike {
 
   // Current offset of the start bytes in the write buffer.
   // This changes when we pop stuff off the writeBuffer.
-  // When we are finished writing out all the bytes until FIN, this will
-  // be one greater than finalWriteOffset.
+  // In a non-DSR stream, when we are finished writing out all the bytes until
+  // FIN, this will be one greater than finalWriteOffset.
+  // When DSR is used, this still points to the starting bytes in the write
+  // buffer. Its value won't change with WriteBufferMetas are appended and sent
+  // for a stream.
   uint64_t currentWriteOffset{0};
 
   // the minimum offset requires retransmit
@@ -228,14 +297,62 @@ struct QuicStreamState : public QuicStreamLike {
     return recvState == StreamRecvState::Open;
   }
 
+  // If the stream has writable data that's not backed by DSR. That is, in a
+  // regular stream write, it will be able to write something. So it either
+  // needs to have writeBuffer, or it has EOF to send.
   bool hasWritableData() const {
     if (!writeBuffer.empty()) {
       return flowControlState.peerAdvertisedMaxOffset - currentWriteOffset > 0;
     }
     if (finalWriteOffset) {
-      return currentWriteOffset <= *finalWriteOffset;
+      /**
+       * This is the case that EOF/FIN is the only thing we can write in a
+       * non-DSR write for a stream. It's actually OK to send out a FIN with
+       * correct offset before we send out DSRed bytes. Peer is supposed to be
+       * able to handle this. But it's also not hard to limit it. So here i'm
+       * gonna go with the safer path: do not write FIN only stream frame if we
+       * still have BufMetas to send.
+       */
+      return writeBufMeta.length == 0 &&
+          currentWriteOffset <= *finalWriteOffset &&
+          writeBufMeta.offset <= *finalWriteOffset;
     }
     return false;
+  }
+
+  FOLLY_NODISCARD bool hasWritableBufMeta() const {
+    if (writeBufMeta.offset == 0) {
+      return false;
+    }
+    if (writeBufMeta.length > 0) {
+      return flowControlState.peerAdvertisedMaxOffset - writeBufMeta.offset > 0;
+    }
+    if (finalWriteOffset) {
+      return writeBufMeta.offset <= *finalWriteOffset;
+    }
+    return false;
+  }
+
+  FOLLY_NODISCARD bool hasSentFIN() const {
+    if (!finalWriteOffset) {
+      return false;
+    }
+    return currentWriteOffset > *finalWriteOffset ||
+        writeBufMeta.offset > *finalWriteOffset;
+  }
+
+  FOLLY_NODISCARD uint64_t nextOffsetToWrite() const {
+    // The stream has never had WriteBufferMetas. Then currentWriteOffset
+    // always points to the next offset we send. This of course relies on the
+    // current contract of DSR: Real data always comes first. This code (and a
+    // lot other code) breaks when that contract is breached.
+    if (writeBufMeta.offset == 0) {
+      return currentWriteOffset;
+    }
+    if (!writeBuffer.empty()) {
+      return currentWriteOffset;
+    }
+    return writeBufMeta.offset;
   }
 
   bool hasReadableData() const {
@@ -246,6 +363,44 @@ struct QuicStreamState : public QuicStreamLike {
 
   bool hasPeekableData() const {
     return readBuffer.size() > 0;
+  }
+
+  std::unique_ptr<DSRPacketizationRequestSender> dsrSender;
+
+  // BufferMeta that has been writen to the QUIC layer.
+  // When offset is 0, nothing has been written to it. On first write, its
+  // starting offset will be currentWriteOffset + writeBuffer.chainLength().
+  WriteBufferMeta writeBufMeta;
+
+  // A map to store sent WriteBufferMetas for potential retransmission.
+  folly::F14FastMap<uint64_t, WriteBufferMeta> retransmissionBufMetas;
+
+  // WriteBufferMetas that's already marked lost. They will be retransmitted.
+  std::deque<WriteBufferMeta> lossBufMetas;
+
+  /**
+   * Insert a new WriteBufferMeta into lossBufMetas. If the new WriteBufferMeta
+   * can be append to an existing WriteBufferMeta, it will be appended. Note
+   * it won't be prepended to an existing WriteBufferMeta. And it will also not
+   * merge 3 WriteBufferMetas together if the new one happens to fill up a hole
+   * between 2 existing WriteBufferMetas.
+   */
+  void insertIntoLossBufMeta(WriteBufferMeta bufMeta) {
+    auto lossItr = std::upper_bound(
+        lossBufMetas.begin(),
+        lossBufMetas.end(),
+        bufMeta.offset,
+        [](auto offset, const auto& bufMeta) {
+          return offset < bufMeta.offset;
+        });
+    if (!lossBufMetas.empty() && lossItr != lossBufMetas.begin() &&
+        std::prev(lossItr)->offset + std::prev(lossItr)->length ==
+            bufMeta.offset) {
+      std::prev(lossItr)->length += bufMeta.length;
+      std::prev(lossItr)->eof = bufMeta.eof;
+    } else {
+      lossBufMetas.insert(lossItr, bufMeta);
+    }
   }
 };
 } // namespace quic

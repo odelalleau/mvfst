@@ -63,6 +63,20 @@ class MockPeekCallback : public QuicSocket::PeekCallback {
       ,
       onDataAvailable,
       void(StreamId, const folly::Range<PeekIterator>&));
+  GMOCK_METHOD2_(
+      ,
+      noexcept,
+      ,
+      peekError,
+      void(
+          StreamId,
+          std::pair<QuicErrorCode, folly::Optional<folly::StringPiece>>));
+};
+
+class MockDatagramCallback : public QuicSocket::DatagramCallback {
+ public:
+  ~MockDatagramCallback() override = default;
+  GMOCK_METHOD0_(, noexcept, , onDatagramsAvailable, void());
 };
 
 class MockWriteCallback : public QuicSocket::WriteCallback {
@@ -118,6 +132,16 @@ class MockConnectionCallback : public QuicSocket::ConnectionCallback {
       onUnidirectionalStreamsAvailable,
       void(uint64_t));
   GMOCK_METHOD0_(, noexcept, , onAppRateLimited, void());
+  GMOCK_METHOD3_(
+      ,
+      noexcept,
+      ,
+      onKnobMock,
+      void(uint64_t, uint64_t, folly::IOBuf*));
+
+  void onKnob(uint64_t knobSpace, uint64_t knobId, Buf knobBlob) override {
+    onKnobMock(knobSpace, knobId, knobBlob.get());
+  }
 };
 
 class MockDeliveryCallback : public QuicSocket::DeliveryCallback {
@@ -132,6 +156,7 @@ class MockDeliveryCallback : public QuicSocket::DeliveryCallback {
 class MockByteEventCallback : public QuicSocket::ByteEventCallback {
  public:
   ~MockByteEventCallback() override = default;
+  MOCK_METHOD1(onByteEventRegistered, void(QuicSocket::ByteEvent));
   MOCK_METHOD1(onByteEvent, void(QuicSocket::ByteEvent));
   MOCK_METHOD1(onByteEventCanceled, void(QuicSocket::ByteEvent));
 
@@ -152,18 +177,6 @@ class MockByteEventCallback : public QuicSocket::ByteEventCallback {
         testing::Field(&QuicSocket::ByteEvent::id, testing::Eq(id)),
         testing::Field(&QuicSocket::ByteEvent::offset, testing::Eq(offset)));
   }
-};
-
-class MockDataExpiredCallback : public QuicSocket::DataExpiredCallback {
- public:
-  ~MockDataExpiredCallback() override = default;
-  GMOCK_METHOD2_(, noexcept, , onDataExpired, void(StreamId, uint64_t));
-};
-
-class MockDataRejectedCallback : public QuicSocket::DataRejectedCallback {
- public:
-  ~MockDataRejectedCallback() override = default;
-  GMOCK_METHOD2_(, noexcept, , onDataRejected, void(StreamId, uint64_t));
 };
 
 class MockQuicTransport : public QuicServerTransport {
@@ -307,8 +320,11 @@ class MockLoopDetectorCallback : public LoopDetectorCallback {
   MOCK_METHOD2(onSuspiciousReadLoops, void(uint64_t, NoReadReason));
 };
 
-class MockLifecycleObserver : public LifecycleObserver {
+class MockObserver : public Observer {
  public:
+  MockObserver() : Observer(Observer::Config()) {}
+  MockObserver(const Observer::Config& observerConfig)
+      : Observer(observerConfig) {}
   GMOCK_METHOD1_(, noexcept, , observerAttach, void(QuicSocket*));
   GMOCK_METHOD1_(, noexcept, , observerDetach, void(QuicSocket*));
   GMOCK_METHOD1_(, noexcept, , destroy, void(QuicSocket*));
@@ -322,18 +338,30 @@ class MockLifecycleObserver : public LifecycleObserver {
       void(
           QuicSocket*,
           const folly::Optional<std::pair<QuicErrorCode, std::string>>&));
-};
-
-class MockInstrumentationObserver : public InstrumentationObserver {
- public:
-  GMOCK_METHOD1_(, noexcept, , observerDetach, void(QuicSocket*));
-  GMOCK_METHOD1_(, noexcept, , appRateLimited, void(QuicSocket*));
+  GMOCK_METHOD2_(
+      ,
+      noexcept,
+      ,
+      startWritingFromAppLimited,
+      void(QuicSocket*, const AppLimitedEvent&));
+  GMOCK_METHOD2_(
+      ,
+      noexcept,
+      ,
+      packetsWritten,
+      void(QuicSocket*, const AppLimitedEvent&));
+  GMOCK_METHOD2_(
+      ,
+      noexcept,
+      ,
+      appRateLimited,
+      void(QuicSocket*, const AppLimitedEvent&));
   GMOCK_METHOD2_(
       ,
       noexcept,
       ,
       packetLossDetected,
-      void(QuicSocket*, const ObserverLossEvent&));
+      void(QuicSocket*, const LossEvent&));
   GMOCK_METHOD2_(
       ,
       noexcept,
@@ -353,15 +381,39 @@ class MockInstrumentationObserver : public InstrumentationObserver {
       ,
       pmtuUpperBoundDetected,
       void(QuicSocket*, const PMTUUpperBoundEvent&));
+  GMOCK_METHOD2_(
+      ,
+      noexcept,
+      ,
+      spuriousLossDetected,
+      void(QuicSocket*, const SpuriousLossEvent&));
+  GMOCK_METHOD2_(
+      ,
+      noexcept,
+      ,
+      knobFrameReceived,
+      void(QuicSocket*, const KnobFrameEvent&));
 
-  static auto getLossPacketMatcher(bool reorderLoss, bool timeoutLoss) {
+  static auto getLossPacketNum(PacketNum packetNum) {
+    return testing::Field(
+        &OutstandingPacket::packet,
+        testing::Field(
+            &RegularPacket::header,
+            testing::Property(&PacketHeader::getPacketSequenceNum, packetNum)));
+  }
+
+  static auto getLossPacketMatcher(
+      PacketNum packetNum,
+      bool reorderLoss,
+      bool timeoutLoss) {
     return AllOf(
         testing::Field(
-            &InstrumentationObserver::LostPacket::lostByReorderThreshold,
+            &Observer::LostPacket::lostByReorderThreshold,
             testing::Eq(reorderLoss)),
         testing::Field(
-            &InstrumentationObserver::LostPacket::lostByTimeout,
-            testing::Eq(timeoutLoss)));
+            &Observer::LostPacket::lostByTimeout, testing::Eq(timeoutLoss)),
+        testing::Field(
+            &Observer::LostPacket::packet, getLossPacketNum(packetNum)));
   }
 };
 

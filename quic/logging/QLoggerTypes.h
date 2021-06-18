@@ -145,6 +145,26 @@ class KnobFrameLog : public QLogFrame {
   FOLLY_NODISCARD folly::dynamic toDynamic() const override;
 };
 
+class AckFrequencyFrameLog : public QLogFrame {
+ public:
+  uint64_t sequenceNumber;
+  uint64_t packetTolerance;
+  uint64_t updateMaxAckDelay;
+  bool ignoreOrder;
+
+  explicit AckFrequencyFrameLog(
+      uint64_t sequenceNumberIn,
+      uint64_t packetToleranceIn,
+      uint64_t updateMaxAckDelayIn,
+      bool ignoreOrderIn)
+      : sequenceNumber(sequenceNumberIn),
+        packetTolerance(packetToleranceIn),
+        updateMaxAckDelay(updateMaxAckDelayIn),
+        ignoreOrder(ignoreOrderIn) {}
+  ~AckFrequencyFrameLog() override = default;
+  FOLLY_NODISCARD folly::dynamic toDynamic() const override;
+};
+
 class StreamDataBlockedFrameLog : public QLogFrame {
  public:
   StreamId streamId;
@@ -219,34 +239,6 @@ class StopSendingFrameLog : public QLogFrame {
   StopSendingFrameLog(StreamId streamIdIn, ApplicationErrorCode errorCodeIn)
       : streamId{streamIdIn}, errorCode{errorCodeIn} {}
   ~StopSendingFrameLog() override = default;
-  folly::dynamic toDynamic() const override;
-};
-
-class MinStreamDataFrameLog : public QLogFrame {
- public:
-  StreamId streamId;
-  uint64_t maximumData;
-  uint64_t minimumStreamOffset;
-
-  MinStreamDataFrameLog(
-      StreamId streamIdIn,
-      uint64_t maximumDataIn,
-      uint64_t minimumStreamOffsetIn)
-      : streamId{streamIdIn},
-        maximumData{maximumDataIn},
-        minimumStreamOffset{minimumStreamOffsetIn} {}
-  ~MinStreamDataFrameLog() override = default;
-  folly::dynamic toDynamic() const override;
-};
-
-class ExpiredStreamDataFrameLog : public QLogFrame {
- public:
-  StreamId streamId;
-  uint64_t minimumStreamOffset;
-
-  ExpiredStreamDataFrameLog(StreamId streamIdIn, uint64_t minimumStreamOffsetIn)
-      : streamId{streamIdIn}, minimumStreamOffset{minimumStreamOffsetIn} {}
-  ~ExpiredStreamDataFrameLog() override = default;
   folly::dynamic toDynamic() const override;
 };
 
@@ -401,6 +393,22 @@ class QLogConnectionCloseEvent : public QLogEvent {
   folly::dynamic toDynamic() const override;
 };
 
+struct TransportSummaryArgs {
+  uint64_t totalBytesSent{};
+  uint64_t totalBytesRecvd{};
+  uint64_t sumCurWriteOffset{};
+  uint64_t sumMaxObservedOffset{};
+  uint64_t sumCurStreamBufferLen{};
+  uint64_t totalBytesRetransmitted{};
+  uint64_t totalStreamBytesCloned{};
+  uint64_t totalBytesCloned{};
+  uint64_t totalCryptoDataWritten{};
+  uint64_t totalCryptoDataRecvd{};
+  uint64_t currentWritableBytes{};
+  uint64_t currentConnFlowControl{};
+  bool usedZeroRtt{};
+};
+
 class QLogTransportSummaryEvent : public QLogEvent {
  public:
   QLogTransportSummaryEvent(
@@ -414,6 +422,10 @@ class QLogTransportSummaryEvent : public QLogEvent {
       uint64_t totalBytesCloned,
       uint64_t totalCryptoDataWritten,
       uint64_t totalCryptoDataRecvd,
+      uint64_t currentWritableBytes,
+      uint64_t currentConnFlowControl,
+      bool usedZeroRtt,
+      QuicVersion version,
       std::chrono::microseconds refTimeIn);
   ~QLogTransportSummaryEvent() override = default;
   uint64_t totalBytesSent;
@@ -426,6 +438,10 @@ class QLogTransportSummaryEvent : public QLogEvent {
   uint64_t totalBytesCloned;
   uint64_t totalCryptoDataWritten;
   uint64_t totalCryptoDataRecvd;
+  uint64_t currentWritableBytes;
+  uint64_t currentConnFlowControl;
+  bool usedZeroRtt;
+  QuicVersion quicVersion;
 
   folly::dynamic toDynamic() const override;
 };

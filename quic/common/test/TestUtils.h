@@ -8,14 +8,18 @@
 
 #pragma once
 
+#include <quic/api/QuicBatchWriter.h>
 #include <quic/codec/QuicPacketBuilder.h>
 #include <quic/codec/Types.h>
 #include <quic/common/BufUtil.h>
 #include <quic/fizz/client/handshake/QuicPskCache.h>
+#include <quic/fizz/handshake/FizzCryptoFactory.h>
+#include <quic/fizz/server/handshake/FizzServerHandshake.h>
 #include <quic/handshake/test/Mocks.h>
 #include <quic/logging/FileQLogger.h>
 #include <quic/server/state/ServerStateMachine.h>
 #include <quic/state/AckStates.h>
+#include <quic/state/QuicStreamManager.h>
 #include <quic/state/StateData.h>
 
 #include <fizz/client/FizzClientContext.h>
@@ -138,9 +142,32 @@ QuicCachedPsk setupZeroRttOnClientCtx(
     fizz::client::FizzClientContext& clientCtx,
     std::string hostname);
 
+template <class T>
+std::unique_ptr<T> createNoOpAeadImpl() {
+  // Fake that the handshake has already occured
+  auto aead = std::make_unique<testing::NiceMock<T>>();
+  ON_CALL(*aead, _inplaceEncrypt(testing::_, testing::_, testing::_))
+      .WillByDefault(testing::Invoke([&](auto& buf, auto, auto) {
+        if (buf) {
+          return std::move(buf);
+        } else {
+          return folly::IOBuf::create(0);
+        }
+      }));
+  // Fake that the handshake has already occured and fix the keys.
+  ON_CALL(*aead, _decrypt(testing::_, testing::_, testing::_))
+      .WillByDefault(
+          testing::Invoke([&](auto& buf, auto, auto) { return buf->clone(); }));
+  ON_CALL(*aead, _tryDecrypt(testing::_, testing::_, testing::_))
+      .WillByDefault(
+          testing::Invoke([&](auto& buf, auto, auto) { return buf->clone(); }));
+  ON_CALL(*aead, getCipherOverhead()).WillByDefault(testing::Return(0));
+  return aead;
+}
+
 std::unique_ptr<MockAead> createNoOpAead();
 
-std::unique_ptr<PacketNumberCipher> createNoOpHeaderCipher();
+std::unique_ptr<MockPacketNumberCipher> createNoOpHeaderCipher();
 
 uint64_t computeExpectedDelay(
     std::chrono::microseconds ackDelay,
@@ -221,7 +248,8 @@ OutstandingPacket makeTestingWritePacket(
     size_t desiredSize,
     uint64_t totalBytesSent,
     TimePoint sentTime = Clock::now(),
-    uint64_t inflightBytes = 0);
+    uint64_t inflightBytes = 0,
+    uint64_t writeCount = 0);
 
 // TODO: The way we setup packet sent, ack, loss in test cases can use some
 // major refactor.
@@ -290,5 +318,241 @@ void overridePacketWithToken(
 void overridePacketWithToken(
     folly::IOBuf& bodyBuf,
     const StatelessResetToken& token);
+
+/*
+ * Returns if the current writable streams contains the given id.
+ */
+bool writableContains(QuicStreamManager& streamManager, StreamId streamId);
+
+class FizzCryptoTestFactory : public FizzCryptoFactory {
+ public:
+  FizzCryptoTestFactory() = default;
+  explicit FizzCryptoTestFactory(std::shared_ptr<fizz::Factory> fizzFactory) {
+    fizzFactory_ = std::move(fizzFactory);
+  }
+
+  ~FizzCryptoTestFactory() override = default;
+
+  using FizzCryptoFactory::makePacketNumberCipher;
+  std::unique_ptr<PacketNumberCipher> makePacketNumberCipher(
+      fizz::CipherSuite) const override;
+
+  MOCK_CONST_METHOD1(
+      _makePacketNumberCipher,
+      std::unique_ptr<PacketNumberCipher>(folly::ByteRange));
+
+  std::unique_ptr<PacketNumberCipher> makePacketNumberCipher(
+      folly::ByteRange secret) const override;
+
+  void setMockPacketNumberCipher(
+      std::unique_ptr<PacketNumberCipher> packetNumberCipher);
+
+  void setDefault();
+
+  mutable std::unique_ptr<PacketNumberCipher> packetNumberCipher_;
+};
+
+class TestPacketBatchWriter : public IOBufBatchWriter {
+ public:
+  explicit TestPacketBatchWriter(int maxBufs) : maxBufs_(maxBufs) {}
+  ~TestPacketBatchWriter() override {
+    CHECK_EQ(bufNum_, 0);
+    CHECK_EQ(bufSize_, 0);
+  }
+
+  void reset() override;
+
+  bool append(
+      std::unique_ptr<folly::IOBuf>&& /*unused*/,
+      size_t size,
+      const folly::SocketAddress& /*unused*/,
+      folly::AsyncUDPSocket* /*unused*/) override;
+
+  ssize_t write(
+      folly::AsyncUDPSocket& /*unused*/,
+      const folly::SocketAddress& /*unused*/) override;
+
+  size_t getBufSize() const {
+    return bufSize_;
+  }
+
+ private:
+  int maxBufs_{0};
+  int bufNum_{0};
+  size_t bufSize_{0};
+};
+
+TrafficKey getQuicTestKey();
+std::unique_ptr<folly::IOBuf> getProtectionKey();
+
+class FakeServerHandshake : public FizzServerHandshake {
+ public:
+  explicit FakeServerHandshake(
+      QuicServerConnectionState& conn,
+      std::shared_ptr<FizzServerQuicHandshakeContext> fizzContext,
+      bool chloSync = false,
+      bool cfinSync = false,
+      folly::Optional<uint64_t> clientActiveConnectionIdLimit = folly::none)
+      : FizzServerHandshake(
+            &conn,
+            std::move(fizzContext),
+            std::make_unique<FizzCryptoFactory>()),
+        conn_(conn),
+        chloSync_(chloSync),
+        cfinSync_(cfinSync),
+        clientActiveConnectionIdLimit_(
+            std::move(clientActiveConnectionIdLimit)) {}
+
+  void accept(std::shared_ptr<ServerTransportParametersExtension>) override {}
+
+  MOCK_METHOD1(writeNewSessionTicket, void(const AppToken&));
+
+  void doHandshake(std::unique_ptr<folly::IOBuf> data, EncryptionLevel)
+      override {
+    folly::IOBufEqualTo eq;
+    auto chlo = folly::IOBuf::copyBuffer("CHLO");
+    auto clientFinished = folly::IOBuf::copyBuffer("FINISHED");
+    if (eq(data, chlo)) {
+      if (chloSync_) {
+        // Do NOT invoke onCryptoEventAvailable callback
+        // Fall through and let the ServerStateMachine to process the event
+        writeDataToQuicStream(
+            *getCryptoStream(*conn_.cryptoState, EncryptionLevel::Initial),
+            folly::IOBuf::copyBuffer("SHLO"));
+        if (allowZeroRttKeys_) {
+          validateAndUpdateSourceToken(conn_, sourceAddrs_);
+          phase_ = Phase::KeysDerived;
+          setEarlyKeys();
+        }
+        setHandshakeKeys();
+      } else {
+        // Asynchronously schedule the callback
+        executor_->add([&] {
+          writeDataToQuicStream(
+              *getCryptoStream(*conn_.cryptoState, EncryptionLevel::Initial),
+              folly::IOBuf::copyBuffer("SHLO"));
+          if (allowZeroRttKeys_) {
+            validateAndUpdateSourceToken(conn_, sourceAddrs_);
+            phase_ = Phase::KeysDerived;
+            setEarlyKeys();
+          }
+          setHandshakeKeys();
+          if (callback_) {
+            callback_->onCryptoEventAvailable();
+          }
+        });
+      }
+    } else if (eq(data, clientFinished)) {
+      if (cfinSync_) {
+        // Do NOT invoke onCryptoEventAvailable callback
+        // Fall through and let the ServerStateMachine to process the event
+        setOneRttKeys();
+        phase_ = Phase::Established;
+        handshakeDone_ = true;
+      } else {
+        // Asynchronously schedule the callback
+        executor_->add([&] {
+          setOneRttKeys();
+          phase_ = Phase::Established;
+          handshakeDone_ = true;
+          if (callback_) {
+            callback_->onCryptoEventAvailable();
+          }
+        });
+      }
+    }
+  }
+
+  folly::Optional<ClientTransportParameters> getClientTransportParams()
+      override {
+    std::vector<TransportParameter> transportParams;
+    transportParams.push_back(encodeIntegerParameter(
+        TransportParameterId::initial_max_stream_data_bidi_local,
+        kDefaultStreamWindowSize));
+    transportParams.push_back(encodeIntegerParameter(
+        TransportParameterId::initial_max_stream_data_bidi_remote,
+        kDefaultStreamWindowSize));
+    transportParams.push_back(encodeIntegerParameter(
+        TransportParameterId::initial_max_stream_data_uni,
+        kDefaultStreamWindowSize));
+    transportParams.push_back(encodeIntegerParameter(
+        TransportParameterId::initial_max_streams_bidi,
+        kDefaultMaxStreamsBidirectional));
+    transportParams.push_back(encodeIntegerParameter(
+        TransportParameterId::initial_max_streams_uni,
+        kDefaultMaxStreamsUnidirectional));
+    transportParams.push_back(encodeIntegerParameter(
+        TransportParameterId::initial_max_data, kDefaultConnectionWindowSize));
+    transportParams.push_back(encodeIntegerParameter(
+        TransportParameterId::idle_timeout, kDefaultIdleTimeout.count()));
+    transportParams.push_back(encodeIntegerParameter(
+        TransportParameterId::max_packet_size, maxRecvPacketSize));
+    if (clientActiveConnectionIdLimit_) {
+      transportParams.push_back(encodeIntegerParameter(
+          TransportParameterId::active_connection_id_limit,
+          *clientActiveConnectionIdLimit_));
+    }
+    transportParams.push_back(encodeConnIdParameter(
+        TransportParameterId::initial_source_connection_id,
+        getTestConnectionId()));
+
+    return ClientTransportParameters{std::move(transportParams)};
+  }
+
+  void setEarlyKeys() {
+    oneRttWriteCipher_ = createNoOpAead();
+    oneRttWriteHeaderCipher_ = createNoOpHeaderCipher();
+    zeroRttReadCipher_ = createNoOpAead();
+    zeroRttReadHeaderCipher_ = createNoOpHeaderCipher();
+  }
+
+  void setOneRttKeys() {
+    // Mimic ServerHandshake behavior.
+    // oneRttWriteCipher would already be set during ReportEarlyHandshakeSuccess
+    if (!allowZeroRttKeys_) {
+      auto mockOneRttWriteCipher = createNoOpAead();
+      ON_CALL(*mockOneRttWriteCipher, getKey())
+          .WillByDefault(testing::Invoke([]() { return getQuicTestKey(); }));
+      oneRttWriteCipher_ = std::move(mockOneRttWriteCipher);
+      auto mockOneRttWriteHeaderCipher = createNoOpHeaderCipher();
+      mockOneRttWriteHeaderCipher->setDefaultKey();
+      oneRttWriteHeaderCipher_ = std::move(mockOneRttWriteHeaderCipher);
+    }
+    oneRttReadCipher_ = createNoOpAead();
+    oneRttReadHeaderCipher_ = createNoOpHeaderCipher();
+  }
+
+  void setHandshakeKeys() {
+    conn_.handshakeWriteCipher = createNoOpAead();
+    conn_.handshakeWriteHeaderCipher = createNoOpHeaderCipher();
+    handshakeReadCipher_ = createNoOpAead();
+    handshakeReadHeaderCipher_ = createNoOpHeaderCipher();
+  }
+
+  void setHandshakeDone(bool done) {
+    handshakeDone_ = done;
+  }
+
+  void allowZeroRttKeys() {
+    allowZeroRttKeys_ = true;
+  }
+
+  void setSourceTokens(std::vector<folly::IPAddress> srcAddrs) {
+    sourceAddrs_ = std::move(srcAddrs);
+  }
+
+  void setCipherSuite(fizz::CipherSuite cipher) {
+    state_.cipher() = cipher;
+  }
+
+  QuicServerConnectionState& conn_;
+  bool chloSync_{false};
+  bool cfinSync_{false};
+  uint64_t maxRecvPacketSize{kDefaultMaxUDPPayload};
+  bool allowZeroRttKeys_{false};
+  std::vector<folly::IPAddress> sourceAddrs_;
+  folly::Optional<uint64_t> clientActiveConnectionIdLimit_;
+};
+
 } // namespace test
 } // namespace quic

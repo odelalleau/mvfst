@@ -1,3 +1,11 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ *
+ */
+
 #pragma once
 
 #include <glog/logging.h>
@@ -19,16 +27,12 @@ struct Priority {
 
   Priority(uint8_t l, bool i) : level(l), incremental(i) {}
 
-  bool operator==(Priority other) {
+  bool operator==(Priority other) const noexcept {
     return level == other.level && incremental == other.incremental;
   }
 };
 
-/**
- * Default priority, urgency = 3, incremental = true
- * Note this is different from the priority draft where default incremental = 0
- */
-const Priority kDefaultPriority(3, true);
+extern const Priority kDefaultPriority;
 
 /**
  * Priority queue for Quic streams.  It represents each level/incremental bucket

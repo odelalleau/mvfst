@@ -7,6 +7,7 @@
  */
 
 #include <quic/codec/Decode.h>
+
 #include <folly/Random.h>
 #include <folly/container/Array.h>
 #include <folly/io/IOBuf.h>
@@ -130,11 +131,12 @@ std::unique_ptr<folly::IOBuf> createCryptoFrame(
 TEST_F(DecodeTest, VersionNegotiationPacketDecodeTest) {
   ConnectionId srcCid = getTestConnectionId(0),
                destCid = getTestConnectionId(1);
-  std::vector<QuicVersion> versions{{static_cast<QuicVersion>(1234),
-                                     static_cast<QuicVersion>(4321),
-                                     static_cast<QuicVersion>(2341),
-                                     static_cast<QuicVersion>(3412),
-                                     static_cast<QuicVersion>(4123)}};
+  std::vector<QuicVersion> versions{
+      {static_cast<QuicVersion>(1234),
+       static_cast<QuicVersion>(4321),
+       static_cast<QuicVersion>(2341),
+       static_cast<QuicVersion>(3412),
+       static_cast<QuicVersion>(4123)}};
   auto packet =
       VersionNegotiationPacketBuilder(srcCid, destCid, versions).buildPacket();
   auto codec = std::make_unique<QuicReadCodec>(QuicNodeType::Server);
@@ -151,11 +153,12 @@ TEST_F(DecodeTest, VersionNegotiationPacketDecodeTest) {
 TEST_F(DecodeTest, DifferentCIDLength) {
   ConnectionId sourceConnectionId = getTestConnectionId();
   ConnectionId destinationConnectionId({1, 2, 3, 4, 5, 6});
-  std::vector<QuicVersion> versions{{static_cast<QuicVersion>(1234),
-                                     static_cast<QuicVersion>(4321),
-                                     static_cast<QuicVersion>(2341),
-                                     static_cast<QuicVersion>(3412),
-                                     static_cast<QuicVersion>(4123)}};
+  std::vector<QuicVersion> versions{
+      {static_cast<QuicVersion>(1234),
+       static_cast<QuicVersion>(4321),
+       static_cast<QuicVersion>(2341),
+       static_cast<QuicVersion>(3412),
+       static_cast<QuicVersion>(4123)}};
   auto packet = VersionNegotiationPacketBuilder(
                     sourceConnectionId, destinationConnectionId, versions)
                     .buildPacket();
@@ -572,6 +575,50 @@ TEST_F(DecodeTest, StreamIncorrectDataLength) {
   EXPECT_THROW(decodeStreamFrame(queue, streamType), QuicTransportException);
 }
 
+std::unique_ptr<folly::IOBuf> CreateMaxStreamsIdFrame(
+    unsigned long long maxStreamsId) {
+  std::unique_ptr<folly::IOBuf> buf = folly::IOBuf::create(sizeof(QuicInteger));
+  BufAppender wcursor(buf.get(), sizeof(QuicInteger));
+  auto appenderOp = [&](auto val) { wcursor.writeBE(val); };
+  QuicInteger maxStreamsIdVal(maxStreamsId);
+  maxStreamsIdVal.encode(appenderOp);
+  return buf;
+}
+
+// Uni and BiDi have same max limits so uses single 'frame' to check both.
+void MaxStreamsIdCheckSuccess(StreamId maxStreamsId) {
+  std::unique_ptr<folly::IOBuf> buf = CreateMaxStreamsIdFrame(maxStreamsId);
+
+  folly::io::Cursor cursorBiDi(buf.get());
+  MaxStreamsFrame maxStreamsBiDiFrame = decodeBiDiMaxStreamsFrame(cursorBiDi);
+  EXPECT_EQ(maxStreamsBiDiFrame.maxStreams, maxStreamsId);
+
+  folly::io::Cursor cursorUni(buf.get());
+  MaxStreamsFrame maxStreamsUniFrame = decodeUniMaxStreamsFrame(cursorUni);
+  EXPECT_EQ(maxStreamsUniFrame.maxStreams, maxStreamsId);
+}
+
+// Uni and BiDi have same max limits so uses single 'frame' to check both.
+void MaxStreamsIdCheckInvalid(StreamId maxStreamsId) {
+  std::unique_ptr<folly::IOBuf> buf = CreateMaxStreamsIdFrame(maxStreamsId);
+
+  folly::io::Cursor cursorBiDi(buf.get());
+  EXPECT_THROW(decodeBiDiMaxStreamsFrame(cursorBiDi), QuicTransportException);
+
+  folly::io::Cursor cursorUni(buf.get());
+  EXPECT_THROW(decodeUniMaxStreamsFrame(cursorUni), QuicTransportException);
+}
+
+TEST_F(DecodeTest, MaxStreamsIdChecks) {
+  MaxStreamsIdCheckSuccess(0);
+  MaxStreamsIdCheckSuccess(123);
+  MaxStreamsIdCheckSuccess(kMaxMaxStreams);
+
+  MaxStreamsIdCheckInvalid(kMaxMaxStreams + 1);
+  MaxStreamsIdCheckInvalid(kMaxMaxStreams + 123);
+  MaxStreamsIdCheckInvalid(kMaxStreamId - 1);
+}
+
 TEST_F(DecodeTest, CryptoDecodeSuccess) {
   QuicInteger offset(10);
   QuicInteger length(1);
@@ -685,57 +732,6 @@ TEST_F(DecodeTest, NewTokenIncorrectDataLength) {
       createNewTokenFrame(length, folly::IOBuf::copyBuffer("a"));
   folly::io::Cursor cursor(newTokenFrame.get());
   EXPECT_THROW(decodeNewTokenFrame(cursor), QuicTransportException);
-}
-
-std::unique_ptr<folly::IOBuf> createMinOrExpiredStreamDataFrame(
-    QuicInteger streamId,
-    folly::Optional<QuicInteger> maximumData = folly::none,
-    folly::Optional<QuicInteger> minimumStreamOffset = folly::none) {
-  std::unique_ptr<folly::IOBuf> bufQueue = folly::IOBuf::create(0);
-  BufAppender wcursor(bufQueue.get(), 10);
-  auto appenderOp = [&](auto val) { wcursor.writeBE(val); };
-  streamId.encode(appenderOp);
-
-  if (maximumData) {
-    maximumData->encode(appenderOp);
-  }
-
-  if (minimumStreamOffset) {
-    minimumStreamOffset->encode(appenderOp);
-  }
-  return bufQueue;
-}
-
-TEST_F(DecodeTest, DecodeMinStreamDataFrame) {
-  QuicInteger streamId(10);
-  QuicInteger maximumData(1000);
-  QuicInteger minimumStreamOffset(100);
-  auto noOffset = createMinOrExpiredStreamDataFrame(streamId, maximumData);
-  folly::io::Cursor cursor0(noOffset.get());
-  EXPECT_THROW(decodeMinStreamDataFrame(cursor0), QuicTransportException);
-
-  auto minStreamDataFrame = createMinOrExpiredStreamDataFrame(
-      streamId, maximumData, minimumStreamOffset);
-  folly::io::Cursor cursor(minStreamDataFrame.get());
-  auto result = decodeMinStreamDataFrame(cursor);
-  EXPECT_EQ(result.streamId, 10);
-  EXPECT_EQ(result.maximumData, 1000);
-  EXPECT_EQ(result.minimumStreamOffset, 100);
-}
-
-TEST_F(DecodeTest, DecodeExpiredStreamDataFrame) {
-  QuicInteger streamId(10);
-  QuicInteger offset(100);
-  auto noOffset = createMinOrExpiredStreamDataFrame(streamId);
-  folly::io::Cursor cursor0(noOffset.get());
-  EXPECT_THROW(decodeExpiredStreamDataFrame(cursor0), QuicTransportException);
-
-  auto expiredStreamDataFrame =
-      createMinOrExpiredStreamDataFrame(streamId, folly::none, offset);
-  folly::io::Cursor cursor(expiredStreamDataFrame.get());
-  auto result = decodeExpiredStreamDataFrame(cursor);
-  EXPECT_EQ(result.streamId, 10);
-  EXPECT_EQ(result.minimumStreamOffset, 100);
 }
 
 TEST_F(DecodeTest, ParsePlaintextRetryToken) {

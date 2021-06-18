@@ -9,7 +9,6 @@
 #pragma once
 
 #include <quic/codec/Types.h>
-#include <quic/state/QPRFunctions.h>
 #include <quic/state/StateData.h>
 
 namespace quic {
@@ -44,7 +43,7 @@ void updateSimpleFrameOnPacketLoss(
 
 /*
  * Update the connection state on receipt of the given simple frame.
- * Returns true if the frame is not a probing frame
+ * Returns true if the frame is NOT a probing frame
  */
 bool updateSimpleFrameOnPacketReceived(
     QuicConnectionStateBase& conn,

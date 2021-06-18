@@ -23,10 +23,12 @@
 #include <quic/congestion_control/ServerCongestionControllerFactory.h>
 #include <quic/fizz/client/handshake/FizzClientQuicHandshakeContext.h>
 #include <quic/server/AcceptObserver.h>
+#include <quic/server/QuicCcpThreadLauncher.h>
 #include <quic/server/QuicServer.h>
 #include <quic/server/QuicServerTransport.h>
 #include <quic/server/QuicSharedUDPSocketFactory.h>
 #include <quic/tools/tperf/PacingObserver.h>
+#include <quic/tools/tperf/TperfDSRSender.h>
 #include <quic/tools/tperf/TperfQLogger.h>
 
 DEFINE_string(host, "::1", "TPerf server hostname/IP");
@@ -117,6 +119,7 @@ DEFINE_string(
     transport_knob_params,
     "",
     "JSON-serialized dictionary of transport knob params");
+DEFINE_bool(dsr, false, "if you want to debug perf");
 // RL-specific arguments.
 DEFINE_string(
     cc_env_mode,
@@ -358,13 +361,12 @@ ProbeSizeRaiserType parseRaiserType(uint32_t type) {
   }
 }
 
-class TPerfInstrumentationObserver : public InstrumentationObserver {
+class TPerfObserver : public Observer {
  public:
-  void observerDetach(QuicSocket* /* socket */) noexcept override {
-    // do nothing
-  }
-
-  void appRateLimited(QuicSocket* /* socket */) override {
+  TPerfObserver(const Observer::Config& config) : Observer(config) {}
+  void appRateLimited(
+      QuicSocket* /* socket */,
+      const quic::Observer::AppLimitedEvent& /* appLimitedEvent */) override {
     if (FLAGS_log_app_rate_limited) {
       LOG(INFO) << "appRateLimited detected";
     }
@@ -372,7 +374,7 @@ class TPerfInstrumentationObserver : public InstrumentationObserver {
 
   void packetLossDetected(
       QuicSocket*, /* socket */
-      const struct ObserverLossEvent& /* lossEvent */) override {
+      const struct LossEvent& /* lossEvent */) override {
     if (FLAGS_log_loss) {
       LOG(INFO) << "packetLoss detected";
     }
@@ -412,16 +414,24 @@ class TPerfInstrumentationObserver : public InstrumentationObserver {
 };
 
 /**
- * A helper accpetor observer that installs instrumentation observers to
+ * A helper accpetor observer that installs life cycle observers to
  * transport upon accpet
  */
 class TPerfAcceptObserver : public AcceptObserver {
  public:
-  TPerfAcceptObserver()
-      : tperfInstObserver_(std::make_unique<TPerfInstrumentationObserver>()) {}
+  TPerfAcceptObserver() {
+    // Create an observer config, only enabling events we are interested in
+    // receiving.
+    Observer::Config config = {};
+    config.appRateLimitedEvents = true;
+    config.pmtuEvents = true;
+    config.rttSamples = true;
+    config.lossEvents = true;
+    tperfObserver_ = std::make_unique<TPerfObserver>(config);
+  }
 
   void accept(QuicTransportBase* transport) noexcept override {
-    transport->addInstrumentationObserver(tperfInstObserver_.get());
+    transport->addObserver(tperfObserver_.get());
   }
 
   void acceptorDestroy(QuicServerWorker* /* worker */) noexcept override {
@@ -437,7 +447,7 @@ class TPerfAcceptObserver : public AcceptObserver {
   }
 
  private:
-  std::unique_ptr<TPerfInstrumentationObserver> tperfInstObserver_;
+  std::unique_ptr<TPerfObserver> tperfObserver_;
 };
 
 } // namespace
@@ -450,11 +460,15 @@ class ServerStreamHandler : public quic::QuicSocket::ConnectionCallback,
       folly::EventBase* evbIn,
       uint64_t blockSize,
       uint32_t numStreams,
-      uint64_t maxBytesPerStream)
+      uint64_t maxBytesPerStream,
+      folly::AsyncUDPSocket& sock,
+      bool dsrEnabled)
       : evb_(evbIn),
         blockSize_(blockSize),
         numStreams_(numStreams),
-        maxBytesPerStream_(maxBytesPerStream) {}
+        maxBytesPerStream_(maxBytesPerStream),
+        udpSock_(sock),
+        dsrEnabled_(dsrEnabled) {}
 
   void setQuicSocket(std::shared_ptr<quic::QuicSocket> socket) {
     sock_ = socket;
@@ -546,15 +560,10 @@ class ServerStreamHandler : public quic::QuicSocket::ConnectionCallback,
         eof = true;
       }
     }
-    auto buf = folly::IOBuf::createChain(toSend, blockSize_);
-    auto curBuf = buf.get();
-    do {
-      curBuf->append(curBuf->capacity());
-      curBuf = curBuf->next();
-    } while (curBuf != buf.get());
-    auto res = sock_->writeChain(id, std::move(buf), eof, true, nullptr);
-    if (res.hasError()) {
-      LOG(FATAL) << "Got error on write: " << quic::toString(res.error());
+    if (dsrEnabled_) {
+      dsrSend(id, toSend, eof);
+    } else {
+      regularSend(id, toSend, eof);
     }
     if (!eof) {
       notifyDataForStream(id);
@@ -577,12 +586,53 @@ class ServerStreamHandler : public quic::QuicSocket::ConnectionCallback,
   }
 
  private:
+  void dsrSend(quic::StreamId id, uint64_t toSend, bool eof) {
+    if (streamsHavingDSRSender_.find(id) == streamsHavingDSRSender_.end()) {
+      auto dsrSender = std::make_unique<TperfDSRSender>(blockSize_, udpSock_);
+      auto res =
+          sock_->setDSRPacketizationRequestSender(id, std::move(dsrSender));
+      if (res.hasError()) {
+        LOG(FATAL) << "Got error on write: " << quic::toString(res.error());
+      }
+      // OK I don't know when to erase it...
+      streamsHavingDSRSender_.insert(id);
+      // Some real data has to be written before BufMeta is written, and we
+      // can only do it once:
+      res = sock_->writeChain(id, folly::IOBuf::copyBuffer("Lame"), false);
+      if (res.hasError()) {
+        LOG(FATAL) << "Got error on write: " << quic::toString(res.error());
+      }
+    }
+    BufferMeta bufferMeta(toSend);
+    auto res = sock_->writeBufMeta(id, bufferMeta, eof, nullptr);
+    if (res.hasError()) {
+      LOG(FATAL) << "Got error on write: " << quic::toString(res.error());
+    }
+  }
+
+  void regularSend(quic::StreamId id, uint64_t toSend, bool eof) {
+    auto buf = folly::IOBuf::createChain(toSend, blockSize_);
+    auto curBuf = buf.get();
+    do {
+      curBuf->append(curBuf->capacity());
+      curBuf = curBuf->next();
+    } while (curBuf != buf.get());
+    auto res = sock_->writeChain(id, std::move(buf), eof, nullptr);
+    if (res.hasError()) {
+      LOG(FATAL) << "Got error on write: " << quic::toString(res.error());
+    }
+  }
+
+ private:
   std::shared_ptr<quic::QuicSocket> sock_;
   folly::EventBase* evb_;
   uint64_t blockSize_;
   uint32_t numStreams_;
   uint64_t maxBytesPerStream_;
   std::unordered_map<quic::StreamId, uint64_t> bytesPerStream_;
+  std::set<quic::StreamId> streamsHavingDSRSender_;
+  folly::AsyncUDPSocket& udpSock_;
+  bool dsrEnabled_;
 };
 
 class TPerfServerTransportFactory : public quic::QuicServerTransportFactory {
@@ -592,10 +642,12 @@ class TPerfServerTransportFactory : public quic::QuicServerTransportFactory {
   explicit TPerfServerTransportFactory(
       uint64_t blockSize,
       uint32_t numStreams,
-      uint64_t maxBytesPerStream)
+      uint64_t maxBytesPerStream,
+      bool dsrEnabled)
       : blockSize_(blockSize),
         numStreams_(numStreams),
-        maxBytesPerStream_(maxBytesPerStream) {}
+        maxBytesPerStream_(maxBytesPerStream),
+        dsrEnabled_(dsrEnabled) {}
 
   quic::QuicServerTransport::Ptr make(
       folly::EventBase* evb,
@@ -605,7 +657,7 @@ class TPerfServerTransportFactory : public quic::QuicServerTransportFactory {
       override {
     CHECK_EQ(evb, sock->getEventBase());
     auto serverHandler = std::make_unique<ServerStreamHandler>(
-        evb, blockSize_, numStreams_, maxBytesPerStream_);
+        evb, blockSize_, numStreams_, maxBytesPerStream_, *sock, dsrEnabled_);
     auto transport = quic::QuicServerTransport::make(
         evb, std::move(sock), *serverHandler, ctx);
     if (!FLAGS_server_qlogger_path.empty()) {
@@ -639,6 +691,7 @@ class TPerfServerTransportFactory : public quic::QuicServerTransportFactory {
   uint64_t blockSize_;
   uint32_t numStreams_;
   uint64_t maxBytesPerStream_;
+  bool dsrEnabled_;
 };
 
 class TPerfServer {
@@ -655,7 +708,8 @@ class TPerfServer {
       uint32_t numStreams,
       uint64_t maxBytesPerStream,
       uint32_t maxReceivePacketSize,
-      bool useInplaceWrite)
+      bool useInplaceWrite,
+      bool dsrEnabled)
       : host_(host),
         port_(port),
         acceptObserver_(std::make_unique<TPerfAcceptObserver>()),
@@ -663,7 +717,7 @@ class TPerfServer {
     eventBase_.setName("tperf_server");
     server_->setQuicServerTransportFactory(
         std::make_unique<TPerfServerTransportFactory>(
-            blockSize, numStreams, maxBytesPerStream));
+            blockSize, numStreams, maxBytesPerStream, dsrEnabled));
     auto serverCtx = quic::test::createServerCtx();
     serverCtx->setClock(std::make_shared<fizz::SystemClock>());
     server_->setFizzContext(serverCtx);
@@ -696,6 +750,7 @@ class TPerfServer {
         std::chrono::seconds(FLAGS_d6d_blackhole_detection_window_secs);
     settings.d6dConfig.blackholeDetectionThreshold =
         FLAGS_d6d_blackhole_detection_threshold;
+    settings.dsrEnabled = dsrEnabled;
 
     // RL-based congestion control uses a special factory.
     std::shared_ptr<quic::CongestionControllerFactory> ccFactory =
@@ -706,7 +761,16 @@ class TPerfServer {
     server_->setCongestionControllerFactory(ccFactory);
 
     server_->setTransportSettings(settings);
-    server_->setCcpConfig(FLAGS_ccp_config);
+
+    if (congestionControlType == quic::CongestionControlType::CCP) {
+#ifdef CCP_ENABLED
+      quicCcpThreadLauncher_.start(FLAGS_ccp_config);
+      server_->setCcpId(quicCcpThreadLauncher_.getCcpId());
+#else
+      LOG(ERROR)
+          << "To use CCP you must recompile tperf and all dependencies with -DCCP_ENABLED";
+#endif
+    }
   }
 
   void start() {
@@ -728,6 +792,7 @@ class TPerfServer {
   folly::EventBase eventBase_;
   std::unique_ptr<TPerfAcceptObserver> acceptObserver_;
   std::shared_ptr<quic::QuicServer> server_;
+  quic::QuicCcpThreadLauncher quicCcpThreadLauncher_;
 };
 
 class TPerfClient : public quic::QuicSocket::ConnectionCallback,
@@ -981,7 +1046,8 @@ int main(int argc, char* argv[]) {
         FLAGS_num_streams,
         FLAGS_bytes_per_stream,
         FLAGS_max_receive_packet_size,
-        FLAGS_use_inplace_write);
+        FLAGS_use_inplace_write,
+        FLAGS_dsr);
     server.start();
   } else if (FLAGS_mode == "client") {
     if (FLAGS_num_streams != 1) {

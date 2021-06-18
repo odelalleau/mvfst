@@ -19,7 +19,7 @@
 
 #include <quic/QuicConstants.h>
 #include <quic/codec/ConnectionIdAlgo.h>
-#include <quic/congestion_control/CongestionControllerFactory.h>
+#include <quic/congestion_control/ServerCongestionControllerFactory.h>
 #include <quic/server/QuicServerTransportFactory.h>
 #include <quic/server/QuicServerWorker.h>
 #include <quic/server/QuicUDPSocketFactory.h>
@@ -176,7 +176,13 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
    */
   void setTransportSettings(TransportSettings transportSettings);
 
-  void setCcpConfig(std::string ccpConfig);
+  /**
+   * If the calling application wants to use CCP for CC, it's the
+   * app's responsibility to start an instance of CCP -- this ID
+   * refers to that unique instance of CCP so we (QuicServer) know
+   * how to connect to it.
+   */
+  void setCcpId(uint64_t ccpId);
 
   /**
    * Tells the server to start rejecting any new connection
@@ -227,12 +233,6 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
       RoutingData&& routingData,
       NetworkData&& networkData,
       bool isForwardedData = false) override;
-
-  /**
-   * Set an EventBaseObserver for server and all its workers. This only works
-   * after server is already start()-ed, no-op otherwise.
-   */
-  void setEventBaseObserver(std::shared_ptr<folly::EventBaseObserver> observer);
 
   /**
    * Set the transport factory for the worker associated with the given
@@ -377,10 +377,6 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
       const std::vector<folly::EventBase*>& evbs,
       bool useDefaultTransport);
 
-  // helper function to start ccp thread, if ccp is enabled, otherwise do
-  // nothing
-  void startCcpIfEnabled();
-
   std::unique_ptr<QuicServerWorker> newWorkerWithoutSocket();
 
   // helper method to run the given function in all worker asynchronously
@@ -393,11 +389,12 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
       const folly::SocketAddress& address,
       const std::vector<folly::EventBase*>& evbs);
 
-  std::vector<QuicVersion> supportedVersions_{{QuicVersion::MVFST,
-                                               QuicVersion::MVFST_D24,
-                                               QuicVersion::MVFST_EXPERIMENTAL,
-                                               QuicVersion::QUIC_DRAFT,
-                                               QuicVersion::QUIC_DRAFT_LEGACY}};
+  std::vector<QuicVersion> supportedVersions_{
+      {QuicVersion::MVFST,
+       QuicVersion::MVFST_D24,
+       QuicVersion::MVFST_EXPERIMENTAL,
+       QuicVersion::QUIC_DRAFT,
+       QuicVersion::QUIC_DRAFT_LEGACY}};
 
   bool isUsingCCP();
 
@@ -410,10 +407,7 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
   std::condition_variable startCv_;
   std::atomic<bool> takeoverHandlerInitialized_{false};
   std::vector<std::unique_ptr<folly::ScopedEventBaseThread>> workerEvbs_;
-#ifdef CCP_ENABLED
-  std::unique_ptr<folly::ScopedEventBaseThread> ccpEvb_;
-#endif
-  std::string ccpConfig_;
+
   std::vector<std::unique_ptr<QuicServerWorker>> workers_;
   // Thread local pointer to QuicServerWorker. This is useful to avoid
   // looking up the worker to route to.
@@ -460,6 +454,14 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
 
   // Options to AsyncUDPSocket::bind, only controls IPV6_ONLY currently.
   folly::AsyncUDPSocket::BindOptions bindOptions_;
+
+#ifdef CCP_ENABLED
+  std::unique_ptr<folly::ScopedEventBaseThread> ccpEvb_;
+#endif
+  // Random number to uniquely identify this instance of quic to ccp
+  // in case there are multiple concurrent instances (e.g. when proxygen is
+  // migrating connections and there are two concurrent instances of proxygen)
+  uint64_t ccpId_{0};
 };
 
 } // namespace quic

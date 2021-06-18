@@ -10,7 +10,7 @@
 
 #include <quic/QuicException.h>
 #include <quic/congestion_control/CongestionControlFunctions.h>
-#include <quic/logging/QuicLogger.h>
+
 #include <quic/state/StateData.h>
 
 namespace quic {
@@ -45,6 +45,8 @@ enum class CubicStates : uint8_t {
 
 class Cubic : public CongestionController {
  public:
+  static constexpr uint64_t INIT_SSTHRESH =
+      std::numeric_limits<uint64_t>::max();
   /**
    * initSsthresh:      the initial value of ssthresh
    * ssreduction:       how should cwnd be reduced when loss happens during slow
@@ -56,23 +58,11 @@ class Cubic : public CongestionController {
   // TODO: We haven't experimented with setting ackTrain and tcpFriendly
   explicit Cubic(
       QuicConnectionStateBase& conn,
-      uint64_t initSsthresh = std::numeric_limits<uint64_t>::max(),
+      uint64_t initCwndBytes = 0,
+      uint64_t initSsthresh = INIT_SSTHRESH,
       bool tcpFriendly = true,
       bool ackTrain = false,
       bool spreadAcrossRtt = false);
-
-  class CubicBuilder {
-   public:
-    std::unique_ptr<Cubic> build(QuicConnectionStateBase& conn);
-    CubicBuilder& setAckTrain(bool ackTrain) noexcept;
-    CubicBuilder& setTcpFriendly(bool tcpFriendly) noexcept;
-    CubicBuilder& setPacingSpreadAcrossRtt(bool spreadAcrossRtt) noexcept;
-
-   private:
-    bool tcpFriendly_{true};
-    bool ackTrain_{false};
-    bool spreadAcrossRtt_{false};
-  };
 
   CubicStates state() const noexcept;
 
@@ -100,7 +90,7 @@ class Cubic : public CongestionController {
 
   bool isAppLimited() const noexcept override;
 
-  void getStats(CongestionControllerStats& /*stats*/) const override {}
+  void getStats(CongestionControllerStats& stats) const override;
 
   void handoff(uint64_t newCwnd, uint64_t newInflight) noexcept;
 

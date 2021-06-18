@@ -7,6 +7,7 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -234,7 +235,7 @@ class CachedProject(object):
         )
 
     def is_cacheable(self):
-        """ We only cache third party projects """
+        """We only cache third party projects"""
         return self.cache and self.m.shipit_project is None
 
     def was_cached(self):
@@ -400,6 +401,27 @@ class CleanCmd(SubCmd):
         clean_dirs(opts)
 
 
+@cmd("show-build-dir", "print the build dir for a given project")
+class ShowBuildDirCmd(ProjectCmdBase):
+    def run_project_cmd(self, args, loader, manifest):
+        if args.recursive:
+            manifests = loader.manifests_in_dependency_order()
+        else:
+            manifests = [manifest]
+
+        for m in manifests:
+            inst_dir = loader.get_project_build_dir(m)
+            print(inst_dir)
+
+    def setup_project_cmd_parser(self, parser):
+        parser.add_argument(
+            "--recursive",
+            help="print the transitive deps also",
+            action="store_true",
+            default=False,
+        )
+
+
 @cmd("show-inst-dir", "print the installation dir for a given project")
 class ShowInstDirCmd(ProjectCmdBase):
     def run_project_cmd(self, args, loader, manifest):
@@ -500,6 +522,12 @@ class BuildCmd(ProjectCmdBase):
                     if dep_build:
                         sources_changed = True
 
+                extra_cmake_defines = (
+                    json.loads(args.extra_cmake_defines)
+                    if args.extra_cmake_defines
+                    else {}
+                )
+
                 if sources_changed or reconfigure or not os.path.exists(built_marker):
                     if os.path.exists(built_marker):
                         os.unlink(built_marker)
@@ -512,6 +540,7 @@ class BuildCmd(ProjectCmdBase):
                         ctx,
                         loader,
                         final_install_prefix=loader.get_project_install_prefix(m),
+                        extra_cmake_defines=extra_cmake_defines,
                     )
                     builder.build(install_dirs, reconfigure=reconfigure)
 
@@ -638,6 +667,14 @@ class BuildCmd(ProjectCmdBase):
         )
         parser.add_argument(
             "--schedule-type", help="Indicates how the build was activated"
+        )
+        parser.add_argument(
+            "--extra-cmake-defines",
+            help=(
+                "Input json map that contains extra cmake defines to be used "
+                "when compiling the current project and all its deps. "
+                'e.g: \'{"CMAKE_CXX_FLAGS": "--bla"}\''
+            ),
         )
 
 
@@ -814,8 +851,6 @@ jobs:
             )
 
             getdeps = f"{py3} build/fbcode_builder/getdeps.py"
-            if not args.disallow_system_packages:
-                getdeps += " --allow-system-packages"
 
             out.write("  build:\n")
             out.write("    runs-on: %s\n" % runs_on)
@@ -841,11 +876,6 @@ jobs:
                 # that we want it to use them!
                 out.write("    - name: Fix Git config\n")
                 out.write("      run: git config --system core.longpaths true\n")
-            elif not args.disallow_system_packages:
-                out.write("    - name: Install system deps\n")
-                out.write(
-                    f"      run: sudo {getdeps} install-system-deps --recursive {manifest.name}\n"
-                )
 
             projects = loader.manifests_in_dependency_order()
 

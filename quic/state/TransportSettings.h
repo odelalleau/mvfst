@@ -40,6 +40,11 @@ struct BbrConfig {
   bool drainToTarget{false};
 };
 
+struct CcpConfig {
+  std::string alg_name = "";
+  std::string alg_args = "";
+};
+
 struct D6DConfig {
   /**
    * Currently, only server does probing, so this flags means different things
@@ -48,6 +53,9 @@ struct D6DConfig {
    * whether it will send the base PMTU transport parameter during handshake.
    * As a result, d6d is activated for a connection only when *both* client and
    * server enables d6d.
+   *
+   * TODO: Please make sure QuicConnectionStateBase::D6DState::outstandingProbes
+   * are mutated correctly throughout Mvfst.
    */
   bool enabled{false};
 
@@ -102,6 +110,10 @@ struct D6DConfig {
   ProbeSizeRaiserType raiserType{ProbeSizeRaiserType::ConstantStep};
 };
 
+struct DatagramConfig {
+  bool enabled{false};
+};
+
 // JSON-serialized transport knobs
 struct SerializedKnob {
   uint64_t space;
@@ -146,8 +158,6 @@ struct TransportSettings {
   bool connectUDP{false};
   // Maximum number of consecutive PTOs before the connection is torn down.
   uint16_t maxNumPTOs{kDefaultMaxNumPTO};
-  // Whether to turn off PMTUD on the socket
-  bool turnoffPMTUD{false};
   // Whether to listen to socket error
   bool enableSocketErrMsgCallback{true};
   // Whether pacing is enabled.
@@ -159,6 +169,10 @@ struct TransportSettings {
       kDefaultPacingTimerTickInterval};
   ZeroRttSourceTokenMatchingPolicy zeroRttSourceTokenMatchingPolicy{
       ZeroRttSourceTokenMatchingPolicy::REJECT_IF_NO_EXACT_MATCH};
+  // Scale pacing rate for CC, non-empty indicates override via transport knobs
+  std::pair<uint8_t, uint8_t> startupRttFactor{1, 2};
+  std::pair<uint8_t, uint8_t> defaultRttFactor{4, 5};
+  //
   bool attemptEarlyData{false};
   // Maximum number of packets the connection will write in
   // writeConnectionDataToSocket.
@@ -198,13 +212,12 @@ struct TransportSettings {
       kDefaultRxPacketsBeforeAckInitThreshold};
   uint16_t rxPacketsBeforeAckBeforeInit{kDefaultRxPacketsBeforeAckBeforeInit};
   uint16_t rxPacketsBeforeAckAfterInit{kDefaultRxPacketsBeforeAckAfterInit};
+  folly::Optional<std::chrono::microseconds> minAckDelay;
   // Limits the amount of data that should be buffered in a QuicSocket.
   // If the amount of data in the buffer equals or exceeds this amount, then
   // the callback registered through notifyPendingWriteOnConnection() will
   // not be called
   uint64_t totalBufferSpaceAvailable{kDefaultBufferSpaceAvailable};
-  // Whether or not to advertise partial reliability capability
-  bool partialReliabilityEnabled{false};
   // Whether the endpoint allows peer to migrate to new address
   bool disableMigration{true};
   // Whether or not the socket should gracefully drain on close
@@ -228,6 +241,8 @@ struct TransportSettings {
   bool shouldUseRecvmmsgForBatchRecv{false};
   // Config struct for BBR
   BbrConfig bbrConfig;
+  // Config struct for CCP
+  CcpConfig ccpConfig;
   // A packet is considered loss when a packet that's sent later by at least
   // timeReorderingThreshold * RTT is acked by peer.
   DurationRep timeReorderingThreshDividend{
@@ -245,6 +260,10 @@ struct TransportSettings {
   D6DConfig d6dConfig;
   // Quic knobs
   std::vector<SerializedKnob> knobs;
+  // DSR enabling
+  bool dsrEnabled{false};
+  // Datagram config
+  DatagramConfig datagramConfig;
 };
 
 } // namespace quic
