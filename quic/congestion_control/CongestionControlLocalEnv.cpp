@@ -11,8 +11,8 @@
 namespace quic {
 
 namespace {
-// This should be train/learner.py --hidden_size + 1
-const int kLSTMHiddenSize = 1024 + 1;
+// This should be flags.hidden_size (+ 1 if flags.use_reward is True)
+const int kLSTMHiddenSize = 256;
 }
 
 CongestionControlLocalEnv::CongestionControlLocalEnv(

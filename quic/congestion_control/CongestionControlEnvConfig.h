@@ -113,8 +113,7 @@ struct CongestionControlEnvConfig {
   // Whether to use max delay within a window in reward (avg otherwise)
   bool maxDelayInReward{true};
 
-  // Moving average coefficient used to compute the average ACK delay
-  // (weight of new observations: higher values update the average faster)
+  // Moving average coefficient for ack delay-related computations.
   float ackDelayAvgCoeff{0.1};
 
   // 'fixed' env mode only: the target cwnd value we want to reach
@@ -124,6 +123,12 @@ struct CongestionControlEnvConfig {
 
   // Window duration used to compute the min RTT
   std::chrono::microseconds minRTTWindowLength{kMinRTTWindowLength};
+
+  // Observation scaling factor
+  float obsScaling{1.0};
+
+  /// RLBandwidthSampler settings
+  std::chrono::microseconds bandwidthMinWindowDuration{100'000us};
 
   /// Helper functions
 

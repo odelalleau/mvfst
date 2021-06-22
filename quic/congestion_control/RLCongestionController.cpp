@@ -27,7 +27,7 @@ RLCongestionController::RLCongestionController(
       env_(envFactory->make(this, conn)),
       minRTTFilter_(kMinRTTWindowLength.count(), 0us, 0), // length reset below
       standingRTTFilter_(100000, 0us, 0),                 // 100ms
-      bandwidthSampler_(conn) {
+      bandwidthSampler_(conn, env_->config()) {
   DCHECK(env_);
   const CongestionControlEnv::Config &cfg = env_->config();
   minRTTFilter_.SetWindowLength(cfg.minRTTWindowLength.count());
@@ -141,6 +141,7 @@ bool RLCongestionController::setNetworkState(
   const CongestionControlEnv::Config &cfg = env_->config();
 
   obs[Field::RTT_MIN] = rttMin.count() / 1000.0 / normMs;
+  /*
   obs[Field::RTT_STANDING] = rttStanding / 1000.0 / normMs;
   // `lrtt` is the last observed RTT
   // `ldrtt` is the last observed RTT *including* ACK delay
@@ -149,15 +150,33 @@ bool RLCongestionController::setNetworkState(
   obs[Field::LDRTT] = state.ldrtt.count() / 1000.0 / normMs;
   obs[Field::SRTT] = state.srtt.count() / 1000.0 / normMs;
   obs[Field::RTT_VAR] = state.rttvar.count() / 1000.0 / normMs;
+  */
   obs[Field::DELAY] = delay / 1000.0 / normMs;
 
   // The ACK delay is smoothed with an exponential moving average.
-  avgAckDelayMs_ =
-      (1.f - cfg.ackDelayAvgCoeff) * avgAckDelayMs_ +
-      cfg.ackDelayAvgCoeff * state.lastAckDelay.count() / 1000.f;
+  avgAckDelayMs_ = (1.f - cfg.ackDelayAvgCoeff) * avgAckDelayMs_ +
+                   cfg.ackDelayAvgCoeff * state.lastAckDelay.count() / 1000.f;
   obs[Field::ACK_DELAY] = avgAckDelayMs_ / normMs;
 
-  obs[Field::CWND] = cwndBytes_ / normBytes;
+  // Normalize CWND field such that max value is 1.
+  obs[Field::CWND] =
+      cwndBytes_ / static_cast<float>(conn_.transportSettings.maxCwndInMss *
+                                      conn_.udpSendPacketLen);
+
+  // We compute a throughput estimate as CWND / total RTT (including ACK delay).
+  // Note that this estimate does *not* account for lost bytes.
+  // The total RTT is smoothed with the same coefficient as for
+  // `avgAckDelayMs_`.
+  if (avgRTTWithDelayMs_ <= 0.f) {
+    avgRTTWithDelayMs_ = state.ldrtt.count() / 1000.f;
+  } else {
+    avgRTTWithDelayMs_ = (1.f - cfg.ackDelayAvgCoeff) * avgRTTWithDelayMs_ +
+                         cfg.ackDelayAvgCoeff * state.ldrtt.count() / 1000.f;
+  }
+  obs[Field::THROUGHPUT_FROM_CWND] =
+      cwndBytes_ / std::max(1.f, avgRTTWithDelayMs_) * 1000.f / normBytes;
+
+  /*
   obs[Field::IN_FLIGHT] = bytesInFlight_ / normBytes;
   obs[Field::WRITABLE] = getWritableBytes() / normBytes;
   obs[Field::SENT] = (state.totalBytesSent - prevTotalBytesSent_) / normBytes;
@@ -166,6 +185,7 @@ bool RLCongestionController::setNetworkState(
   obs[Field::RETRANSMITTED] =
       (state.totalBytesRetransmitted - prevTotalBytesRetransmitted_) /
       normBytes;
+  */
 
   // The throughput is in bytes / s => we normalize it with `normBytes`.
   DCHECK(bandwidthSampler_.getBandwidth().unitType ==
@@ -173,6 +193,12 @@ bool RLCongestionController::setNetworkState(
   obs[Field::THROUGHPUT] =
       bandwidthSampler_.getBandwidth().normalize() / normBytes;
 
+  // This is the (log) ratio of the throughput measured from ACK events vs. the estimated
+  // throughput based on CWND.
+  obs[Field::THROUGHPUT_LOG_RATIO] =
+      log(1e-5 + obs[Field::THROUGHPUT] / obs[Field::THROUGHPUT_FROM_CWND]);
+
+  /*
   obs[Field::PTO_COUNT] = state.ptoCount;
   obs[Field::TOTAL_PTO_DELTA] = state.totalPTOCount - prevTotalPTOCount_;
   obs[Field::RTX_COUNT] = state.rtxCount - prevRtxCount_;
@@ -185,8 +211,9 @@ bool RLCongestionController::setNetworkState(
 
   if (loss) {
     obs[Field::LOST] = loss->lostBytes / normBytes;
-    obs[Field::PERSISTENT_CONGESTION] = loss->persistentCongestion;
+    // obs[Field::PERSISTENT_CONGESTION] = loss->persistentCongestion;
   }
+  */
 
   // Update prev state values
   prevTotalBytesSent_ = state.totalBytesSent;

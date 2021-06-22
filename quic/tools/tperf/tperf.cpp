@@ -246,8 +246,18 @@ DEFINE_uint64(
 DEFINE_double(
     cc_env_ack_delay_avg_coeff,
     0.1,
-    "Moving average coefficient used to compute the average ACK delay "
-    "(weight of new observations: higher values update the average faster)");
+    "Moving average coefficient used to compute the average ACK delay, as "
+    "well as the average total RTT (including ACK delay). "
+    "This is the weight of new observations: higher values update the average "
+    "faster.");
+DEFINE_uint32(
+    cc_env_bandwidth_min_window_duration_ms,
+    100,
+    "Minimum duration over which the bandwidth is computed (in ms)");
+DEFINE_double(
+    cc_env_obs_scaling,
+    1.0,
+    "Factor by which the observation vector should be scaled");
 
 namespace quic {
 namespace tperf {
@@ -343,6 +353,9 @@ makeRLCongestionControllerFactory() {
   cfg.minRTTWindowLength =
       std::chrono::microseconds(FLAGS_cc_env_min_rtt_window_length_us);
   cfg.ackDelayAvgCoeff = FLAGS_cc_env_ack_delay_avg_coeff;
+  cfg.bandwidthMinWindowDuration =
+      std::chrono::milliseconds(FLAGS_cc_env_bandwidth_min_window_duration_ms);
+  cfg.obsScaling = FLAGS_cc_env_obs_scaling;
 
   auto envFactory = std::make_shared<quic::CongestionControlEnvFactory>(cfg);
   return std::make_shared<quic::RLCongestionControllerFactory>(envFactory);

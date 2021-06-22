@@ -21,7 +21,7 @@ static const float kBytesToMB = 1.f / 1048576.f; // 1 / (1024 * 1024)
 
 CongestionControlEnv::CongestionControlEnv(const Config &cfg, Callback *cob,
                                            const QuicConnectionStateBase &conn)
-    : cfg_(cfg), cob_(CHECK_NOTNULL(cob)), conn_(conn),
+    : cfg_(cfg), conn_(conn), cob_(CHECK_NOTNULL(cob)),
       evb_(folly::EventBaseManager::get()->getEventBase()),
       observationTimeout_(this, evb_),
       cwndBytes_(conn.transportSettings.initCwndInMss * conn.udpSendPacketLen),
@@ -43,7 +43,10 @@ void CongestionControlEnv::onAction(const Action &action) {
 
     // Update history
     history_.pop_front();
-    history_.emplace_back(action, cwndBytes_ / normBytes());
+    history_.emplace_back(
+        action,
+        cwndBytes_ / static_cast<float>(conn_.transportSettings.maxCwndInMss *
+                                        conn_.udpSendPacketLen));
 
     const auto &elapsed = std::chrono::duration<float, std::milli>(
         std::chrono::steady_clock::now() - lastObservationTime_);
@@ -160,9 +163,16 @@ quic::utils::vector<NetworkState> CongestionControlEnv::stateSummary(
   // Certain stats for some fields don't make sense such as sum over
   // RTT from ACKs. Zero-out them.
   static const quic::utils::vector<Field> invalidSumFields = {
-      Field::RTT_MIN, Field::RTT_STANDING, Field::LRTT,     Field::LDRTT,
-      Field::SRTT,    Field::RTT_VAR,      Field::DELAY,    Field::ACK_DELAY,
-      Field::CWND,    Field::IN_FLIGHT,    Field::WRITABLE,
+      Field::RTT_MIN,
+      // Field::RTT_STANDING, Field::LRTT,     Field::LDRTT,
+      // Field::SRTT,    Field::RTT_VAR,
+      Field::DELAY,
+      Field::ACK_DELAY,
+      Field::CWND,
+      Field::THROUGHPUT_FROM_CWND,
+      // Field::IN_FLIGHT,    Field::WRITABLE,
+      Field::THROUGHPUT,
+      Field::THROUGHPUT_LOG_RATIO,
   };
   for (const Field field : invalidSumFields) {
     summaryStates[0][field] = 0.0;
@@ -196,7 +206,7 @@ float CongestionControlEnv::computeReward(
     avgDelay += state[Field::DELAY];
     maxDelay = std::max(maxDelay, state[Field::DELAY]);
     avgAckDelay += state[Field::ACK_DELAY];
-    totalLost += state[Field::LOST];
+    // totalLost += state[Field::LOST];
     minRtt = std::min(minRtt, state[Field::RTT_MIN]);
   }
   avgThroughput /= states.size();
@@ -337,8 +347,10 @@ float CongestionControlEnv::computeReward(
       rewardDelay =
           std::min(1.f, std::max(0.f, std::min(rewardRTT, rewardQueue)));
     }
-    reward = cfg_.throughputFactor * 2.f * (rewardThroughput - 0.5f) +
-             cfg_.delayFactor * 2.f * (rewardDelay - 0.5f);
+    reward = (cfg_.throughputFactor * 2.f * (rewardThroughput - 0.5f) +
+              cfg_.delayFactor * 2.f * (rewardDelay - 0.5f)) /
+             (cfg_.throughputFactor + cfg_.delayFactor);
+
     break;
   }
 
@@ -400,6 +412,9 @@ void CongestionControlEnv::Observation::toTensor(torch::Tensor &tensor) const {
     }
     tensor_a[x++] = h.cwnd;
   }
+
+  // Scale final observation.
+  tensor *= cfg_.obsScaling;
 
   CHECK_EQ(x, dim);
 }

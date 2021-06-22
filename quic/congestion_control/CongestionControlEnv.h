@@ -96,6 +96,7 @@ protected:
                                uint32_t actionIdx) const;
 
   const Config &cfg_;
+  const QuicConnectionStateBase &conn_;
 
 private:
   class ObservationTimeout : public folly::HHWheelTimer::Callback {
@@ -137,7 +138,6 @@ private:
   stateSummary(const quic::utils::vector<NetworkState> &states);
 
   Callback *cob_{nullptr};
-  const QuicConnectionStateBase &conn_;
   folly::EventBase *evb_{nullptr};
   ObservationTimeout observationTimeout_;
 
