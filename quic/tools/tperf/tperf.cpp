@@ -506,30 +506,6 @@ class ServerStreamHandler : public quic::QuicSocket::ConnectionCallback,
   void onConnectionEnd() noexcept override {
     LOG(INFO) << "Socket closed";
     sock_.reset();
-
-    if (srtt_.empty()) {
-      LOG(WARNING) << "No RTT data!";
-      return;
-    }
-
-    // Report RTT stats.
-
-    std::sort(srtt_.begin(), srtt_.end());
-
-    double mean = 0.0;
-    for (const auto& rtt: srtt_) {
-      mean += rtt;
-    }
-    mean /= srtt_.size();
-    LOG(INFO) << "RTT - avg: " << mean;
-
-    const uint32_t n = srtt_.size() - 1;
-    LOG(INFO) << "RTT - p25: " << srtt_[n / 4];
-    LOG(INFO) << "RTT - p50: " << srtt_[n / 2];
-    LOG(INFO) << "RTT - p75: " << srtt_[static_cast<uint32_t>(n * 0.75)];
-    LOG(INFO) << "RTT - p95: " << srtt_[static_cast<uint32_t>(n * 0.95)];
-
-    srtt_.clear();
   }
 
   void onConnectionError(
@@ -540,7 +516,6 @@ class ServerStreamHandler : public quic::QuicSocket::ConnectionCallback,
 
   void onTransportReady() noexcept override {
     LOG(INFO) << "Starting sends to client.";
-    mustInitRttData_ = true;
     for (uint32_t i = 0; i < numStreams_; i++) {
       createNewStream();
     }
@@ -598,19 +573,6 @@ class ServerStreamHandler : public quic::QuicSocket::ConnectionCallback,
         eof = true;
       }
     }
-
-    const auto now = std::chrono::system_clock::now();
-    if (mustInitRttData_) {
-      srtt_.clear();
-      nextRttUpdateTime_ = now + rttUpdateEvery_;
-      mustInitRttData_ = false;
-    } else if (now >= nextRttUpdateTime_) {
-      const float srttMs = sock_->getTransportInfo().srtt.count() / 1000.f;
-      srtt_.push_back(srttMs);
-      // LOG(INFO) << "New sRTT sample: " << srttMs;
-      nextRttUpdateTime_ = now + rttUpdateEvery_;
-    }
-
     if (dsrEnabled_) {
       dsrSend(id, toSend, eof);
     } else {
@@ -684,10 +646,6 @@ class ServerStreamHandler : public quic::QuicSocket::ConnectionCallback,
   std::set<quic::StreamId> streamsHavingDSRSender_;
   folly::AsyncUDPSocket& udpSock_;
   bool dsrEnabled_;
-  std::vector<float> srtt_;
-  std::chrono::milliseconds rttUpdateEvery_{100};
-  std::chrono::time_point<std::chrono::system_clock> nextRttUpdateTime_{std::chrono::system_clock::now()};
-  bool mustInitRttData_{true};
 };
 
 class TPerfServerTransportFactory : public quic::QuicServerTransportFactory {
