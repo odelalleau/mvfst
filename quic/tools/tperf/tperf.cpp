@@ -505,6 +505,18 @@ class ServerStreamHandler : public quic::QuicSocket::ConnectionCallback,
 
   void onConnectionEnd() noexcept override {
     LOG(INFO) << "Socket closed";
+
+    const quic::QuicSocket::TransportInfo& info = sock_->getTransportInfo(true);
+    LOG(INFO) << "totalPacketsSent       = " << info.totalPacketsSent;
+    LOG(INFO) << "totalPacketsMarkedLost = " << info.totalPacketsMarkedLost;
+    LOG(INFO) << "#RTT samples           = " << info.numRttSamples;
+    LOG(INFO) << "RTT mean               = " << info.rttMean;
+    LOG(INFO) << "RTT P25                = " << info.rttP25;
+    LOG(INFO) << "RTT P50                = " << info.rttP50;
+    LOG(INFO) << "RTT P75                = " << info.rttP75;
+    LOG(INFO) << "RTT P95                = " << info.rttP95;
+    LOG(INFO) << "RTT P99                = " << info.rttP99;
+
     sock_.reset();
   }
 

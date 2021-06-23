@@ -8,8 +8,13 @@
 
 #pragma once
 
+#include <random>
+
 #include <quic/codec/Types.h>
 #include <quic/common/EnumArray.h>
+
+// Maximum number of RTT samples that we keep in memory.
+constexpr uint32_t kMaxNumRTTStored = 10000;
 
 namespace quic {
 
@@ -36,6 +41,13 @@ struct LossState {
   std::chrono::microseconds ldrtt{0us};
   // Rtt var
   std::chrono::microseconds rttvar{0us};
+  // Store RTT samples (in ms)
+  std::vector<float> rttSamples;
+  uint64_t rttSamplesCount{0};
+  // RNG & distributions to decide which RTT samples to keep
+  std::mt19937 rttSamplesRNG;
+  std::uniform_real_distribution<double> rttSamplesRealDistr{0., 1.};
+  std::uniform_int_distribution<uint32_t> rttSamplesIntDistr{0, kMaxNumRTTStored - 1};
   // The sent time of the latest acked packet
   folly::Optional<TimePoint> lastAckedPacketSentTime;
   // The latest time a packet is acked

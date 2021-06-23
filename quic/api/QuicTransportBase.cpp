@@ -524,7 +524,8 @@ QuicTransportBase::getStreamWriteBufferedBytes(StreamId id) const {
  * client proposed ciphers, etc.
  */
 
-QuicSocket::TransportInfo QuicTransportBase::getTransportInfo() const {
+QuicSocket::TransportInfo QuicTransportBase::getTransportInfo(
+    bool computeRttStats) const {
   CongestionControlType congestionControlType = CongestionControlType::None;
   uint64_t writableBytes = std::numeric_limits<uint64_t>::max();
   uint64_t congestionWindow = std::numeric_limits<uint64_t>::max();
@@ -580,6 +581,37 @@ QuicSocket::TransportInfo QuicTransportBase::getTransportInfo() const {
   transportInfo.largestPacketAckedByPeer =
       conn_->ackStates.appDataAckState.largestAckedByPeer;
   transportInfo.largestPacketSent = conn_->lossState.largestSent;
+
+  // Compute RTT statistics.
+  if (computeRttStats && !conn_->lossState.rttSamples.empty()) {
+    std::vector<float>& r = conn_->lossState.rttSamples;
+
+    double rttMean = 0.;
+    for (const auto& v : r) {
+      rttMean += v;
+    }
+    rttMean /= r.size();
+
+    std::sort(r.begin(), r.end());
+    const uint32_t n = r.size() - 1;
+
+    transportInfo.numRttSamples = r.size();
+    transportInfo.rttMean = rttMean;
+    transportInfo.rttP25 = r[static_cast<uint32_t>(n * 0.25)];
+    transportInfo.rttP50 = r[static_cast<uint32_t>(n * 0.50)];
+    transportInfo.rttP75 = r[static_cast<uint32_t>(n * 0.75)];
+    transportInfo.rttP95 = r[static_cast<uint32_t>(n * 0.95)];
+    transportInfo.rttP99 = r[static_cast<uint32_t>(n * 0.99)];
+  } else {
+    transportInfo.numRttSamples = 0;
+    transportInfo.rttMean = -1.;
+    transportInfo.rttP25 = -1.;
+    transportInfo.rttP50 = -1.;
+    transportInfo.rttP75 = -1.;
+    transportInfo.rttP95 = -1.;
+    transportInfo.rttP99 = -1.;
+  }
+
   return transportInfo;
 }
 
@@ -2068,9 +2100,8 @@ QuicTransportBase::registerByteEventCallback(
   if (byteEventMapIt == byteEventMap.end()) {
     byteEventMap.emplace(
         id,
-        std::initializer_list<std::remove_reference<
-            decltype(byteEventMap)>::type::mapped_type::value_type>(
-            {{offset, cb}}));
+        std::initializer_list<std::remove_reference<decltype(
+            byteEventMap)>::type::mapped_type::value_type>({{offset, cb}}));
   } else {
     // Keep ByteEvents for the same stream sorted by offsets:
     auto pos = std::upper_bound(

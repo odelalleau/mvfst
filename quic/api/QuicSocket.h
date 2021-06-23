@@ -129,6 +129,13 @@ class QuicSocket {
     std::chrono::microseconds rttvar{0us};
     std::chrono::microseconds lrtt{0us};
     std::chrono::microseconds mrtt{0us};
+    uint64_t numRttSamples{0};
+    float rttMean{-1};
+    float rttP25{-1};
+    float rttP50{-1};
+    float rttP75{-1};
+    float rttP95{-1};
+    float rttP99{-1};
     uint64_t mss{kDefaultUDPSendPacketLen};
     CongestionControlType congestionControlType{CongestionControlType::None};
     uint64_t writableBytes{0};
@@ -344,7 +351,7 @@ class QuicSocket {
   /**
    * Get internal transport info similar to TCP information.
    */
-  virtual TransportInfo getTransportInfo() const = 0;
+  virtual TransportInfo getTransportInfo(bool computeRttStats = false) const = 0;
 
   /**
    * Get internal transport info similar to TCP information.

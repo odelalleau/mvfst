@@ -69,6 +69,28 @@ void updateRtt(
     conn.lossState.srtt = conn.lossState.srtt * (kRttAlpha - 1) / kRttAlpha +
         rttSample / kRttAlpha;
   }
+
+  // Store a subset of RTTs.
+  auto& ls = conn.lossState;
+  ls.rttSamplesCount++;
+  std::vector<float>& r = ls.rttSamples;
+  if (r.size() < kMaxNumRTTStored) {
+    r.push_back(rttSample.count() / 1000.f);
+  } else {
+    // Store this sample with a probability based on how many samples have been
+    // seen so far.
+    if (ls.rttSamplesCount < kMaxNumRTTStored) {
+      LOG(FATAL) << "rttSamplesCount = " << ls.rttSamplesCount << " < "
+                 << kMaxNumRTTStored;
+    }
+    const double p = kMaxNumRTTStored / static_cast<double>(ls.rttSamplesCount);
+    // LOG(INFO) << "p = " << p;
+    if (ls.rttSamplesRealDistr(ls.rttSamplesRNG) < p) {
+      const uint32_t idx = ls.rttSamplesIntDistr(ls.rttSamplesRNG);
+      r[idx] = rttSample.count() / 1000.f;
+    }
+  }
+
   if (conn.qLogger) {
     conn.qLogger->addMetricUpdate(
         rttSample, conn.lossState.mrtt, conn.lossState.srtt, ackDelay);

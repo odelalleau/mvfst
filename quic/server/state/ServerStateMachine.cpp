@@ -69,6 +69,8 @@ void resetCongestionAndRttState(QuicServerConnectionState& conn) {
   conn.lossState.lrtt = 0us;
   conn.lossState.rttvar = 0us;
   conn.lossState.mrtt = kDefaultMinRtt;
+  conn.lossState.rttSamples.clear();
+  conn.lossState.rttSamplesCount = 0;
 }
 
 void recoverOrResetCongestionAndRttState(

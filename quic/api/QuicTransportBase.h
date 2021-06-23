@@ -84,7 +84,7 @@ class QuicTransportBase : public QuicSocket {
   folly::Expected<size_t, LocalErrorCode> getStreamWriteBufferedBytes(
       StreamId id) const override;
 
-  TransportInfo getTransportInfo() const override;
+  TransportInfo getTransportInfo(bool computeRttStats = false) const override;
 
   folly::Expected<StreamTransportInfo, LocalErrorCode> getStreamTransportInfo(
       StreamId id) const override;

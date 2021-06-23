@@ -54,7 +54,7 @@ class MockQuicSocket : public QuicSocket {
   MOCK_CONST_METHOD1(
       getStreamWriteBufferedBytes,
       folly::Expected<size_t, LocalErrorCode>(StreamId));
-  MOCK_CONST_METHOD0(getTransportInfo, QuicSocket::TransportInfo());
+  MOCK_CONST_METHOD1(getTransportInfo, QuicSocket::TransportInfo(bool));
   MOCK_CONST_METHOD1(
       getStreamTransportInfo,
       folly::Expected<QuicSocket::StreamTransportInfo, LocalErrorCode>(
