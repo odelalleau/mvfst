@@ -54,7 +54,7 @@ public:
     ACKED,
     */
     THROUGHPUT,
-    THROUGHPUT_LOG_RATIO,
+    // THROUGHPUT_LOG_RATIO,
 
     // LossEvent
     // LOST,

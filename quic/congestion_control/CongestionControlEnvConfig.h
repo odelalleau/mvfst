@@ -41,6 +41,7 @@ struct CongestionControlEnvConfig {
     CWND_RANGE,
     CWND_RANGE_SOFT,
     CWND_TRADEOFF,
+    BELOW_TARGET_CWND,
   };
 
   // Type of aggregation to group state updates

@@ -329,6 +329,8 @@ makeRLCongestionControllerFactory() {
     cfg.rewardFormula = Config::RewardFormula::CWND_RANGE_SOFT;
   } else if (FLAGS_cc_env_reward_formula == "cwnd_tradeoff") {
     cfg.rewardFormula = Config::RewardFormula::CWND_TRADEOFF;
+  } else if (FLAGS_cc_env_reward_formula == "below_target_cwnd") {
+    cfg.rewardFormula = Config::RewardFormula::BELOW_TARGET_CWND;
   } else {
     LOG(FATAL) << "Unknown cc_env_reward_formula: "
                << FLAGS_cc_env_reward_formula;

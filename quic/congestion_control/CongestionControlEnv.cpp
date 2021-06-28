@@ -172,7 +172,7 @@ quic::utils::vector<NetworkState> CongestionControlEnv::stateSummary(
       Field::THROUGHPUT_FROM_CWND,
       // Field::IN_FLIGHT,    Field::WRITABLE,
       Field::THROUGHPUT,
-      Field::THROUGHPUT_LOG_RATIO,
+      // Field::THROUGHPUT_LOG_RATIO,
   };
   for (const Field field : invalidSumFields) {
     summaryStates[0][field] = 0.0;
@@ -353,6 +353,16 @@ float CongestionControlEnv::computeReward(
 
     break;
   }
+
+  case Config::RewardFormula::BELOW_TARGET_CWND: {
+    if (cwndBytes_ > targetCwndBytes) {
+      reward = 0.f;
+    } else {
+      reward = pow(cwndBytes_ / targetCwndBytes, cfg_.throughputFactor);
+    }
+    break;
+  }
+
 
   default:
     LOG(FATAL) << "Unknown rewardFormula";

@@ -193,10 +193,12 @@ bool RLCongestionController::setNetworkState(
   obs[Field::THROUGHPUT] =
       bandwidthSampler_.getBandwidth().normalize() / normBytes;
 
+  /*
   // This is the (log) ratio of the throughput measured from ACK events vs. the estimated
   // throughput based on CWND.
   obs[Field::THROUGHPUT_LOG_RATIO] =
       log(1e-5 + obs[Field::THROUGHPUT] / obs[Field::THROUGHPUT_FROM_CWND]);
+  */
 
   /*
   obs[Field::PTO_COUNT] = state.ptoCount;
