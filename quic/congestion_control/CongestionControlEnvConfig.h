@@ -98,7 +98,7 @@ struct CongestionControlEnvConfig {
   RewardFormula rewardFormula{RewardFormula::LOG_RATIO};
   float uplinkBandwidth{0.0};
   uint32_t uplinkQueueSizeBytes{1}; // 1 by default to avoid division by zero
-  uint32_t baseRTT{1};              // 1 by default to avoid division by zero
+  float baseRTT{1.0};               // 1 by default to avoid division by zero
   float delayOffset{0.0};
   float throughputFactor{0.1};
   float throughputLogOffset{1.0};
@@ -120,10 +120,16 @@ struct CongestionControlEnvConfig {
   // 'fixed' env mode only: the target cwnd value we want to reach
   uint32_t fixedCwnd{10};
 
+  // Path to file where some statistics are saved (if provided).
+  std::string statsFile{""};
+
   /// RLCongestionController settings
 
   // Window duration used to compute the min RTT
   std::chrono::microseconds minRTTWindowLength{kMinRTTWindowLength};
+
+  // Noise settings.
+  float rttNoiseStd{0.0};
 
   // Observation scaling factor
   float obsScaling{1.0};

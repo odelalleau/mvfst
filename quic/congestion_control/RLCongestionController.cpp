@@ -24,13 +24,12 @@ RLCongestionController::RLCongestionController(
     std::shared_ptr<CongestionControlEnvFactory> envFactory)
     : conn_(conn),
       cwndBytes_(conn.transportSettings.initCwndInMss * conn.udpSendPacketLen),
-      env_(envFactory->make(this, conn)),
+      env_(envFactory->make(this, conn)), cfg_(env_->config()),
       minRTTFilter_(kMinRTTWindowLength.count(), 0us, 0), // length reset below
       standingRTTFilter_(100000, 0us, 0),                 // 100ms
       bandwidthSampler_(conn, env_->config()) {
   DCHECK(env_);
-  const CongestionControlEnv::Config &cfg = env_->config();
-  minRTTFilter_.SetWindowLength(cfg.minRTTWindowLength.count());
+  minRTTFilter_.SetWindowLength(cfg_.minRTTWindowLength.count());
 
   VLOG(10) << __func__ << " writable=" << getWritableBytes()
            << " cwnd=" << cwndBytes_ << " inflight=" << bytesInFlight_ << " "
@@ -73,8 +72,10 @@ void RLCongestionController::onPacketAckOrLoss(
 void RLCongestionController::onPacketAcked(const AckEvent &ack) {
   DCHECK(ack.largestAckedPacket.hasValue());
   subtractAndCheckUnderflow(bytesInFlight_, ack.ackedBytes);
+  const uint32_t lrttWithNoise = static_cast<uint32_t>(
+      conn_.lossState.lrtt.count() * (1. + normal_(rng_) * cfg_.rttNoiseStd));
   minRTTFilter_.Update(
-      conn_.lossState.lrtt,
+      std::chrono::microseconds(lrttWithNoise),
       std::chrono::duration_cast<microseconds>(ack.ackTime.time_since_epoch())
           .count());
   standingRTTFilter_.SetWindowLength(conn_.lossState.srtt.count() / 2);
@@ -126,19 +127,27 @@ bool RLCongestionController::setNetworkState(
 
   const auto &rttMin = minRTTFilter_.GetBest();
   const auto &rttStanding = standingRTTFilter_.GetBest().count();
-  const auto &delay =
-      duration_cast<microseconds>(conn_.lossState.lrtt - rttMin).count();
+
+  // Compute delay (from possibly noisy RTT measurement).
+  float delay;
+  if (cfg_.rttNoiseStd > 0) {
+    const float lrttWithNoise =
+        state.lrtt.count() / 1000.f * (1.f + normal_(rng_) * cfg_.rttNoiseStd);
+    delay = std::max(0.f, lrttWithNoise - rttMin.count() / 1000.f);
+  } else {
+    delay = duration_cast<microseconds>(state.lrtt - rttMin).count() / 1000.f;
+  }
+
   if (rttStanding == 0 || delay < 0) {
     LOG(ERROR)
         << "Invalid rttStanding or delay, skipping network state update: "
-        << "rttStanding = " << rttStanding << ", delay = " << delay << " "
+        << "rttStanding = " << rttStanding << ", delay = " << delay << "ms "
         << conn_;
     return false;
   }
 
   const float normMs = env_->normMs();
   const float normBytes = env_->normBytes();
-  const CongestionControlEnv::Config &cfg = env_->config();
 
   obs[Field::RTT_MIN] = rttMin.count() / 1000.0 / normMs;
   /*
@@ -151,11 +160,11 @@ bool RLCongestionController::setNetworkState(
   obs[Field::SRTT] = state.srtt.count() / 1000.0 / normMs;
   obs[Field::RTT_VAR] = state.rttvar.count() / 1000.0 / normMs;
   */
-  obs[Field::DELAY] = delay / 1000.0 / normMs;
+  obs[Field::DELAY] = delay / normMs;
 
   // The ACK delay is smoothed with an exponential moving average.
-  avgAckDelayMs_ = (1.f - cfg.ackDelayAvgCoeff) * avgAckDelayMs_ +
-                   cfg.ackDelayAvgCoeff * state.lastAckDelay.count() / 1000.f;
+  avgAckDelayMs_ = (1.f - cfg_.ackDelayAvgCoeff) * avgAckDelayMs_ +
+                   cfg_.ackDelayAvgCoeff * state.lastAckDelay.count() / 1000.f;
   obs[Field::ACK_DELAY] = avgAckDelayMs_ / normMs;
 
   // Normalize CWND field such that max value is 1.
@@ -167,12 +176,15 @@ bool RLCongestionController::setNetworkState(
   // Note that this estimate does *not* account for lost bytes.
   // The total RTT is smoothed with the same coefficient as for
   // `avgAckDelayMs_`.
+  const float ldrttWithNoise =
+      state.ldrtt.count() / 1000.f * (1.f + normal_(rng_) * cfg_.rttNoiseStd);
   if (avgRTTWithDelayMs_ <= 0.f) {
-    avgRTTWithDelayMs_ = state.ldrtt.count() / 1000.f;
+    avgRTTWithDelayMs_ = ldrttWithNoise;
   } else {
-    avgRTTWithDelayMs_ = (1.f - cfg.ackDelayAvgCoeff) * avgRTTWithDelayMs_ +
-                         cfg.ackDelayAvgCoeff * state.ldrtt.count() / 1000.f;
+    avgRTTWithDelayMs_ = (1.f - cfg_.ackDelayAvgCoeff) * avgRTTWithDelayMs_ +
+                         cfg_.ackDelayAvgCoeff * ldrttWithNoise;
   }
+  obs[Field::NOISY_RTT_WITH_DELAY] = avgRTTWithDelayMs_ / normMs;
   obs[Field::THROUGHPUT_FROM_CWND] =
       cwndBytes_ / std::max(1.f, avgRTTWithDelayMs_) * 1000.f / normBytes;
 
@@ -194,7 +206,8 @@ bool RLCongestionController::setNetworkState(
       bandwidthSampler_.getBandwidth().normalize() / normBytes;
 
   /*
-  // This is the (log) ratio of the throughput measured from ACK events vs. the estimated
+  // This is the (log) ratio of the throughput measured from ACK events vs. the
+  estimated
   // throughput based on CWND.
   obs[Field::THROUGHPUT_LOG_RATIO] =
       log(1e-5 + obs[Field::THROUGHPUT] / obs[Field::THROUGHPUT_FROM_CWND]);

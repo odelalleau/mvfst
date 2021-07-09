@@ -31,6 +31,7 @@ public:
     SRTT,
     RTT_VAR,
     */
+    NOISY_RTT_WITH_DELAY,
     DELAY,
     ACK_DELAY,
 

@@ -174,9 +174,9 @@ DEFINE_int32(
     cc_env_uplink_queue_size_bytes,
     1,
     "Size of the uplink queue (in bytes)");
-DEFINE_uint32(
+DEFINE_double(
     cc_env_base_rtt,
-    1,
+    1.0,
     "Minimum RTT that can be achieved based on network settings (in ms)");
 DEFINE_string(
     cc_env_reward_formula,
@@ -254,10 +254,14 @@ DEFINE_uint32(
     cc_env_bandwidth_min_window_duration_ms,
     100,
     "Minimum duration over which the bandwidth is computed (in ms)");
+DEFINE_double(cc_env_rtt_noise_std, 0.,
+              "Standard deviation of the noise added to RTT measurements");
 DEFINE_double(
     cc_env_obs_scaling,
     1.0,
     "Factor by which the observation vector should be scaled");
+DEFINE_string(cc_env_stats_file, "",
+              "Path to file where some statistics are saved (if provided)");
 
 namespace quic {
 namespace tperf {
@@ -354,10 +358,12 @@ makeRLCongestionControllerFactory() {
   cfg.fixedCwnd = FLAGS_cc_env_fixed_cwnd;
   cfg.minRTTWindowLength =
       std::chrono::microseconds(FLAGS_cc_env_min_rtt_window_length_us);
+  cfg.rttNoiseStd = FLAGS_cc_env_rtt_noise_std;
   cfg.ackDelayAvgCoeff = FLAGS_cc_env_ack_delay_avg_coeff;
   cfg.bandwidthMinWindowDuration =
       std::chrono::milliseconds(FLAGS_cc_env_bandwidth_min_window_duration_ms);
   cfg.obsScaling = FLAGS_cc_env_obs_scaling;
+  cfg.statsFile = FLAGS_cc_env_stats_file;
 
   auto envFactory = std::make_shared<quic::CongestionControlEnvFactory>(cfg);
   return std::make_shared<quic::RLCongestionControllerFactory>(envFactory);

@@ -8,6 +8,8 @@
  */
 #include "CongestionControlEnv.h"
 
+#include <fstream>
+
 #include <folly/Conv.h>
 #include <quic/congestion_control/CongestionControlFunctions.h>
 
@@ -15,7 +17,7 @@ namespace quic {
 
 using Field = NetworkState::Field;
 
-static const float kBytesToMB = 1.f / 1048576.f; // 1 / (1024 * 1024)
+static const float kBytesToMB = 1e-6;
 
 /// CongestionControlEnv impl
 
@@ -33,6 +35,12 @@ CongestionControlEnv::CongestionControlEnv(const Config &cfg, Callback *cob,
   if (cfg.aggregation == Config::Aggregation::TIME_WINDOW) {
     CHECK_GT(cfg.windowDuration.count(), 0);
     observationTimeout_.schedule(cfg.windowDuration);
+  }
+
+  if (!cfg_.statsFile.empty()) {
+    std::ofstream outfile;
+    outfile.open(cfg_.statsFile);
+    outfile << "episode_step avg_noisy_rtt_no_delay" << std::endl;
   }
 }
 
@@ -129,6 +137,12 @@ void CongestionControlEnv::handleStates() {
             << rewardCount_
             << " steps, avg reward = " << (rewardSum_ / rewardCount_);
   }
+  if (rewardCount_ % 50 == 0 && !cfg_.statsFile.empty()) {
+    // Save some stats every 50 steps.
+    std::ofstream outfile;
+    outfile.open(cfg_.statsFile, std::ofstream::app);
+    outfile << rewardCount_ << " " << avgNoisyRTTNoDelay_ << std::endl;
+  }
 
   Observation obs(cfg_);
   obs.states = useStateSummary() ? stateSummary(states_) : std::move(states_);
@@ -166,10 +180,8 @@ quic::utils::vector<NetworkState> CongestionControlEnv::stateSummary(
       Field::RTT_MIN,
       // Field::RTT_STANDING, Field::LRTT,     Field::LDRTT,
       // Field::SRTT,    Field::RTT_VAR,
-      Field::DELAY,
-      Field::ACK_DELAY,
-      Field::CWND,
-      Field::THROUGHPUT_FROM_CWND,
+      Field::NOISY_RTT_WITH_DELAY,
+      Field::DELAY, Field::ACK_DELAY, Field::CWND, Field::THROUGHPUT_FROM_CWND,
       // Field::IN_FLIGHT,    Field::WRITABLE,
       Field::THROUGHPUT,
       // Field::THROUGHPUT_LOG_RATIO,
@@ -201,6 +213,7 @@ float CongestionControlEnv::computeReward(
   float totalLost = 0.0;
   float minRtt = std::numeric_limits<float>::max();
   static uint64_t prevCwndBytes = 10;
+  avgNoisyRTTNoDelay_ = 0.0;
   for (const auto &state : states) {
     avgThroughput += state[Field::THROUGHPUT];
     avgDelay += state[Field::DELAY];
@@ -208,10 +221,12 @@ float CongestionControlEnv::computeReward(
     avgAckDelay += state[Field::ACK_DELAY];
     // totalLost += state[Field::LOST];
     minRtt = std::min(minRtt, state[Field::RTT_MIN]);
+    avgNoisyRTTNoDelay_ += state[Field::NOISY_RTT_WITH_DELAY] - state[Field::ACK_DELAY];
   }
   avgThroughput /= states.size();
   avgDelay /= states.size();
   avgAckDelay /= states.size();
+  avgNoisyRTTNoDelay_ *= normMs() / states.size();
 
   // Undo normalization and convert to MB/sec for throughput and ms for
   // delay.
@@ -228,8 +243,8 @@ float CongestionControlEnv::computeReward(
   // augmented with the observed ACK delay). This gives the formula:
   //  target cwnd (in bytes) = bandwidth * (rtt + ack_delay)
   const float targetCwndBytes =
-      cfg_.uplinkBandwidth * 1024.f * 1024.f *
-      (static_cast<float>(cfg_.baseRTT) + avgAckDelayMs) / 1000.f;
+      cfg_.uplinkBandwidth / kBytesToMB *
+      (cfg_.baseRTT + avgAckDelayMs) / 1000.f;
 
   float reward = 0.f;
 
@@ -336,7 +351,7 @@ float CongestionControlEnv::computeReward(
     float rewardDelay = 1.f;
     if (cwndBytes_ > targetCwndBytes) {
       const float cwndScaleRTT =
-          cfg_.baseRTT / 1000.f * cfg_.uplinkBandwidth * 1024.f * 1024.f;
+          cfg_.baseRTT / 1000.f * cfg_.uplinkBandwidth / kBytesToMB;
       const float rewardRTT =
           1.f - (cwndBytes_ - targetCwndBytes) / cwndScaleRTT;
       const float rewardQueue =
@@ -355,14 +370,20 @@ float CongestionControlEnv::computeReward(
   }
 
   case Config::RewardFormula::BELOW_TARGET_CWND: {
-    if (cwndBytes_ > targetCwndBytes) {
-      reward = 0.f;
+    const float ratioTargetCwnd = targetCwndBytes * cfg_.maxThroughputRatio;
+    if (cwndBytes_ > ratioTargetCwnd) {
+      if (targetCwndBytes > ratioTargetCwnd) {
+        reward = 1.f - std::min(1.f, (cwndBytes_ - ratioTargetCwnd) /
+                                         (targetCwndBytes - ratioTargetCwnd)) *
+                           (1 + cfg_.delayFactor);
+      } else {
+        reward = 0.f;
+      }
     } else {
-      reward = pow(cwndBytes_ / targetCwndBytes, cfg_.throughputFactor);
+      reward = pow(cwndBytes_ / ratioTargetCwnd, cfg_.throughputFactor);
     }
     break;
   }
-
 
   default:
     LOG(FATAL) << "Unknown rewardFormula";

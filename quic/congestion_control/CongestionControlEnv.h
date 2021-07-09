@@ -149,6 +149,10 @@ private:
   uint64_t rewardCount_;
   float rewardSum_;
 
+  // This field is updated every time the reward is computed. It tracks the current
+  // estimate of the RTT (without ACK delay), possibly with noise when rttNoiseStd > 0.
+  mutable float avgNoisyRTTNoDelay_{0.0};
+
   // Intermediate tensor to compute state summary
   torch::Tensor summaryTensor_{torch::empty({0}, torch::kFloat32)};
 
