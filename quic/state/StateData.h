@@ -416,12 +416,18 @@ struct LossState {
   EnumArray<PacketNumberSpace, folly::Optional<TimePoint>> lossTimes;
   // Max ack delay received from peer
   std::chrono::microseconds maxAckDelay{0us};
+  // Latest ack delay received from peer
+  std::chrono::microseconds lastAckDelay{0us};
   // minimum rtt. AckDelay isn't excluded from this.
   std::chrono::microseconds mrtt{kDefaultMinRtt};
   // Smooth rtt
   std::chrono::microseconds srtt{0us};
   // Latest rtt
   std::chrono::microseconds lrtt{0us};
+  // Latest rtt *including* ack delay
+  // (it is not just equal to `lrtt + lastAckDelay` because `lrtt` does not
+  // always remove the ack delay)
+  std::chrono::microseconds ldrtt{0us};
   // Rtt var
   std::chrono::microseconds rttvar{0us};
   // The sent time of the latest acked packet

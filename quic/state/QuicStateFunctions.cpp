@@ -45,6 +45,8 @@ void updateRtt(
     std::chrono::microseconds ackDelay) {
   std::chrono::microseconds minRtt = timeMin(conn.lossState.mrtt, rttSample);
   conn.lossState.maxAckDelay = timeMax(conn.lossState.maxAckDelay, ackDelay);
+  conn.lossState.lastAckDelay = ackDelay;
+  conn.lossState.ldrtt = rttSample;
   bool shouldUseAckDelay = (rttSample > ackDelay) &&
       (rttSample > minRtt + ackDelay || conn.lossState.mrtt == kDefaultMinRtt);
   if (shouldUseAckDelay) {
